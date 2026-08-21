@@ -1,0 +1,20 @@
+{
+  "endpoint": "/standings",
+  "parameters": {
+    "league": 39,
+    "season": 2024
+  },
+  "fetched_at": "2026-08-21T18:15:51.998772+00:00",
+  "http_status": 200,
+  "results": 1,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "rate_limit": {
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "7",
+    "x-ratelimit-requests-limit": "100",
+    "x-ratelimit-requests-remaining": "97"
+  }
+}

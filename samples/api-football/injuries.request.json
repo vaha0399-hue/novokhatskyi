@@ -1,0 +1,20 @@
+{
+  "endpoint": "/injuries",
+  "parameters": {
+    "league": 39,
+    "season": 2024
+  },
+  "fetched_at": "2026-08-21T18:15:52.298548+00:00",
+  "http_status": 200,
+  "results": 3168,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "rate_limit": {
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "4",
+    "x-ratelimit-requests-limit": "100",
+    "x-ratelimit-requests-remaining": "94"
+  }
+}

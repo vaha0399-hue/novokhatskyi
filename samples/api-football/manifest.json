@@ -1,0 +1,82 @@
+{
+  "source": "API-Football v3",
+  "purpose": "contract-research-only",
+  "league_id": 39,
+  "research_season": 2024,
+  "production_target_season": 2026,
+  "request_limit": 7,
+  "started_at": "2026-08-21T18:15:51.714543+00:00",
+  "requests": [
+    {
+      "name": "fixtures",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "league": 39,
+        "season": 2024
+      },
+      "raw_file": "fixtures.raw.json",
+      "request_file": "fixtures.request.json"
+    },
+    {
+      "name": "teams",
+      "endpoint": "/teams",
+      "parameters": {
+        "league": 39,
+        "season": 2024
+      },
+      "raw_file": "teams.raw.json",
+      "request_file": "teams.request.json"
+    },
+    {
+      "name": "standings",
+      "endpoint": "/standings",
+      "parameters": {
+        "league": 39,
+        "season": 2024
+      },
+      "raw_file": "standings.raw.json",
+      "request_file": "standings.request.json"
+    },
+    {
+      "name": "team-statistics",
+      "endpoint": "/teams/statistics",
+      "parameters": {
+        "league": 39,
+        "season": 2024,
+        "team": 33
+      },
+      "raw_file": "team-statistics.raw.json",
+      "request_file": "team-statistics.request.json"
+    },
+    {
+      "name": "fixture-statistics",
+      "endpoint": "/fixtures/statistics",
+      "parameters": {
+        "fixture": 1208021
+      },
+      "raw_file": "fixture-statistics.raw.json",
+      "request_file": "fixture-statistics.request.json"
+    },
+    {
+      "name": "injuries",
+      "endpoint": "/injuries",
+      "parameters": {
+        "league": 39,
+        "season": 2024
+      },
+      "raw_file": "injuries.raw.json",
+      "request_file": "injuries.request.json"
+    },
+    {
+      "name": "lineups",
+      "endpoint": "/fixtures/lineups",
+      "parameters": {
+        "fixture": 1208021
+      },
+      "raw_file": "lineups.raw.json",
+      "request_file": "lineups.request.json"
+    }
+  ],
+  "completed_at": "2026-08-21T18:15:52.376242+00:00",
+  "request_count": 7
+}

@@ -1,0 +1,19 @@
+{
+  "endpoint": "/fixtures/lineups",
+  "parameters": {
+    "fixture": 1208021
+  },
+  "fetched_at": "2026-08-21T18:15:52.376095+00:00",
+  "http_status": 200,
+  "results": 2,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "rate_limit": {
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "3",
+    "x-ratelimit-requests-limit": "100",
+    "x-ratelimit-requests-remaining": "93"
+  }
+}
