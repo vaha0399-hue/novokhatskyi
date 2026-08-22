@@ -53,7 +53,14 @@ def test_http_error_is_sanitized_and_not_retried() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return httpx.Response(401, json={"message": "test-secret must not leak"})
+        return httpx.Response(
+            401,
+            json={"message": "test-secret must not leak"},
+            headers={
+                "x-ratelimit-requests-remaining": "42",
+                "authorization": "test-secret",
+            },
+        )
 
     async def exercise() -> None:
         client = APIFootballClient("test-secret", transport=httpx.MockTransport(handler))
@@ -61,6 +68,7 @@ def test_http_error_is_sanitized_and_not_retried() -> None:
             await client.get("fixtures")
         assert str(captured.value) == "API-Football returned HTTP 401."
         assert "test-secret" not in str(captured.value)
+        assert captured.value.safe_headers == {"x-ratelimit-requests-remaining": "42"}
 
     asyncio.run(exercise())
     assert calls == 1

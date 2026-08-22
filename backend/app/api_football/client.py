@@ -13,6 +13,24 @@ from .errors import APIFootballAPIError, APIFootballConfigurationError, APIFootb
 
 DEFAULT_BASE_URL = "https://v3.football.api-sports.io"
 DEFAULT_TIMEOUT_SECONDS = 15.0
+SAFE_RATE_LIMIT_HEADERS = frozenset(
+    {
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-requests-limit",
+        "x-ratelimit-requests-remaining",
+        "retry-after",
+    }
+)
+
+
+def safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Return only non-sensitive rate-limit metadata from provider headers."""
+    return {
+        key.lower(): value
+        for key, value in headers.items()
+        if key.lower() in SAFE_RATE_LIMIT_HEADERS
+    }
 
 
 @dataclass(frozen=True)
@@ -70,7 +88,10 @@ class APIFootballClient:
                 raise APIFootballHTTPError(0) from error
 
         if response.is_error:
-            raise APIFootballHTTPError(response.status_code)
+            raise APIFootballHTTPError(
+                response.status_code,
+                safe_headers=safe_rate_limit_headers(response.headers),
+            )
 
         try:
             payload = response.json()

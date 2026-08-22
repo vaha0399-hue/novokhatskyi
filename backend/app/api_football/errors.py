@@ -3,6 +3,8 @@
 Exceptions intentionally never include request headers, URLs with credentials, or API keys.
 """
 
+from collections.abc import Mapping
+
 
 class APIFootballError(RuntimeError):
     """Base error for API-Football client failures."""
@@ -15,9 +17,10 @@ class APIFootballConfigurationError(APIFootballError):
 class APIFootballHTTPError(APIFootballError):
     """Raised for a non-successful HTTP response."""
 
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, *, safe_headers: Mapping[str, str] | None = None) -> None:
         super().__init__(f"API-Football returned HTTP {status_code}.")
         self.status_code = status_code
+        self.safe_headers = dict(safe_headers or {})
 
 
 class APIFootballAPIError(APIFootballError):
