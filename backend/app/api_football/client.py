@@ -96,12 +96,27 @@ class APIFootballClient:
         try:
             payload = response.json()
         except ValueError as error:
-            raise APIFootballAPIError("invalid JSON response") from error
+            raise APIFootballAPIError(
+                "invalid JSON response",
+                raw_body=response.content,
+                status_code=response.status_code,
+                safe_headers=safe_rate_limit_headers(response.headers),
+            ) from error
 
         if not isinstance(payload, dict):
-            raise APIFootballAPIError("invalid top-level response")
+            raise APIFootballAPIError(
+                "invalid top-level response",
+                raw_body=response.content,
+                status_code=response.status_code,
+                safe_headers=safe_rate_limit_headers(response.headers),
+            )
         if payload.get("errors"):
-            raise APIFootballAPIError(payload["errors"])
+            raise APIFootballAPIError(
+                payload["errors"],
+                raw_body=response.content,
+                status_code=response.status_code,
+                safe_headers=safe_rate_limit_headers(response.headers),
+            )
 
         return APIFootballResponse(
             data=payload,

@@ -1,13 +1,21 @@
 # Football Analytics
 
-Football Analytics is a web-first service for analysing upcoming football
-matches. The MVP is limited to the Premier League and will eventually expose
-pre-match HOME/DRAW/AWAY probabilities through a Next.js website.
+Football Analytics is a web-first football analytics platform. It provides
+historical match data, calculated statistical indicators, team comparisons,
+and analytical views through a responsive Next.js website. It does not produce
+match predictions or win probabilities.
+
+## Product canon
+
+The approved and current product boundary is recorded in
+[`docs/product-scope.md`](docs/product-scope.md). It supersedes older references
+to prediction functionality.
 
 ## Current phase
 
-Stage 1 established the tested project foundation. Stage 2 is researching the
-real API-Football data contract before any database schema is designed.
+Stage 1 established the tested project foundation. API-Football contract
+research, the reviewed development schema, and the EPL 2024 historical
+fixture-statistics backfill are complete.
 
 The current repository contains:
 
@@ -17,10 +25,12 @@ The current repository contains:
 - real Premier League season 2024 contract samples and analysis documentation;
 - placeholders for the future web frontend and reviewed database migrations.
 
-Season 2024 is used only for response-shape research because the configured
-free API plan does not permit season 2026. The production target remains
-season 2026. Supabase connectivity, schema design, data import, feature
-calculation, predictions, and the main frontend remain out of scope.
+Premier League 2024 is the first complete historical dataset: 380 fixtures and
+760 team-level fixture-statistics rows. The next work, after a dedicated Git
+checkpoint, is the Analytics Engine and its historical anti-leakage validation
+layer; FastAPI read contracts follow. Frontend and Supabase Auth work do not
+start before those backend contracts are stable. The detailed approved order
+is in [`docs/product-scope.md`](docs/product-scope.md).
 
 The approved Stage 1 scope and acceptance criteria are recorded in
 [`docs/phase-1.md`](docs/phase-1.md). Architectural boundaries are recorded in

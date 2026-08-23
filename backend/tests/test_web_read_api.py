@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.web.dependencies import get_web_read_service
+from app.web.dtos import (
+    AverageMetricSummary, FixtureAnalyticsResponse, FixtureAnalyticsSide, FixtureScore,
+    FixtureSummary, GoalTotalsRateSummary, MetricSummary, PaginationMetadata,
+    RateMetricSummary, SeasonFixturesResponse, StreakSummary, TeamAnalyticsResponse,
+    TeamReference,
+)
+from app.web.service import WebNotFoundError
+
+
+NOW = datetime(2024, 10, 1, 15, tzinfo=UTC)
+HOME = TeamReference(id=10, name="Home")
+AWAY = TeamReference(id=20, name="Away")
+
+
+def _metrics() -> MetricSummary:
+    average = AverageMetricSummary(value=1.0, sample_size=1)
+    rate = RateMetricSummary(count=1, rate=1.0)
+    return MetricSummary(
+        matches=1, wins=1, draws=0, losses=0, points=3, points_per_game=3.0,
+        goals_scored=2, goals_conceded=1, average_goals_scored=2.0, average_goals_conceded=1.0,
+        average_xg=average, average_xga=average, average_shots=average,
+        average_shots_on_goal=average, average_possession_pct=average, average_corners=average,
+        average_yellow_cards=average, average_red_cards=AverageMetricSummary(value=None, sample_size=0),
+        clean_sheets=rate, failed_to_score=RateMetricSummary(count=0, rate=0.0), btts=rate,
+        total_goals={threshold: GoalTotalsRateSummary(over=rate, under=RateMetricSummary(count=0, rate=0.0)) for threshold in ("0.5", "1.5", "2.5", "3.5")},
+        streaks=StreakSummary(wins=1, unbeaten=1, winless=0, losses=0, scored=1, clean_sheets=0, btts=1),
+    )
+
+
+def _fixture(fixture_id: int, *, kickoff_at: datetime, completed: bool = True) -> FixtureSummary:
+    return FixtureSummary(
+        id=fixture_id, season_id=3, kickoff_at=kickoff_at, round_label="Regular Season - 1",
+        lifecycle_state="completed" if completed else "scheduled", home_team=HOME, away_team=AWAY,
+        final_score=FixtureScore(home=2, away=1) if completed else None,
+    )
+
+
+class FakeService:
+    def __init__(self) -> None:
+        self.season_calls: list[tuple[int, int, int]] = []
+        self.team_calls: list[tuple[int, int, object, int]] = []
+        self.fixture_calls: list[tuple[int, int]] = []
+
+    def season_fixtures(self, *, season_id: int, limit: int, offset: int):
+        if season_id == 404:
+            raise WebNotFoundError("season_not_found")
+        self.season_calls.append((season_id, limit, offset))
+        fixtures = [_fixture(1, kickoff_at=NOW), _fixture(2, kickoff_at=NOW.replace(hour=17), completed=False)]
+        return SeasonFixturesResponse(
+            season_id=season_id, fixtures=fixtures,
+            pagination=PaginationMetadata(total=2, limit=limit, offset=offset, next_offset=None),
+        )
+
+    def team_analytics(self, *, team_id: int, season_id: int, scope, window: int):
+        if season_id == 404:
+            raise WebNotFoundError("season_not_found")
+        if team_id == 404:
+            raise WebNotFoundError("team_not_found_in_season")
+        self.team_calls.append((team_id, season_id, scope, window))
+        return TeamAnalyticsResponse(team=HOME, season_id=season_id, scope=scope.value, window=window, as_of_kickoff=NOW, metrics=_metrics())
+
+    def fixture_analytics(self, *, fixture_id: int, window: int):
+        if fixture_id == 404:
+            raise WebNotFoundError("fixture_not_found")
+        self.fixture_calls.append((fixture_id, window))
+        fixture = _fixture(fixture_id, kickoff_at=NOW)
+        return FixtureAnalyticsResponse(
+            fixture=fixture, window=window, historical_cutoff_at=fixture.kickoff_at,
+            home=FixtureAnalyticsSide(team=HOME, overall=_metrics(), venue_split=_metrics()),
+            away=FixtureAnalyticsSide(team=AWAY, overall=_metrics(), venue_split=_metrics()),
+        )
+
+
+@pytest.fixture
+def client_and_service():
+    service = FakeService()
+    app.dependency_overrides[get_web_read_service] = lambda: service
+    try:
+        yield TestClient(app), service
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_season_fixtures_contract_includes_deterministic_order_and_no_scheduled_score(client_and_service) -> None:
+    client, service = client_and_service
+    response = client.get("/web/v1/seasons/3/fixtures?limit=2&offset=0")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [fixture["id"] for fixture in body["fixtures"]] == [1, 2]
+    assert body["fixtures"][0]["final_score"] == {"home": 2, "away": 1}
+    assert body["fixtures"][1]["final_score"] is None
+    assert service.season_calls == [(3, 2, 0)]
+
+
+@pytest.mark.parametrize("path", [
+    "/web/v1/teams/10/analytics?season_id=3&scope=invalid",
+    "/web/v1/teams/10/analytics?season_id=3&window=7",
+    "/web/v1/fixtures/1/analytics?window=7",
+    "/web/v1/seasons/3/fixtures?limit=0",
+])
+def test_invalid_query_contract_is_422(client_and_service, path: str) -> None:
+    client, _ = client_and_service
+    assert client.get(path).status_code == 422
+
+
+@pytest.mark.parametrize("path,code", [
+    ("/web/v1/seasons/404/fixtures", "season_not_found"),
+    ("/web/v1/teams/10/analytics?season_id=404", "season_not_found"),
+    ("/web/v1/teams/404/analytics?season_id=3", "team_not_found_in_season"),
+    ("/web/v1/fixtures/404/analytics", "fixture_not_found"),
+])
+def test_not_found_contract_is_stable(client_and_service, path: str, code: str) -> None:
+    client, _ = client_and_service
+    response = client.get(path)
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": code}}
+
+
+def test_team_analytics_and_fixture_comparison_contract(client_and_service) -> None:
+    client, service = client_and_service
+    team_response = client.get("/web/v1/teams/10/analytics?season_id=3&scope=home&window=15")
+    fixture_response = client.get("/web/v1/fixtures/1/analytics?window=5")
+
+    assert team_response.status_code == 200, team_response.text
+    assert fixture_response.status_code == 200, fixture_response.text
+    assert team_response.json()["scope"] == "home"
+    assert team_response.json()["window"] == 15
+    assert fixture_response.json()["historical_cutoff_at"] == NOW.isoformat().replace("+00:00", "Z")
+    assert fixture_response.json()["home"]["team"]["id"] == HOME.id
+    assert fixture_response.json()["away"]["team"]["id"] == AWAY.id
+    assert service.team_calls[0][1:] == (3, service.team_calls[0][2], 15)
+    assert service.fixture_calls == [(1, 5)]

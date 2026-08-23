@@ -1,0 +1,18 @@
+{
+  "endpoint": "/leagues",
+  "parameters": {
+    "id": 39,
+    "season": 2025
+  },
+  "request_started_at": "2026-08-22T20:16:41.445645+00:00",
+  "response_received_at": "2026-08-22T20:16:41.557908+00:00",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "299",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7398"
+  },
+  "content_sha256": "453023194b223b3ffa7391e7a60d5932c058a8dd4dfc7ccf59a69133b46d209d",
+  "byte_count": 683
+}

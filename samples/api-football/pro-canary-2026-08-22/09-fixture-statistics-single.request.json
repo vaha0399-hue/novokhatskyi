@@ -1,0 +1,17 @@
+{
+  "endpoint": "/fixtures/statistics",
+  "parameters": {
+    "fixture": 1378969
+  },
+  "request_started_at": "2026-08-22T20:16:42.270808+00:00",
+  "response_received_at": "2026-08-22T20:16:42.348677+00:00",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "291",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7390"
+  },
+  "content_sha256": "032e11b76585329c07f3726938228b6d102128872069b927c9397fe20ac7f81f",
+  "byte_count": 1666
+}

@@ -1,0 +1,19 @@
+{
+  "endpoint": "/fixtures",
+  "parameters": {
+    "league": 39,
+    "season": 2025,
+    "status": "FT-AET-PEN"
+  },
+  "request_started_at": "2026-08-22T20:16:42.014339+00:00",
+  "response_received_at": "2026-08-22T20:16:42.098635+00:00",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "294",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7393"
+  },
+  "content_sha256": "5c4bdd68ef3dce72e26b02deb778610e02bd1ca08bdd9b52673f90a4005fe085",
+  "byte_count": 369129
+}

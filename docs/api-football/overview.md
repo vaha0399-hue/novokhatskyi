@@ -1,5 +1,11 @@
 # API-Football contract research overview
 
+> **Current evidence:** Pro-plan access to EPL seasons 2025 and 2026 was
+> verified on 2026-08-22. See
+> [the Pro contract canary](pro-canary-2025-2026.md). The current product canon
+> is an analytics platform without predictions or live ingestion; older scope
+> wording below is retained only as historical Stage 2 context.
+
 ## Scope and season boundary
 
 This research used real API-Football responses for Premier League
@@ -116,7 +122,7 @@ scheduler:
 | standings | daily and after completed matchdays | Useful for validation; product features should be calculated locally. |
 | team statistics | research/validation backend job only | Most aggregates are derivable from canonical fixtures. |
 | fixture statistics | once after completion, with at most one later correction refresh if needed | Post-match metrics such as xG/shots are not score-derivable. |
-| injuries | daily; closer refresh before relevant fixtures if used by predictions | Highly time-sensitive. |
+| injuries | daily; closer refresh before relevant fixtures if used in pre-match availability views | Highly time-sensitive. |
 | lineups | one backend job close to kickoff, only for fixtures whose lineup matters | Fixture-specific and quota-expensive; never user-triggered. |
 
 With a free allowance of 100 calls/day, fixture-specific statistics and lineups

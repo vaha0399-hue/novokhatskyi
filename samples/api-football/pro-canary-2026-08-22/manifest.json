@@ -1,0 +1,234 @@
+{
+  "campaign": "api-football-pro-contract-canary-2026-08-22",
+  "physical_api_calls_this_campaign": 9,
+  "prior_quota_check_calls": 1,
+  "total_controlled_calls": 10,
+  "secrets_included": false,
+  "calls": [
+    {
+      "sequence": 1,
+      "name": "leagues-epl-2025",
+      "endpoint": "/leagues",
+      "parameters": {
+        "id": 39,
+        "season": 2025
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "299",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7398"
+      },
+      "content_sha256": "453023194b223b3ffa7391e7a60d5932c058a8dd4dfc7ccf59a69133b46d209d",
+      "byte_count": 683,
+      "raw_file": "01-leagues-epl-2025.raw.json",
+      "request_file": "01-leagues-epl-2025.request.json"
+    },
+    {
+      "sequence": 2,
+      "name": "leagues-epl-2026",
+      "endpoint": "/leagues",
+      "parameters": {
+        "id": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "298",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7397"
+      },
+      "content_sha256": "a6d4f762621a722e5171b96fdf6ddc3d25bec619c6e1dd7fffddaab699026297",
+      "byte_count": 681,
+      "raw_file": "02-leagues-epl-2026.raw.json",
+      "request_file": "02-leagues-epl-2026.request.json"
+    },
+    {
+      "sequence": 3,
+      "name": "teams-epl-2025",
+      "endpoint": "/teams",
+      "parameters": {
+        "league": 39,
+        "season": 2025
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "297",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7396"
+      },
+      "content_sha256": "8542da68cd30e937f7afbb0f02fd99afad2fa159443369f16b5c419d86549359",
+      "byte_count": 7502,
+      "raw_file": "03-teams-epl-2025.raw.json",
+      "request_file": "03-teams-epl-2025.request.json"
+    },
+    {
+      "sequence": 4,
+      "name": "standings-epl-2025",
+      "endpoint": "/standings",
+      "parameters": {
+        "league": 39,
+        "season": 2025
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "296",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7395"
+      },
+      "content_sha256": "09c0c8d37a7e9ef9753b5899ad6054c9241cd52e835d7c0bea28c9103017f3f0",
+      "byte_count": 10592,
+      "raw_file": "04-standings-epl-2025.raw.json",
+      "request_file": "04-standings-epl-2025.request.json"
+    },
+    {
+      "sequence": 5,
+      "name": "team-statistics-epl-2025",
+      "endpoint": "/teams/statistics",
+      "parameters": {
+        "league": 39,
+        "season": 2025,
+        "team": 33
+      },
+      "http_status": 200,
+      "results": 11,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "295",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7394"
+      },
+      "content_sha256": "21ae97f3b26b04e15e55f752cebde4dfb7a07121521ac85f643bd57db3634699",
+      "byte_count": 3079,
+      "raw_file": "05-team-statistics-epl-2025.raw.json",
+      "request_file": "05-team-statistics-epl-2025.request.json"
+    },
+    {
+      "sequence": 6,
+      "name": "fixtures-epl-2025-completed",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "league": 39,
+        "season": 2025,
+        "status": "FT-AET-PEN"
+      },
+      "http_status": 200,
+      "results": 380,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "294",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7393"
+      },
+      "content_sha256": "5c4bdd68ef3dce72e26b02deb778610e02bd1ca08bdd9b52673f90a4005fe085",
+      "byte_count": 369129,
+      "raw_file": "06-fixtures-epl-2025-completed.raw.json",
+      "request_file": "06-fixtures-epl-2025-completed.request.json"
+    },
+    {
+      "sequence": 7,
+      "name": "fixtures-epl-2026",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 380,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "293",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7392"
+      },
+      "content_sha256": "fa1bab88d96fe0cf794e6bfcbd630fc65f4db94e9b225ae847a0762500510582",
+      "byte_count": 369236,
+      "raw_file": "07-fixtures-epl-2026.raw.json",
+      "request_file": "07-fixtures-epl-2026.request.json"
+    },
+    {
+      "sequence": 8,
+      "name": "fixtures-batch-three",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "ids": "1378969-1378970-1378974"
+      },
+      "http_status": 200,
+      "results": 3,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "292",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7391"
+      },
+      "content_sha256": "03b8cf8a53185faa525aca2aa8ae1a08f72ed942497ea7fd19b1cdfbc4b85477",
+      "byte_count": 111849,
+      "raw_file": "08-fixtures-batch-three.raw.json",
+      "request_file": "08-fixtures-batch-three.request.json"
+    },
+    {
+      "sequence": 9,
+      "name": "fixture-statistics-single",
+      "endpoint": "/fixtures/statistics",
+      "parameters": {
+        "fixture": 1378969
+      },
+      "http_status": 200,
+      "results": 2,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "291",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7390"
+      },
+      "content_sha256": "032e11b76585329c07f3726938228b6d102128872069b927c9397fe20ac7f81f",
+      "byte_count": 1666,
+      "raw_file": "09-fixture-statistics-single.raw.json",
+      "request_file": "09-fixture-statistics-single.request.json"
+    }
+  ]
+}

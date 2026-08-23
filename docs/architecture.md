@@ -1,5 +1,11 @@
 # Architecture Boundaries
 
+## Canon
+
+The approved product scope is recorded in
+[`product-scope.md`](product-scope.md). It supersedes earlier references to a
+prediction product.
+
 ## MVP scope
 
 Football Analytics is currently a web-only MVP. The user-facing application
@@ -16,9 +22,7 @@ API-Football
     -> FastAPI backend
     -> normalisation
     -> Supabase PostgreSQL
-    -> Feature Engine
-    -> Prediction Engine
-    -> Supabase PostgreSQL
+    -> Analytics Engine
     -> FastAPI backend
     -> Next.js website
     -> User
@@ -39,14 +43,20 @@ API-Football responses have been collected and analysed in a later stage.
 7. Database changes must be versioned as migrations in
    `supabase/migrations/` after source-data analysis.
 8. Imports must eventually be idempotent and must not create duplicates.
-9. Pre-match predictions must eventually be stored before kickoff with their
-   model version and calculation timestamp.
+9. Analytics must report factual and derived historical indicators without
+   producing outcome predictions or win probabilities.
 10. No mobile app, desktop app, browser extension, or standalone public API is
     being designed at the current stage.
 
 ## Stage discipline
 
-Stage 1 implements only the minimal FastAPI health contract and repository
-foundation. API-Football and Supabase are deliberately absent. Their future
-presence in the target flow does not authorise schemas, clients, credentials,
-or integrations in the current stage.
+The EPL 2024 historical fixture-statistics backfill is complete and provides
+380 fixtures with 760 team-level statistics rows. The immediate next step is a
+dedicated Git checkpoint for the associated code, tests, and documentation;
+Supabase-imported data itself is not committed.
+
+After that checkpoint, implement the Analytics Engine and its historical SQL
+validation layer before the FastAPI read contract. For a target fixture, every
+derived metric must use only fixtures with an earlier kickoff. Frontend and
+authentication integration begin only after those backend contracts are stable.
+The canonical detailed roadmap is in [`product-scope.md`](product-scope.md).

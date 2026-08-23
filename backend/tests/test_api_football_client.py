@@ -75,15 +75,29 @@ def test_http_error_is_sanitized_and_not_retried() -> None:
 
 
 def test_api_error_is_sanitized() -> None:
+    raw = b'{"errors":{"token":"provider-error"},"results":0,"response":[]}'
+
     async def exercise() -> None:
         client = APIFootballClient(
             "test-secret",
-            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"errors": {"token": "test-secret"}})),
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    content=raw,
+                    headers={
+                        "x-ratelimit-requests-remaining": "41",
+                        "authorization": "test-secret",
+                    },
+                )
+            ),
         )
         with pytest.raises(APIFootballAPIError) as captured:
             await client.get("fixtures")
         assert str(captured.value) == "API-Football returned an API-level error."
         assert "test-secret" not in str(captured.value)
+        assert captured.value.raw_body == raw
+        assert captured.value.status_code == 200
+        assert captured.value.safe_headers == {"x-ratelimit-requests-remaining": "41"}
 
     asyncio.run(exercise())
 

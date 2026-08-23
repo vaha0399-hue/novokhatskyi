@@ -26,8 +26,18 @@ class APIFootballHTTPError(APIFootballError):
 class APIFootballAPIError(APIFootballError):
     """Raised when API-Football returns application-level errors in a 2xx body."""
 
-    def __init__(self, errors: object) -> None:
+    def __init__(
+        self,
+        errors: object,
+        *,
+        raw_body: bytes | None = None,
+        status_code: int | None = None,
+        safe_headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__("API-Football returned an API-level error.")
-        # Provider error bodies are intentionally not retained: they can be echoed by
-        # callers into logs and are not needed to decide whether collection failed.
+        # Provider error details are intentionally not retained in the exception message.
+        # The importer may persist raw bytes without displaying them.
         self.error_type = type(errors).__name__
+        self.raw_body = raw_body
+        self.status_code = status_code
+        self.safe_headers = dict(safe_headers or {})
