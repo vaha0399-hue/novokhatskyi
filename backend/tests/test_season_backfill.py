@@ -13,6 +13,7 @@ from app.importer.season_backfill import (
     MAX_API_ATTEMPTS,
     REQUEST_PARAMS,
     AttemptFailure,
+    SeasonBackfillScope,
     chunked,
     collect_fixture_season,
     validate_fixture_season_response,
@@ -84,6 +85,46 @@ def test_request_is_exactly_one_season_fixtures_call() -> None:
     assert collected.attempts == 1
     assert client.calls == [("/fixtures", REQUEST_PARAMS)]
     assert failures == []
+
+
+def test_2025_scope_uses_its_own_params_and_validates_its_own_league_season() -> None:
+    scope = SeasonBackfillScope(
+        league_external_id=39,
+        season_start_year=2025,
+        expected_fixture_count=380,
+    )
+    response = sample_response()
+    payload = copy.deepcopy(response.data)
+    payload["parameters"] = {"league": "39", "season": "2025"}
+    for entry in payload["response"]:
+        entry["league"]["season"] = 2025
+    scoped_response = APIFootballResponse(payload, json.dumps(payload).encode(), 200, {})
+
+    records = validate_fixture_season_response(
+        scoped_response,
+        allowed_team_external_ids=sample_team_ids(scoped_response),
+        scope=scope,
+    )
+    assert len(records) == 380
+
+    failures: list[AttemptFailure] = []
+    client = QueuedClient([scoped_response])
+    collected = asyncio.run(
+        collect_fixture_season(
+            client,  # type: ignore[arg-type]
+            record_failure=failures.append,
+            scope=scope,
+            sleep=lambda _: asyncio.sleep(0),
+        )
+    )
+    assert collected.attempts == 1
+    assert client.calls == [("/fixtures", {"league": 39, "season": 2025})]
+    assert failures == []
+
+
+def test_scope_rejects_non_round_robin_fixture_count() -> None:
+    with pytest.raises(ValueError, match="double round-robin"):
+        SeasonBackfillScope(league_external_id=39, season_start_year=2025, expected_fixture_count=381)
 
 
 def test_transient_failures_retry_at_most_twice() -> None:

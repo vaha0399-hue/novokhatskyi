@@ -8,12 +8,15 @@ import pytest
 from app.importer.historical_lineups import (
     FixtureTarget,
     HistoricalLineupsContractError,
+    HistoricalLineupsScope,
     LineupPlayer,
     ParsedLineups,
     TeamLineup,
     _expected_player_values,
     _first_batch_is_fully_complete,
+    acquire_context_and_lock,
     classify_response,
+    release_lock,
 )
 
 SAMPLE = Path(__file__).parents[2] / "samples" / "api-football" / "lineups.raw.json"
@@ -152,6 +155,39 @@ def test_verifier_player_values_are_numeric_and_order_independent() -> None:
     })
 
     assert actual_in_database_order == _expected_player_values(parsed)
+
+
+class _QueryResult:
+    def __init__(self, row: tuple[object, ...]) -> None:
+        self.row = row
+
+    def fetchone(self) -> tuple[object, ...]:
+        return self.row
+
+
+class _LockConnection:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self._rows = iter(((True,), (7, 2025), (True,)))
+
+    def execute(self, query: str, params: tuple[object, ...]) -> _QueryResult:
+        self.calls.append((query, params))
+        return _QueryResult(next(self._rows))
+
+
+def test_2025_scope_uses_its_own_mapping_and_advisory_lock() -> None:
+    epl_2024 = HistoricalLineupsScope(league_external_id="39", season_start_year=2024)
+    epl_2025 = HistoricalLineupsScope(league_external_id="39", season_start_year=2025)
+    other_league_2025 = HistoricalLineupsScope(league_external_id="140", season_start_year=2025)
+    assert len({epl_2024.lock_key, epl_2025.lock_key, other_league_2025.lock_key}) == 3
+
+    conn = _LockConnection()
+    assert acquire_context_and_lock(conn, scope=epl_2025) == (7, 2025)  # type: ignore[arg-type]
+    release_lock(conn, scope=epl_2025)  # type: ignore[arg-type]
+
+    assert conn.calls[0][1] == (epl_2025.lock_key,)
+    assert conn.calls[1][1] == ("api-football", "39", 2025)
+    assert conn.calls[2][1] == (epl_2025.lock_key,)
 
 
 @pytest.mark.parametrize(

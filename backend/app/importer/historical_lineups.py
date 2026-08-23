@@ -28,6 +28,8 @@ from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.canary import request_params_sha256
 
 PROVIDER_CODE = "api-football"
+# Backward-compatible defaults for the already imported EPL 2024 scope.  New
+# campaigns must pass their own immutable HistoricalLineupsScope explicitly.
 LEAGUE_EXTERNAL_ID = "39"
 SEASON_START_YEAR = 2024
 EXPECTED_FIXTURE_COUNT = 380
@@ -39,7 +41,6 @@ ANOMALY_RETENTION_DAYS = 90
 MAX_CANARY_CALLS = 10
 FIRST_BATCH_CALLS = 5
 QUOTA_RESERVE = 25
-LOCK_KEY = "api-football:historical-lineups:39:2024:v1"
 
 Sleep = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
@@ -52,6 +53,42 @@ class HistoricalLineupsError(RuntimeError):
 
 class HistoricalLineupsContractError(HistoricalLineupsError):
     """A provider body cannot be safely mapped to the canonical schema."""
+
+
+@dataclass(frozen=True)
+class HistoricalLineupsScope:
+    """One immutable provider league/season campaign.
+
+    ``season_start_year`` is the API-Football season identifier, while the
+    corresponding canonical ``football.seasons.id`` is resolved under the
+    provider mapping lock.  The scope-specific advisory lock prevents one
+    campaign from blocking a different league or season.
+    """
+
+    league_external_id: str = LEAGUE_EXTERNAL_ID
+    season_start_year: int = SEASON_START_YEAR
+    expected_fixture_count: int = EXPECTED_FIXTURE_COUNT
+    provider_code: str = PROVIDER_CODE
+
+    def __post_init__(self) -> None:
+        if not self.league_external_id.strip():
+            raise ValueError("league_external_id must be non-blank")
+        if self.season_start_year < 1:
+            raise ValueError("season_start_year must be positive")
+        if self.expected_fixture_count < 1:
+            raise ValueError("expected_fixture_count must be positive")
+        if not self.provider_code.strip():
+            raise ValueError("provider_code must be non-blank")
+
+    @property
+    def lock_key(self) -> str:
+        return (
+            f"{self.provider_code}:historical-lineups:"
+            f"{self.league_external_id}:{self.season_start_year}:v1"
+        )
+
+
+DEFAULT_HISTORICAL_LINEUPS_SCOPE = HistoricalLineupsScope()
 
 
 @dataclass(frozen=True)
@@ -295,8 +332,12 @@ def classify_response(payload: Mapping[str, Any], target: FixtureTarget) -> Pars
     return ParsedLineups("complete" if results == 2 else "partial", lineups)
 
 
-def acquire_context_and_lock(conn: Connection[Any]) -> tuple[int, int]:
-    locked = conn.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (LOCK_KEY,)).fetchone()[0]
+def acquire_context_and_lock(
+    conn: Connection[Any], *, scope: HistoricalLineupsScope = DEFAULT_HISTORICAL_LINEUPS_SCOPE,
+) -> tuple[int, int]:
+    locked = conn.execute(
+        "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (scope.lock_key,)
+    ).fetchone()[0]
     if not locked:
         raise HistoricalLineupsError("historical lineup importer is already running")
     row = conn.execute(
@@ -306,19 +347,25 @@ def acquire_context_and_lock(conn: Connection[Any]) -> tuple[int, int]:
            WHERE provider.code = %s
              AND season_ref.league_external_id = %s
              AND season_ref.external_season = %s""",
-        (PROVIDER_CODE, LEAGUE_EXTERNAL_ID, SEASON_START_YEAR),
+        (scope.provider_code, scope.league_external_id, scope.season_start_year),
     ).fetchone()
     if row is None:
-        raise HistoricalLineupsError("EPL 2024 provider and season mappings are required")
+        raise HistoricalLineupsError(
+            "provider and season mappings are required for "
+            f"league={scope.league_external_id} season={scope.season_start_year}"
+        )
     return int(row[0]), int(row[1])
 
 
-def release_lock(conn: Connection[Any]) -> None:
-    conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (LOCK_KEY,))
+def release_lock(
+    conn: Connection[Any], *, scope: HistoricalLineupsScope = DEFAULT_HISTORICAL_LINEUPS_SCOPE,
+) -> None:
+    conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (scope.lock_key,))
 
 
 def _targets_without_historical_attempts(
-    conn: Connection[Any], *, provider_id: int, season_id: int, limit: int
+    conn: Connection[Any], *, provider_id: int, season_id: int, limit: int,
+    scope: HistoricalLineupsScope = DEFAULT_HISTORICAL_LINEUPS_SCOPE,
 ) -> list[FixtureTarget]:
     if limit < 1:
         raise ValueError("target limit must be positive")
@@ -327,8 +374,12 @@ def _targets_without_historical_attempts(
            WHERE season_id=%s AND lifecycle_state='completed' AND result_finalized_at IS NOT NULL""",
         (season_id,),
     ).fetchone()[0]
-    if fixture_count != EXPECTED_FIXTURE_COUNT:
-        raise HistoricalLineupsError("preflight requires 380 completed and finalized EPL 2024 fixtures")
+    if fixture_count != scope.expected_fixture_count:
+        raise HistoricalLineupsError(
+            "preflight requires "
+            f"{scope.expected_fixture_count} completed and finalized fixtures for "
+            f"league={scope.league_external_id} season={scope.season_start_year}"
+        )
 
     rows = conn.execute(
         """SELECT fixture.id, fixture.season_id, fixture_ref.external_id,
@@ -1019,6 +1070,7 @@ def run_controlled_canary(
     *, client: APIFootballClient | None = None, clock: Clock = _utcnow,
     sleep: Sleep = asyncio.sleep, first_batch_calls: int = FIRST_BATCH_CALLS,
     second_batch_calls: int = FIRST_BATCH_CALLS,
+    scope: HistoricalLineupsScope = DEFAULT_HISTORICAL_LINEUPS_SCOPE,
 ) -> HistoricalLineupsCanaryReport:
     """Run exactly five calls, verify, replay one raw payload, then five more.
 
@@ -1030,7 +1082,7 @@ def run_controlled_canary(
         raise ValueError("controlled historical-lineups canary requires two batches of exactly five calls")
     api = client or APIFootballClient.from_environment()
     with psycopg.connect(_database_url(), autocommit=True) as conn:
-        provider_id, season_id = acquire_context_and_lock(conn)
+        provider_id, season_id = acquire_context_and_lock(conn, scope=scope)
         try:
             out_of_scope_before = {table: _table_fingerprint(conn, table) for table in OUT_OF_SCOPE_TABLES}
             resumed = _resume_unfinished_success_fetches(
@@ -1046,7 +1098,7 @@ def run_controlled_canary(
             physical_calls = 0
 
             first_targets = _targets_without_historical_attempts(
-                conn, provider_id=provider_id, season_id=season_id, limit=first_batch_calls
+                conn, provider_id=provider_id, season_id=season_id, limit=first_batch_calls, scope=scope
             )
             if len(first_targets) != first_batch_calls:
                 raise HistoricalLineupsError("fewer than five unattempted fixtures are available for first canary batch")
@@ -1093,7 +1145,7 @@ def run_controlled_canary(
                 raise AssertionError("retained raw replay created or changed canonical snapshot")
 
             second_targets = _targets_without_historical_attempts(
-                conn, provider_id=provider_id, season_id=season_id, limit=second_batch_calls
+                conn, provider_id=provider_id, season_id=season_id, limit=second_batch_calls, scope=scope
             )
             if len(second_targets) != second_batch_calls:
                 raise HistoricalLineupsError("fewer than five unattempted fixtures are available for second canary batch")
@@ -1133,13 +1185,22 @@ def run_controlled_canary(
                 replay_fixture_external_id=replay_target.external_id, verification=verification,
             )
         finally:
-            release_lock(conn)
+            release_lock(conn, scope=scope)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the ten-call historical EPL 2024 lineup canary")
-    parser.parse_args()
-    report = run_controlled_canary()
+    parser = argparse.ArgumentParser(description="Run a ten-call historical lineup canary")
+    parser.add_argument("--league-external-id", default=LEAGUE_EXTERNAL_ID)
+    parser.add_argument("--season-start-year", type=int, default=SEASON_START_YEAR)
+    parser.add_argument("--expected-fixture-count", type=int, default=EXPECTED_FIXTURE_COUNT)
+    args = parser.parse_args()
+    report = run_controlled_canary(
+        scope=HistoricalLineupsScope(
+            league_external_id=args.league_external_id,
+            season_start_year=args.season_start_year,
+            expected_fixture_count=args.expected_fixture_count,
+        )
+    )
     print(json.dumps(asdict(report), default=str, sort_keys=True))
 
 

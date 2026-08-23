@@ -1,17 +1,19 @@
-"""Controlled fixtures-only Premier League 2024 season backfill.
+"""Controlled fixtures-only API-Football completed-season backfill.
 
 The job is intentionally manual, quota-bounded, non-live, and development-only.
-It stores one season-wide raw provider response before atomically normalizing the
-380 completed fixtures. A valid stored raw response is always preferred over a
+It stores one season-wide raw provider response before atomically normalizing
+the expected completed fixtures. A valid stored raw response is always preferred over a
 new API request so interrupted normalization resumes without spending quota.
 """
 
 from __future__ import annotations
 
 import asyncio
+import argparse
 import hashlib
 import json
 import os
+import math
 import random
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -26,19 +28,66 @@ from app.api_football import APIFootballClient, APIFootballResponse
 from app.api_football.client import safe_rate_limit_headers
 from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.canary import parse_datetime, request_params_sha256
+from app.importer.fixture_status_contract import (
+    FixtureStatusObservation,
+    validate_fixture_status_response,
+)
 
 PROVIDER_CODE = "api-football"
-LEAGUE_EXTERNAL_ID = 39
-SEASON_START_YEAR = 2024
-EXPECTED_FIXTURE_COUNT = 380
 BACKFILL_PURPOSE = "bootstrap"
 RAW_RETENTION_DAYS = 30
 BATCH_SIZE = 50
 MAX_API_ATTEMPTS = 3
-LOCK_KEY = "api-football:fixtures:39:2024:v1"
-CANARY_FIXTURE_EXTERNAL_ID = 1208021
-REQUEST_PARAMS = {"league": LEAGUE_EXTERNAL_ID, "season": SEASON_START_YEAR}
 RETRYABLE_HTTP_STATUSES = frozenset({408, 500, 502, 503, 504})
+
+
+@dataclass(frozen=True)
+class SeasonBackfillScope:
+    """Immutable provider scope for one controlled, completed-season import."""
+
+    league_external_id: int
+    season_start_year: int
+    expected_fixture_count: int
+    preexisting_canary_fixture_external_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.league_external_id <= 0 or self.season_start_year <= 0:
+            raise ValueError("league external ID and season start year must be positive")
+        if self.expected_fixture_count <= 0:
+            raise ValueError("expected fixture count must be positive")
+        # A double round-robin season has n * (n - 1) fixtures. Keep the
+        # schedule invariant scope-driven rather than EPL-specific.
+        team_count = (1 + math.isqrt(1 + 4 * self.expected_fixture_count)) // 2
+        if team_count < 2 or team_count * (team_count - 1) != self.expected_fixture_count:
+            raise ValueError("expected fixture count must form a complete double round-robin schedule")
+
+    @property
+    def request_params(self) -> dict[str, int]:
+        return {"league": self.league_external_id, "season": self.season_start_year}
+
+    @property
+    def lock_key(self) -> str:
+        return f"api-football:fixtures:{self.league_external_id}:{self.season_start_year}:v1"
+
+    @property
+    def expected_team_count(self) -> int:
+        return (1 + math.isqrt(1 + 4 * self.expected_fixture_count)) // 2
+
+
+DEFAULT_SCOPE = SeasonBackfillScope(
+    league_external_id=39,
+    season_start_year=2024,
+    expected_fixture_count=380,
+    preexisting_canary_fixture_external_id=1208021,
+)
+
+# Backward-compatible exports for the established EPL 2024 operational path.
+LEAGUE_EXTERNAL_ID = DEFAULT_SCOPE.league_external_id
+SEASON_START_YEAR = DEFAULT_SCOPE.season_start_year
+EXPECTED_FIXTURE_COUNT = DEFAULT_SCOPE.expected_fixture_count
+CANARY_FIXTURE_EXTERNAL_ID = DEFAULT_SCOPE.preexisting_canary_fixture_external_id
+LOCK_KEY = DEFAULT_SCOPE.lock_key
+REQUEST_PARAMS = DEFAULT_SCOPE.request_params
 
 
 @dataclass(frozen=True)
@@ -47,6 +96,7 @@ class SeasonContext:
     league_id: int
     season_id: int
     team_ids: Mapping[int, int]
+    scope: SeasonBackfillScope
 
 
 @dataclass(frozen=True)
@@ -154,10 +204,12 @@ def validate_fixture_season_response(
     response: APIFootballResponse,
     *,
     allowed_team_external_ids: Iterable[int],
+    scope: SeasonBackfillScope = DEFAULT_SCOPE,
 ) -> list[FixtureRecord]:
     """Validate the entire season response before any normalized database DML."""
     payload = response.data
-    if payload.get("parameters") != {"league": "39", "season": "2024"}:
+    expected_parameters = {key: str(value) for key, value in scope.request_params.items()}
+    if payload.get("parameters") != expected_parameters:
         raise ValueError("provider parameters mismatch for season fixtures")
     if payload.get("errors") not in ([], {}, None):
         raise ValueError("provider returned errors for season fixtures")
@@ -167,8 +219,10 @@ def validate_fixture_season_response(
     entries = payload.get("response")
     if not isinstance(entries, list):
         raise ValueError("season fixtures response must be an array")
-    if payload.get("results") != EXPECTED_FIXTURE_COUNT or len(entries) != EXPECTED_FIXTURE_COUNT:
-        raise ValueError("season fixtures response must contain exactly 380 fixtures")
+    if payload.get("results") != scope.expected_fixture_count or len(entries) != scope.expected_fixture_count:
+        raise ValueError(
+            f"season fixtures response must contain exactly {scope.expected_fixture_count} fixtures"
+        )
 
     allowed_teams = set(allowed_team_external_ids)
     records: list[FixtureRecord] = []
@@ -193,7 +247,10 @@ def validate_fixture_season_response(
         if external_id in seen_ids:
             raise ValueError("duplicate fixture.id in season response")
         seen_ids.add(external_id)
-        if league.get("id") != LEAGUE_EXTERNAL_ID or league.get("season") != SEASON_START_YEAR:
+        if (
+            league.get("id") != scope.league_external_id
+            or league.get("season") != scope.season_start_year
+        ):
             raise ValueError("fixture belongs to an unexpected league or season")
         status = fixture.get("status")
         if not isinstance(status, Mapping) or status.get("short") != "FT":
@@ -269,8 +326,16 @@ def validate_fixture_season_response(
     for record in records:
         home_counts[record.home_external_id] += 1
         away_counts[record.away_external_id] += 1
-    if len(allowed_teams) != 20 or set(home_counts.values()) != {19} or set(away_counts.values()) != {19}:
-        raise ValueError("season fixtures do not form a complete 20-team home/away schedule")
+    expected_home_or_away = scope.expected_team_count - 1
+    if (
+        len(allowed_teams) != scope.expected_team_count
+        or set(home_counts.values()) != {expected_home_or_away}
+        or set(away_counts.values()) != {expected_home_or_away}
+    ):
+        raise ValueError(
+            "season fixtures do not form a complete "
+            f"{scope.expected_team_count}-team home/away schedule"
+        )
     return records
 
 
@@ -282,13 +347,14 @@ async def collect_fixture_season(
     client: APIFootballClient,
     *,
     record_failure: FailureRecorder,
+    scope: SeasonBackfillScope = DEFAULT_SCOPE,
     sleep: Sleep = asyncio.sleep,
 ) -> CollectedFetch:
     """Execute one logical request with a hard cap of three physical attempts."""
     for attempt in range(1, MAX_API_ATTEMPTS + 1):
         started_at = _utcnow()
         try:
-            response = await client.get("/fixtures", params=REQUEST_PARAMS)
+            response = await client.get("/fixtures", params=scope.request_params)
         except APIFootballHTTPError as error:
             received_at = _utcnow()
             failure = AttemptFailure(
@@ -325,10 +391,14 @@ async def collect_fixture_season(
     raise AssertionError("unreachable API attempt loop")
 
 
-def acquire_context_and_lock(conn: Connection[Any]) -> SeasonContext:
+def acquire_context_and_lock(
+    conn: Connection[Any],
+    *,
+    scope: SeasonBackfillScope = DEFAULT_SCOPE,
+) -> SeasonContext:
     locked = conn.execute(
         "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
-        (LOCK_KEY,),
+        (scope.lock_key,),
     ).fetchone()[0]
     if not locked:
         raise RuntimeError("season backfill is already running")
@@ -344,10 +414,10 @@ def acquire_context_and_lock(conn: Connection[Any]) -> SeasonContext:
          AND sr.external_season = %s
         WHERE p.code = %s
         """,
-        (str(LEAGUE_EXTERNAL_ID), SEASON_START_YEAR, PROVIDER_CODE),
+        (str(scope.league_external_id), scope.season_start_year, PROVIDER_CODE),
     ).fetchone()
     if row is None:
-        raise RuntimeError("canary provider/league/season mappings are required before backfill")
+        raise RuntimeError("provider/league/season mappings are required before season backfill")
     provider_id, league_id, season_id = row
     team_rows = conn.execute(
         """
@@ -364,9 +434,11 @@ def acquire_context_and_lock(conn: Connection[Any]) -> SeasonContext:
         team_ids = {int(external_id): team_id for external_id, team_id in team_rows}
     except ValueError as error:
         raise RuntimeError("season team provider IDs must be integers") from error
-    if len(team_ids) != 20:
-        raise RuntimeError("exactly 20 mapped season teams are required before backfill")
-    return SeasonContext(provider_id, league_id, season_id, team_ids)
+    if len(team_ids) != scope.expected_team_count:
+        raise RuntimeError(
+            f"exactly {scope.expected_team_count} mapped season teams are required before backfill"
+        )
+    return SeasonContext(provider_id, league_id, season_id, team_ids, scope)
 
 
 def load_reusable_fetch(conn: Connection[Any], context: SeasonContext) -> StoredFetch | None:
@@ -390,7 +462,7 @@ def load_reusable_fetch(conn: Connection[Any], context: SeasonContext) -> Stored
         """,
         (
             context.provider_id,
-            request_params_sha256(REQUEST_PARAMS),
+            request_params_sha256(context.scope.request_params),
             BACKFILL_PURPOSE,
             context.season_id,
         ),
@@ -439,8 +511,8 @@ def persist_failed_attempt(
             """,
             (
                 context.provider_id,
-                Jsonb(REQUEST_PARAMS),
-                request_params_sha256(REQUEST_PARAMS),
+                Jsonb(context.scope.request_params),
+                request_params_sha256(context.scope.request_params),
                 BACKFILL_PURPOSE,
                 failure.request_started_at,
                 None if failure.outcome == "transport_error" else failure.response_received_at,
@@ -480,8 +552,8 @@ def persist_success_fetch(
             """,
             (
                 context.provider_id,
-                Jsonb(REQUEST_PARAMS),
-                request_params_sha256(REQUEST_PARAMS),
+                Jsonb(context.scope.request_params),
+                request_params_sha256(context.scope.request_params),
                 BACKFILL_PURPOSE,
                 collected.request_started_at,
                 collected.response_received_at,
@@ -630,8 +702,11 @@ def _normalize_fixture(
         ).fetchone()
         if not _existing_fixture_is_exact(actual, context=context, record=record):
             raise ValueError(f"existing fixture identity or result conflict for {record.external_id}")
-        if record.external_id == CANARY_FIXTURE_EXTERNAL_ID and actual[15] is None:
-            raise ValueError("canary fixture must already be finalized and immutable")
+        if (
+            context.scope.preexisting_canary_fixture_external_id == record.external_id
+            and actual[15] is None
+        ):
+            raise ValueError("preexisting canary fixture must already be finalized and immutable")
         if actual[15] is None:
             availability_at = record.kickoff_at + timedelta(hours=3)
             conn.execute(
@@ -658,8 +733,8 @@ def _normalize_fixture(
             )
         return fixture_id, False
 
-    if record.external_id == CANARY_FIXTURE_EXTERNAL_ID:
-        raise ValueError("finalized canary fixture provider mapping is missing")
+    if context.scope.preexisting_canary_fixture_external_id == record.external_id:
+        raise ValueError("finalized preexisting canary fixture provider mapping is missing")
 
     availability_at = record.kickoff_at + timedelta(hours=3)
     venue_id = _resolve_venue(conn, context=context, record=record, seen_at=fetch.response_received_at)
@@ -731,6 +806,7 @@ def normalize_fixture_season(
     context: SeasonContext,
     fetch: StoredFetch,
     records: Sequence[FixtureRecord],
+    status_observations: Sequence[FixtureStatusObservation],
     fail_after_chunk: int | None = None,
 ) -> dict[str, int]:
     created = 0
@@ -760,8 +836,16 @@ def normalize_fixture_season(
             """,
             (context.provider_id, context.season_id),
         ).fetchone()[0]
-        if count != EXPECTED_FIXTURE_COUNT:
-            raise AssertionError("season fixture mapping count is not 380")
+        if count != context.scope.expected_fixture_count:
+            raise AssertionError(
+                f"season fixture mapping count is not {context.scope.expected_fixture_count}"
+            )
+        _insert_missing_provider_statuses(
+            conn,
+            context=context,
+            fetch=fetch,
+            observations=status_observations,
+        )
         conn.execute(
             """
             UPDATE source.provider_fetches
@@ -771,6 +855,99 @@ def normalize_fixture_season(
             (fetch.fetch_id,),
         )
     return {"processed": processed, "created": created, "batches": len(batches)}
+
+
+def _insert_missing_provider_statuses(
+    conn: Connection[Any],
+    *,
+    context: SeasonContext,
+    fetch: StoredFetch,
+    observations: Sequence[FixtureStatusObservation],
+) -> None:
+    """Persist the current exact provider status for newly imported fixtures.
+
+    Historical backfills must never rewrite an existing status/provenance row.
+    A later controlled reconciliation job is the only lane that may advance a
+    provider status using a newer confirmed observation (for example NS -> FT).
+    """
+
+    expected_external_ids = {
+        row[0]
+        for row in conn.execute(
+            """SELECT ref.external_id
+               FROM source.fixture_provider_refs ref
+               JOIN football.fixtures fixture ON fixture.id = ref.fixture_id
+               WHERE ref.provider_id = %s AND fixture.season_id = %s""",
+            (context.provider_id, context.season_id),
+        ).fetchall()
+    }
+    observation_by_external_id = {
+        str(observation.external_fixture_id): observation for observation in observations
+    }
+    if set(observation_by_external_id) != expected_external_ids:
+        raise AssertionError("provider status observations do not match normalized season fixtures")
+
+    for external_id, observation in observation_by_external_id.items():
+        fixture_row = conn.execute(
+            """SELECT fixture.id, fixture.lifecycle_state::text
+               FROM source.fixture_provider_refs ref
+               JOIN football.fixtures fixture ON fixture.id = ref.fixture_id
+               WHERE ref.provider_id = %s AND ref.external_id = %s
+               FOR KEY SHARE""",
+            (context.provider_id, external_id),
+        ).fetchone()
+        if fixture_row is None:
+            raise AssertionError("normalized fixture provider mapping is missing")
+        fixture_id, lifecycle_state = fixture_row
+        mapping_row = conn.execute(
+            """SELECT canonical_state::text
+               FROM source.fixture_status_code_mappings
+               WHERE provider_id = %s AND external_code = %s""",
+            (context.provider_id, observation.status_code),
+        ).fetchone()
+        if mapping_row is None or mapping_row[0] != lifecycle_state:
+            raise AssertionError("provider status mapping conflicts with canonical fixture lifecycle")
+        conn.execute(
+            """INSERT INTO source.fixture_provider_status (
+                    provider_id, fixture_id, status_code, observed_at, source_fetch_id
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (provider_id, fixture_id) DO NOTHING""",
+            (
+                context.provider_id,
+                fixture_id,
+                observation.status_code,
+                fetch.response_received_at,
+                fetch.fetch_id,
+            ),
+        )
+
+
+def _validate_provider_statuses(
+    conn: Connection[Any],
+    *,
+    context: SeasonContext,
+    fetch: StoredFetch,
+    records: Sequence[FixtureRecord],
+) -> tuple[FixtureStatusObservation, ...]:
+    """Validate exact status membership against the reviewed DB mapping."""
+
+    allowed_status_codes = {
+        str(row[0])
+        for row in conn.execute(
+            """SELECT external_code
+               FROM source.fixture_status_code_mappings
+               WHERE provider_id = %s""",
+            (context.provider_id,),
+        ).fetchall()
+    }
+    if not allowed_status_codes:
+        raise RuntimeError("no reviewed provider fixture-status mappings are configured")
+    return validate_fixture_status_response(
+        fetch.response,
+        expected_content_sha256=hashlib.sha256(fetch.response.raw_body).digest(),
+        expected_fixture_ids={record.external_id for record in records},
+        allowed_status_codes=allowed_status_codes,
+    )
 
 
 UNTOUCHED_TABLES = (
@@ -801,7 +978,15 @@ def table_counts(conn: Connection[Any], tables: Iterable[str]) -> dict[str, int]
     return counts
 
 
-def canary_fixture_snapshot(conn: Connection[Any], context: SeasonContext) -> tuple[Any, ...]:
+def canary_fixture_snapshot(conn: Connection[Any], context: SeasonContext) -> tuple[Any, ...] | None:
+    """Capture an optional pre-existing finalized fixture for preservation checks.
+
+    New-season imports do not assume any provider fixture mapping exists. The
+    established EPL 2024 scope retains its canary invariant through DEFAULT_SCOPE.
+    """
+    external_id = context.scope.preexisting_canary_fixture_external_id
+    if external_id is None:
+        return None
     row = conn.execute(
         """
         SELECT f.*
@@ -809,10 +994,10 @@ def canary_fixture_snapshot(conn: Connection[Any], context: SeasonContext) -> tu
         JOIN football.fixtures f ON f.id = r.fixture_id
         WHERE r.provider_id = %s AND r.external_id = %s
         """,
-        (context.provider_id, str(CANARY_FIXTURE_EXTERNAL_ID)),
+        (context.provider_id, str(external_id)),
     ).fetchone()
     if row is None:
-        raise RuntimeError("finalized canary fixture is required before season backfill")
+        raise RuntimeError("configured preexisting canary fixture is required before season backfill")
     lifecycle_state, result_finalized_at, availability_basis = conn.execute(
         """
         SELECT f.lifecycle_state::text, f.result_finalized_at, f.availability_basis::text
@@ -820,10 +1005,12 @@ def canary_fixture_snapshot(conn: Connection[Any], context: SeasonContext) -> tu
         JOIN football.fixtures f ON f.id = r.fixture_id
         WHERE r.provider_id = %s AND r.external_id = %s
         """,
-        (context.provider_id, str(CANARY_FIXTURE_EXTERNAL_ID)),
+        (context.provider_id, str(external_id)),
     ).fetchone()
     if lifecycle_state != "completed" or result_finalized_at is None or availability_basis != "observed":
-        raise RuntimeError("canary fixture must be completed, observed, and finalized before backfill")
+        raise RuntimeError(
+            "configured preexisting canary fixture must be completed, observed, and finalized"
+        )
     return tuple(row)
 
 
@@ -832,7 +1019,7 @@ def verify_remote(
     *,
     context: SeasonContext,
     fetch_id: int,
-    canary_before: tuple[Any, ...],
+    canary_before: tuple[Any, ...] | None,
     untouched_before: Mapping[str, int],
 ) -> dict[str, Any]:
     fixture_count, mapping_count, completed_count = conn.execute(
@@ -843,6 +1030,15 @@ def verify_remote(
         JOIN football.fixtures f ON f.id = r.fixture_id
         WHERE r.provider_id = %s AND f.season_id = %s
         """,
+        (context.provider_id, context.season_id),
+    ).fetchone()
+    status_count, lifecycle_mismatch_count = conn.execute(
+        """SELECT count(*), count(*) FILTER (
+                WHERE status.status_code <> 'FT' OR fixture.lifecycle_state <> 'completed'
+            )
+           FROM source.fixture_provider_status status
+           JOIN football.fixtures fixture ON fixture.id = status.fixture_id
+           WHERE status.provider_id = %s AND fixture.season_id = %s""",
         (context.provider_id, context.season_id),
     ).fetchone()
     orphan_count = conn.execute(
@@ -874,14 +1070,22 @@ def verify_remote(
         SELECT count(*)
         FROM source.fixture_provider_refs r
         JOIN football.fixtures f ON f.id = r.fixture_id
-        WHERE r.provider_id = %s AND f.season_id = %s AND r.external_id <> %s
+        WHERE r.provider_id = %s AND f.season_id = %s
+          AND (%s IS NULL OR r.external_id <> %s)
           AND (
             f.availability_basis <> 'reconstructed_conservative'
             OR f.terminal_status_observed_at <> f.kickoff_at + interval '3 hours'
             OR f.result_available_at <> f.kickoff_at + interval '3 hours'
           )
         """,
-        (context.provider_id, context.season_id, str(CANARY_FIXTURE_EXTERNAL_ID)),
+        (
+            context.provider_id,
+            context.season_id,
+            context.scope.preexisting_canary_fixture_external_id,
+            str(context.scope.preexisting_canary_fixture_external_id)
+            if context.scope.preexisting_canary_fixture_external_id is not None
+            else None,
+        ),
     ).fetchone()[0]
     fetch_row = conn.execute(
         """
@@ -926,16 +1130,32 @@ def verify_remote(
     ).fetchone()[0]
     untouched_after = table_counts(conn, UNTOUCHED_TABLES)
     canary_unchanged = canary_fixture_snapshot(conn, context) == canary_before
+    expected_count = context.scope.expected_fixture_count
+    expected_schedule = (
+        context.scope.expected_team_count,
+        2 * (context.scope.expected_team_count - 1),
+        2 * (context.scope.expected_team_count - 1),
+        context.scope.expected_team_count - 1,
+        context.scope.expected_team_count - 1,
+        context.scope.expected_team_count - 1,
+        context.scope.expected_team_count - 1,
+    )
 
-    if (fixture_count, mapping_count, completed_count) != (380, 380, 380):
+    if (fixture_count, mapping_count, completed_count) != (expected_count, expected_count, expected_count):
         raise AssertionError("remote season fixture counts are invalid")
     if orphan_count != 0:
         raise AssertionError("orphan fixture provider mappings detected")
-    if team_counts != (20, 38, 38, 19, 19, 19, 19):
+    if (status_count, lifecycle_mismatch_count) != (expected_count, 0):
+        raise AssertionError("exact provider fixture statuses are incomplete or inconsistent")
+    if team_counts != expected_schedule:
         raise AssertionError("home/away season schedule verification failed")
     if conservative_errors != 0:
         raise AssertionError("historical availability reconstruction is invalid")
-    if fetch_row[:3] != (380, 1, 1) or fetch_row[3] is None or fetch_row[4] != context.season_id:
+    if (
+        fetch_row[:3] != (expected_count, 1, 1)
+        or fetch_row[3] is None
+        or fetch_row[4] != context.season_id
+    ):
         raise AssertionError("normalized fetch metadata is invalid")
     if raw_verified != 1:
         raise AssertionError("raw payload integrity verification failed")
@@ -949,6 +1169,8 @@ def verify_remote(
         "fixtures": fixture_count,
         "fixture_provider_mappings": mapping_count,
         "completed_fixtures": completed_count,
+        "exact_provider_statuses": status_count,
+        "provider_status_lifecycle_mismatches": lifecycle_mismatch_count,
         "orphan_mappings": orphan_count,
         "team_schedule": {
             "teams": team_counts[0],
@@ -964,12 +1186,16 @@ def verify_remote(
     }
 
 
-def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
+def run_backfill(
+    *,
+    client: APIFootballClient | None = None,
+    scope: SeasonBackfillScope = DEFAULT_SCOPE,
+) -> dict[str, Any]:
     database_url = _database_url()
     api_client = client or APIFootballClient.from_environment()
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute("SET statement_timeout = '30s'")
-        context = acquire_context_and_lock(conn)
+        context = acquire_context_and_lock(conn, scope=scope)
         untouched_before = table_counts(conn, UNTOUCHED_TABLES)
         canary_before = canary_fixture_snapshot(conn, context)
         reusable = load_reusable_fetch(conn, context)
@@ -985,6 +1211,7 @@ def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
                         context=context,
                         failure=failure,
                     ),
+                    scope=scope,
                 )
             )
             attempts = collected.attempts
@@ -999,11 +1226,19 @@ def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
             records = validate_fixture_season_response(
                 fetch.response,
                 allowed_team_external_ids=context.team_ids,
+                scope=scope,
             )
         except ValueError:
             if fetch.normalized_at is None:
                 mark_fetch_contract_error(conn, fetch.fetch_id)
             raise
+
+        statuses = _validate_provider_statuses(
+            conn,
+            context=context,
+            fetch=fetch,
+            records=records,
+        )
 
         normalization = {"processed": 0, "created": 0, "batches": len(chunked(records))}
         if fetch.normalized_at is None:
@@ -1012,6 +1247,7 @@ def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
                 context=context,
                 fetch=fetch,
                 records=records,
+                status_observations=statuses,
             )
             fetch = replace(fetch, normalized_at=_utcnow())
 
@@ -1023,8 +1259,8 @@ def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
             untouched_before=untouched_before,
         )
         return {
-            "league_external_id": LEAGUE_EXTERNAL_ID,
-            "research_season": SEASON_START_YEAR,
+            "league_external_id": scope.league_external_id,
+            "research_season": scope.season_start_year,
             "api_attempts": attempts,
             "reused_raw_fetch": reusable is not None,
             "fetch_id": fetch.fetch_id,
@@ -1035,7 +1271,31 @@ def run_backfill(*, client: APIFootballClient | None = None) -> dict[str, Any]:
 
 
 def main() -> None:
-    print(json.dumps(run_backfill(), indent=2, sort_keys=True, default=str))
+    parser = argparse.ArgumentParser(description="Controlled completed-season fixtures backfill")
+    parser.add_argument("--league-external-id", type=int, default=DEFAULT_SCOPE.league_external_id)
+    parser.add_argument("--season-start-year", type=int, default=DEFAULT_SCOPE.season_start_year)
+    parser.add_argument("--expected-fixture-count", type=int, default=DEFAULT_SCOPE.expected_fixture_count)
+    parser.add_argument(
+        "--preexisting-canary-fixture-external-id",
+        type=int,
+        default=DEFAULT_SCOPE.preexisting_canary_fixture_external_id,
+        help="Existing finalized fixture preserved by the legacy 2024 path; omit with --no-preexisting-canary",
+    )
+    parser.add_argument(
+        "--no-preexisting-canary",
+        action="store_true",
+        help="Do not require a pre-existing finalized fixture (required for a new season bootstrap)",
+    )
+    args = parser.parse_args()
+    scope = SeasonBackfillScope(
+        league_external_id=args.league_external_id,
+        season_start_year=args.season_start_year,
+        expected_fixture_count=args.expected_fixture_count,
+        preexisting_canary_fixture_external_id=(
+            None if args.no_preexisting_canary else args.preexisting_canary_fixture_external_id
+        ),
+    )
+    print(json.dumps(run_backfill(scope=scope), indent=2, sort_keys=True, default=str))
 
 
 if __name__ == "__main__":

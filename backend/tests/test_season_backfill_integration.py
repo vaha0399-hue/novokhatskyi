@@ -8,6 +8,7 @@ import pytest
 
 from app.api_football import APIFootballResponse
 from app.importer.canary import CANARY_REQUESTS, CollectedResponse, normalize_canary
+from app.importer.fixture_status_contract import FixtureStatusObservation
 from app.importer.season_backfill import (
     REQUEST_PARAMS,
     CollectedFetch,
@@ -107,6 +108,10 @@ def test_atomic_rollback_raw_resume_and_idempotent_replay(monkeypatch: pytest.Mo
             fetch.response,
             allowed_team_external_ids=context.team_ids,
         )
+        statuses = tuple(
+            FixtureStatusObservation(external_fixture_id=record.external_id, status_code="FT")
+            for record in records
+        )
 
         with pytest.raises(RuntimeError, match="injected"):
             normalize_fixture_season(
@@ -114,6 +119,7 @@ def test_atomic_rollback_raw_resume_and_idempotent_replay(monkeypatch: pytest.Mo
                 context=context,
                 fetch=fetch,
                 records=records,
+                status_observations=statuses,
                 fail_after_chunk=3,
             )
 
@@ -134,6 +140,7 @@ def test_atomic_rollback_raw_resume_and_idempotent_replay(monkeypatch: pytest.Mo
             context=context,
             fetch=fetch,
             records=records,
+            status_observations=statuses,
         )
         assert result == {"processed": 380, "created": 379, "batches": 8}
         verification = verify_remote(

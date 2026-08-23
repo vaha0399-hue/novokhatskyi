@@ -1,4 +1,4 @@
-"""Fail-closed, resumable historical EPL 2024 fixture-statistics backfill.
+"""Fail-closed, resumable historical fixture-statistics backfill.
 
 This module deliberately contains no scheduler.  A caller starts one bounded
 batch; every successful provider body is persisted before it is interpreted.
@@ -29,14 +29,9 @@ from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.canary import INTEGER_STATISTICS, STATISTIC_COLUMNS, request_params_sha256
 
 PROVIDER_CODE = "api-football"
-LEAGUE_EXTERNAL_ID = 39
-SEASON_START_YEAR = 2024
-EXPECTED_FIXTURE_COUNT = 380
-CANARY_FIXTURE_EXTERNAL_ID = 1208021
 ENDPOINT = "/fixtures/statistics"
 PURPOSE = "bootstrap"
 MAPPING_VERSION = "api-football-v1"
-LOCK_KEY = "api-football:fixture-statistics:39:2024:v1"
 RAW_RETENTION_DAYS = 30
 ANOMALY_RETENTION_DAYS = 90
 PACE_SECONDS = 6.5
@@ -57,6 +52,47 @@ class StatisticsBackfillError(RuntimeError):
 
 class StatisticsContractError(StatisticsBackfillError):
     """The provider response cannot safely be normalized."""
+
+
+@dataclass(frozen=True)
+class StatisticsImportScope:
+    """Immutable provider/canonical scope for one controlled season run."""
+
+    league_external_id: int
+    season_start_year: int
+    expected_fixture_count: int
+    canary_fixture_external_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.league_external_id <= 0:
+            raise ValueError("league_external_id must be positive")
+        if self.season_start_year < 1900:
+            raise ValueError("season_start_year must be a four-digit year")
+        if self.expected_fixture_count <= 0:
+            raise ValueError("expected_fixture_count must be positive")
+        if self.canary_fixture_external_id is not None and self.canary_fixture_external_id <= 0:
+            raise ValueError("canary_fixture_external_id must be positive when provided")
+
+    @property
+    def lock_key(self) -> str:
+        return (
+            "api-football:fixture-statistics:"
+            f"{self.league_external_id}:{self.season_start_year}:v1"
+        )
+
+
+# Backwards-compatible default only. New seasonal invocations pass their scope
+# explicitly, so a run cannot accidentally acquire the EPL 2024 lock/context.
+EPL_2024_SCOPE = StatisticsImportScope(
+    league_external_id=39,
+    season_start_year=2024,
+    expected_fixture_count=380,
+    canary_fixture_external_id=1208021,
+)
+LEAGUE_EXTERNAL_ID = EPL_2024_SCOPE.league_external_id
+SEASON_START_YEAR = EPL_2024_SCOPE.season_start_year
+EXPECTED_FIXTURE_COUNT = EPL_2024_SCOPE.expected_fixture_count
+CANARY_FIXTURE_EXTERNAL_ID = EPL_2024_SCOPE.canary_fixture_external_id
 
 
 @dataclass(frozen=True)
@@ -230,22 +266,31 @@ def classify_response(payload: Mapping[str, Any], target: FixtureTarget) -> tupl
     return ("complete" if results == 2 else "partial"), mapped
 
 
-def acquire_context_and_lock(conn: Connection[Any]) -> tuple[int, int]:
-    locked = conn.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (LOCK_KEY,)).fetchone()[0]
+def acquire_context_and_lock(
+    conn: Connection[Any], *, scope: StatisticsImportScope = EPL_2024_SCOPE
+) -> tuple[int, int]:
+    locked = conn.execute(
+        "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (scope.lock_key,)
+    ).fetchone()[0]
     if not locked:
         raise StatisticsBackfillError("statistics backfill is already running")
     row = conn.execute(
         """SELECT p.id, sr.season_id FROM source.providers p
            JOIN source.season_provider_refs sr ON sr.provider_id=p.id
            WHERE p.code=%s AND sr.league_external_id=%s AND sr.external_season=%s""",
-        (PROVIDER_CODE, str(LEAGUE_EXTERNAL_ID), SEASON_START_YEAR),
+        (PROVIDER_CODE, str(scope.league_external_id), scope.season_start_year),
     ).fetchone()
     if row is None:
-        raise StatisticsBackfillError("EPL 2024 provider and season mappings are required")
+        raise StatisticsBackfillError(
+            "provider and season mappings are required for "
+            f"league={scope.league_external_id} season={scope.season_start_year}"
+        )
     return int(row[0]), int(row[1])
 
 
-def load_targets(conn: Connection[Any], *, provider_id: int, season_id: int) -> list[FixtureTarget]:
+def load_targets(
+    conn: Connection[Any], *, provider_id: int, season_id: int, scope: StatisticsImportScope
+) -> list[FixtureTarget]:
     rows = conn.execute(
         """SELECT f.id, r.external_id, f.home_team_id, f.away_team_id, f.kickoff_at, f.result_available_at
            FROM football.fixtures f JOIN source.fixture_provider_refs r ON r.fixture_id=f.id AND r.provider_id=%s
@@ -253,8 +298,12 @@ def load_targets(conn: Connection[Any], *, provider_id: int, season_id: int) -> 
            ORDER BY r.external_id::bigint""",
         (provider_id, season_id),
     ).fetchall()
-    if len(rows) != EXPECTED_FIXTURE_COUNT:
-        raise StatisticsBackfillError("preflight requires exactly 380 completed provider-mapped fixtures")
+    if len(rows) != scope.expected_fixture_count:
+        raise StatisticsBackfillError(
+            "preflight requires exactly "
+            f"{scope.expected_fixture_count} completed provider-mapped fixtures "
+            f"for league={scope.league_external_id} season={scope.season_start_year}"
+        )
     targets = [FixtureTarget(int(a), int(b), int(c), int(d), e, f) for a, b, c, d, e, f in rows]
     if any(t.result_available_at is None for t in targets):
         raise StatisticsBackfillError("completed fixture lacks result_available_at")
@@ -581,9 +630,15 @@ def approve_contract_replays(
     return reopened
 
 
-def preflight_statistics_backfill(conn: Connection[Any], *, provider_id: int, season_id: int) -> tuple[list[FixtureTarget], dict[str, int]]:
+def preflight_statistics_backfill(
+    conn: Connection[Any],
+    *,
+    provider_id: int,
+    season_id: int,
+    scope: StatisticsImportScope = EPL_2024_SCOPE,
+) -> tuple[list[FixtureTarget], dict[str, int]]:
     """Scan every fixture before network and return only targets requiring a request."""
-    targets = load_targets(conn, provider_id=provider_id, season_id=season_id)
+    targets = load_targets(conn, provider_id=provider_id, season_id=season_id, scope=scope)
     statistics_by_fixture: dict[int, list[tuple[Any, ...]]] = {}
     for row in conn.execute(
         """SELECT s.fixture_id,s.team_id,s.finalized_at,s.mapping_version,s.last_source_fetch_id,
@@ -669,14 +724,23 @@ def preflight_statistics_backfill(conn: Connection[Any], *, provider_id: int, se
             raise StatisticsBackfillError("unfinished statistics fetch has no reusable raw payload")
         queue.append(target)
         states["pending"] += 1
-    if sum(states.values()) != EXPECTED_FIXTURE_COUNT:
+    if sum(states.values()) != scope.expected_fixture_count:
         raise AssertionError("preflight classification is incomplete")
-    # The Stage 3C canary must remain a strict, already-finalized no-op.
-    canary = next((t for t in targets if t.external_id == CANARY_FIXTURE_EXTERNAL_ID), None)
-    if canary is None:
-        raise StatisticsBackfillError("canary fixture is not present in EPL 2024")
-    if _existing_pair_state(conn, provider_id=provider_id, target=canary) != "done":
-        raise StatisticsBackfillError("canary statistics pair is not a valid finalized checkpoint")
+    # A configured canary must remain a strict, already-finalized no-op. New
+    # seasons do not inherit the EPL 2024 canary, so canary is optional.
+    if scope.canary_fixture_external_id is not None:
+        canary = next(
+            (t for t in targets if t.external_id == scope.canary_fixture_external_id),
+            None,
+        )
+        if canary is None:
+            raise StatisticsBackfillError(
+                "configured canary fixture is not present in the import scope"
+            )
+        if _existing_pair_state(conn, provider_id=provider_id, target=canary) != "done":
+            raise StatisticsBackfillError(
+                "configured canary statistics pair is not a valid finalized checkpoint"
+            )
     return queue, states
 
 
@@ -686,7 +750,11 @@ def _fingerprint(conn: Connection[Any], table: str) -> str:
     return str(row[0])
 
 
-def _canary_statistics_fingerprint(conn: Connection[Any], *, provider_id: int) -> str:
+def _canary_statistics_fingerprint(
+    conn: Connection[Any], *, provider_id: int, canary_fixture_external_id: int | None
+) -> str | None:
+    if canary_fixture_external_id is None:
+        return None
     row = conn.execute(
         """SELECT md5(coalesce(string_agg(row_to_json(t)::text, '' ORDER BY row_to_json(t)::text), ''))
            FROM (
@@ -694,7 +762,7 @@ def _canary_statistics_fingerprint(conn: Connection[Any], *, provider_id: int) -
              JOIN source.fixture_provider_refs r ON r.fixture_id=s.fixture_id
              WHERE r.provider_id=%s AND r.external_id=%s
            ) t""",
-        (provider_id, str(CANARY_FIXTURE_EXTERNAL_ID)),
+        (provider_id, str(canary_fixture_external_id)),
     ).fetchone()
     return str(row[0])
 
@@ -704,8 +772,9 @@ def remote_verification(
     *,
     provider_id: int,
     season_id: int,
+    scope: StatisticsImportScope,
     before: Mapping[str, str],
-    canary_before: str,
+    canary_before: str | None,
 ) -> dict[str, Any]:
     rows, nonparticipant = conn.execute(
         """SELECT count(*), count(*) FILTER (
@@ -786,13 +855,20 @@ def remote_verification(
         "empty": empty_count,
         "partial": partial_count,
         "failed": failed_count,
-        "pending": EXPECTED_FIXTURE_COUNT-complete_count-empty_count-partial_count-failed_count,
+        "pending": scope.expected_fixture_count-complete_count-empty_count-partial_count-failed_count,
         "covered_fixtures": complete_count,
-        "remaining_fixtures": EXPECTED_FIXTURE_COUNT-complete_count,
+        "remaining_fixtures": scope.expected_fixture_count-complete_count,
         "duplicates": int(duplicates),
         "nonparticipants": int(nonparticipant),
         "orphans": int(orphans),
-        "canary_unchanged": _canary_statistics_fingerprint(conn, provider_id=provider_id) == canary_before,
+        "canary_unchanged": (
+            _canary_statistics_fingerprint(
+                conn,
+                provider_id=provider_id,
+                canary_fixture_external_id=scope.canary_fixture_external_id,
+            )
+            == canary_before
+        ),
         "out_of_scope_fingerprints_unchanged": {
             table: before[table] == after[table] for table in before
         },
@@ -810,6 +886,7 @@ def run_statistics_backfill(
     clock: Clock = _utcnow,
     max_calls: int = DEFAULT_RUN_ATTEMPT_CAP,
     approved_replay_fetch_ids: frozenset[int] = frozenset(),
+    scope: StatisticsImportScope = EPL_2024_SCOPE,
 ) -> StatisticsBatchReport:
     """Run one quota-bounded batch. All unsafe states stop before the next fixture."""
     if not 1 <= max_calls <= DEFAULT_RUN_ATTEMPT_CAP:
@@ -821,14 +898,16 @@ def run_statistics_backfill(
         "ml.predictions", "ml.prediction_feature_snapshots", "ml.prediction_fixture_inputs",
     )
     with psycopg.connect(_database_url(), autocommit=True) as conn:
-        provider_id, season_id = acquire_context_and_lock(conn)
+        provider_id, season_id = acquire_context_and_lock(conn, scope=scope)
         approve_contract_replays(
             conn,
             provider_id=provider_id,
             season_id=season_id,
             fetch_ids=approved_replay_fetch_ids,
         )
-        queue, initial = preflight_statistics_backfill(conn, provider_id=provider_id, season_id=season_id)
+        queue, initial = preflight_statistics_backfill(
+            conn, provider_id=provider_id, season_id=season_id, scope=scope
+        )
         # Persisted, hash-verified bodies are always replayed before any network call.
         raw_fixture_ids = {
             int(row[0])
@@ -855,7 +934,11 @@ def run_statistics_backfill(
             ).fetchall()
         }
         before = {table: _fingerprint(conn, table) for table in protected}
-        canary_before = _canary_statistics_fingerprint(conn, provider_id=provider_id)
+        canary_before = _canary_statistics_fingerprint(
+            conn,
+            provider_id=provider_id,
+            canary_fixture_external_id=scope.canary_fixture_external_id,
+        )
         total_prior, retries_prior = _attempt_budget(conn, provider_id=provider_id, season_id=season_id)
         if total_prior > DATASET_ATTEMPT_CAP or retries_prior > GLOBAL_RETRY_CAP:
             raise StatisticsBackfillError("durable statistics attempt budget already exceeded")
@@ -928,6 +1011,7 @@ def run_statistics_backfill(
             conn,
             provider_id=provider_id,
             season_id=season_id,
+            scope=scope,
             before=before,
             canary_before=canary_before,
         )
@@ -948,7 +1032,21 @@ def run_statistics_backfill(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Controlled EPL 2024 fixture statistics backfill")
+    parser = argparse.ArgumentParser(description="Controlled fixture statistics backfill")
+    parser.add_argument("--league-external-id", type=int, default=EPL_2024_SCOPE.league_external_id)
+    parser.add_argument("--season-start-year", type=int, default=EPL_2024_SCOPE.season_start_year)
+    parser.add_argument("--expected-fixture-count", type=int, default=EPL_2024_SCOPE.expected_fixture_count)
+    parser.add_argument(
+        "--canary-fixture-external-id",
+        type=int,
+        default=EPL_2024_SCOPE.canary_fixture_external_id,
+        help="Existing completed statistics fixture required as a no-op checkpoint; omit with --no-canary",
+    )
+    parser.add_argument(
+        "--no-canary",
+        action="store_true",
+        help="Disable the optional existing-statistics canary requirement for a new season",
+    )
     parser.add_argument(
         "--replay-fetch-id",
         action="append",
@@ -957,8 +1055,17 @@ def main() -> None:
         help="Explicitly approved retained contract-anomaly fetch ID to replay without API",
     )
     arguments = parser.parse_args()
+    scope = StatisticsImportScope(
+        league_external_id=arguments.league_external_id,
+        season_start_year=arguments.season_start_year,
+        expected_fixture_count=arguments.expected_fixture_count,
+        canary_fixture_external_id=(
+            None if arguments.no_canary else arguments.canary_fixture_external_id
+        ),
+    )
     report = run_statistics_backfill(
         approved_replay_fetch_ids=frozenset(arguments.replay_fetch_id),
+        scope=scope,
     )
     print(json.dumps(report.__dict__, sort_keys=True, default=str))
 

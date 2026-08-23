@@ -10,6 +10,7 @@ from app.importer.statistics_backfill import (
     DEFAULT_RUN_ATTEMPT_CAP,
     ENDPOINT,
     FixtureTarget,
+    StatisticsImportScope,
     StatisticsContractError,
     _decimal,
     _integer,
@@ -17,6 +18,7 @@ from app.importer.statistics_backfill import (
     classify_response,
     map_statistics_block,
     run_statistics_backfill,
+    acquire_context_and_lock,
 )
 
 
@@ -164,3 +166,56 @@ def test_wrapper_schema_drift_fails_closed(payload: dict, target: FixtureTarget,
 def test_run_attempt_cap_is_fail_closed_before_environment_access(max_calls: int) -> None:
     with pytest.raises(ValueError, match="between 1 and 90"):
         run_statistics_backfill(max_calls=max_calls)
+
+
+class _Row:
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def fetchone(self):
+        return self.value
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple]] = []
+        self.results = iter(((True,), (17, 25)))
+
+    def execute(self, statement: str, params: tuple):
+        self.calls.append((statement, params))
+        return _Row(next(self.results))
+
+
+def test_2025_season_scope_uses_own_lock_and_provider_mapping() -> None:
+    scope = StatisticsImportScope(
+        league_external_id=39,
+        season_start_year=2025,
+        expected_fixture_count=380,
+        canary_fixture_external_id=None,
+    )
+    conn = _RecordingConnection()
+
+    assert acquire_context_and_lock(conn, scope=scope) == (17, 25)  # type: ignore[arg-type]
+
+    assert conn.calls[0][1] == ("api-football:fixture-statistics:39:2025:v1",)
+    assert conn.calls[1][1] == ("api-football", "39", 2025)
+    assert scope.canary_fixture_external_id is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"league_external_id": 0, "season_start_year": 2025, "expected_fixture_count": 380},
+        {"league_external_id": 39, "season_start_year": 1899, "expected_fixture_count": 380},
+        {"league_external_id": 39, "season_start_year": 2025, "expected_fixture_count": 0},
+        {
+            "league_external_id": 39,
+            "season_start_year": 2025,
+            "expected_fixture_count": 380,
+            "canary_fixture_external_id": 0,
+        },
+    ],
+)
+def test_statistics_scope_rejects_unsafe_configuration(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValueError):
+        StatisticsImportScope(**kwargs)
