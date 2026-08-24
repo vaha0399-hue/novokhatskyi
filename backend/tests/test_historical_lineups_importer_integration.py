@@ -15,6 +15,7 @@ from app.importer.historical_lineups import (
     _load_retained_raw,
     _persist_success_fetch,
     _resume_unfinished_success_fetches,
+    approve_contract_replays,
     normalize_raw,
     run_controlled_canary,
 )
@@ -136,6 +137,60 @@ def test_real_sample_normalizes_raw_provenance_mappings_and_replay(monkeypatch: 
         assert replay.replayed is True
         assert replay.snapshot_created is False
         assert conn.execute("SELECT count(*) FROM football.fixture_historical_lineup_snapshots WHERE fixture_id=%s", (target.fixture_id,)).fetchone()[0] == 1
+
+
+def test_null_coach_identity_replays_retained_contract_anomaly_without_network() -> None:
+    """A provider coach object with null identity is factual absence, not a failure."""
+    assert TEST_DB_URL is not None
+    payload = json.loads(SAMPLE.read_text())
+    payload["response"][1]["coach"] = {"id": None, "name": None, "photo": None}
+    payload["response"][1]["formation"] = None
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
+        provider_id = conn.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()[0]
+        target = _existing_target(conn, provider_id, 11)
+        payload["parameters"] = {"fixture": str(target.external_id)}
+        payload["response"][0]["team"]["id"] = target.home_external_id
+        payload["response"][1]["team"]["id"] = target.away_external_id
+        received = _after_finalization(target)
+        stored = _persist_success_fetch(
+            conn, provider_id=provider_id, target=target, response=_response(payload),
+            request_started_at=received - timedelta(seconds=1), response_received_at=received,
+        )
+        # Simulate the durable state left by the older strict parser. Reopening
+        # is explicit, hash-checked, and the raw response is then replayed.
+        conn.execute(
+            """UPDATE source.provider_fetches
+               SET outcome='provider_error', sanitized_error_class='HistoricalLineupsContractError'
+               WHERE id=%s""",
+            (stored.fetch_id,),
+        )
+        conn.execute(
+            "UPDATE source.provider_raw_payloads SET retention_class='anomaly' WHERE fetch_id=%s",
+            (stored.fetch_id,),
+        )
+
+        assert approve_contract_replays(
+            conn, provider_id=provider_id, season_id=target.season_id,
+            fetch_ids=frozenset({stored.fetch_id}),
+        ) == 1
+        resumed = _resume_unfinished_success_fetches(
+            conn, provider_id=provider_id, season_id=target.season_id, clock=lambda: received
+        )
+
+        assert len(resumed) == 1
+        assert resumed[0].coverage_state == "complete"
+        assert conn.execute(
+            """SELECT count(*) FILTER (WHERE coach_id IS NULL),
+                      count(*) FILTER (WHERE formation IS NULL)
+               FROM football.fixture_historical_lineups
+               WHERE snapshot_id=(SELECT id FROM football.fixture_historical_lineup_snapshots WHERE fixture_id=%s)""",
+            (target.fixture_id,),
+        ).fetchone() == (1, 1)
+        assert conn.execute(
+            "SELECT outcome::text, normalized_at IS NOT NULL FROM source.provider_fetches WHERE id=%s",
+            (stored.fetch_id,),
+        ).fetchone() == ("success", True)
 
 
 def test_runner_stops_after_first_five_partial_lineups(monkeypatch: pytest.MonkeyPatch) -> None:

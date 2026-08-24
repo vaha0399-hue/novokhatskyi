@@ -11,7 +11,12 @@ import psycopg
 import pytest
 
 from app.api_football import APIFootballResponse
-from app.importer.season_canary import FixtureExpectation, SeasonCanaryScope, run_controlled_canary
+from app.importer.season_canary import (
+    FixtureExpectation,
+    SeasonCanaryScope,
+    _epl_2024_fingerprint,
+    run_controlled_canary,
+)
 
 
 TEST_DB_URL = os.environ.get("SEASON_BOOTSTRAP_TEST_DB_URL")
@@ -96,6 +101,25 @@ class NoNetworkClient:
     @staticmethod
     def response_contains_api_key(_: bytes) -> bool:
         return False
+
+
+def test_epl_2024_fingerprint_is_bound_to_the_epl_baseline() -> None:
+    """A non-EPL canary must still preserve the first completed EPL season."""
+
+    class Cursor:
+        def fetchone(self) -> tuple[str]:
+            return ("baseline-fingerprint",)
+
+    class RecordingConnection:
+        params: tuple[int, str] | None = None
+
+        def execute(self, _: str, params: tuple[int, str]) -> Cursor:
+            self.params = params
+            return Cursor()
+
+    connection = RecordingConnection()
+    assert _epl_2024_fingerprint(connection, provider_id=3) == "baseline-fingerprint"  # type: ignore[arg-type]
+    assert connection.params == (3, "39")
 
 
 def test_full_14_call_canary_is_atomic_per_fixture_and_preserves_epl_2024(monkeypatch: pytest.MonkeyPatch) -> None:

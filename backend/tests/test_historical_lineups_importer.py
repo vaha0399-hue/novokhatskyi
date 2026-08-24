@@ -101,7 +101,9 @@ def test_nonparticipant_duplicate_team_and_duplicate_player_fail_closed(payload:
 
 def test_nullable_lineup_fields_remain_none(payload: dict, target: FixtureTarget) -> None:
     nullable = copy.deepcopy(payload)
-    nullable["response"][0]["coach"] = None
+    # API-Football can return a non-empty coach object with no provider
+    # identity, rather than ``coach: null``. It must not create a fake coach.
+    nullable["response"][0]["coach"] = {"id": None, "name": None, "photo": None}
     nullable["response"][0]["formation"] = None
     nullable["response"][0]["startXI"][0]["player"].update(number=None, pos=None, grid=None)
 
@@ -197,7 +199,7 @@ def test_2025_scope_uses_its_own_mapping_and_advisory_lock() -> None:
         (("response", 0, "startXI", 0, "player", "id"), "not-an-id"),
         (("response", 0, "startXI", 0, "player", "name"), ""),
         (("response", 0, "startXI", 0, "player", "number"), 200),
-        (("response", 0, "coach", "id"), None),
+        (("response", 0, "coach", "id"), "not-an-id"),
     ],
 )
 def test_malformed_entity_fields_fail_closed(payload: dict, target: FixtureTarget, path, value) -> None:

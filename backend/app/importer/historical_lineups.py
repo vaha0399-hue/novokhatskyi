@@ -260,11 +260,21 @@ def _parse_team_lineup(entry: Any) -> TeamLineup:
     else:
         if not isinstance(coach_value, Mapping):
             raise HistoricalLineupsContractError("coach must be an object or null")
-        coach_external_id = _required_int(coach_value.get("id"), field="coach.id")
-        coach_name = _optional_text(coach_value.get("name"), field="coach.name")
-        if coach_name is None:
-            raise HistoricalLineupsContractError("coach.name is required when coach.id is present")
-        coach_photo_url = _optional_text(coach_value.get("photo"), field="coach.photo")
+        # API-Football can return a coach object whose identity fields are all
+        # null.  It carries no durable external identity, so retaining its
+        # display/photo values would manufacture an unlinked coach entity.
+        # Treat that documented nullable shape exactly like an absent coach.
+        # A non-null ID remains strict because it is the canonical mapping key.
+        if coach_value.get("id") is None:
+            coach_external_id = None
+            coach_name = None
+            coach_photo_url = None
+        else:
+            coach_external_id = _required_int(coach_value.get("id"), field="coach.id")
+            coach_name = _optional_text(coach_value.get("name"), field="coach.name")
+            if coach_name is None:
+                raise HistoricalLineupsContractError("coach.name is required when coach.id is present")
+            coach_photo_url = _optional_text(coach_value.get("photo"), field="coach.photo")
 
     formation = _optional_text(entry.get("formation"), field="formation")
     players: list[LineupPlayer] = []
@@ -636,6 +646,73 @@ def _mark_contract_error(conn: Connection[Any], *, fetch_id: int) -> None:
                WHERE fetch_id=%s""",
             (fetch_id,),
         )
+
+
+def approve_contract_replays(
+    conn: Connection[Any], *, provider_id: int, season_id: int, fetch_ids: frozenset[int]
+) -> int:
+    """Explicitly reopen hash-verified raw bodies after an importer contract fix.
+
+    This is intentionally not automatic: only an operator-selected historical
+    lineup contract anomaly for the requested provider season can be replayed.
+    The raw body is never refetched or altered.
+    """
+    if not fetch_ids:
+        return 0
+    reopened = 0
+    with conn.transaction():
+        for fetch_id in sorted(fetch_ids):
+            row = conn.execute(
+                """SELECT provider_fetch.outcome::text,provider_fetch.normalized_at,
+                          provider_fetch.sanitized_error_class,provider_fetch.subject_fixture_id,
+                          provider_fetch.subject_season_id,provider_fetch.http_status,
+                          provider_fetch.request_params_sha256,provider_fetch.content_sha256,
+                          raw.inline_body,raw.purged_at
+                   FROM source.provider_fetches provider_fetch
+                   JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
+                   WHERE provider_fetch.id=%s AND provider_fetch.provider_id=%s
+                     AND provider_fetch.endpoint=%s AND provider_fetch.purpose=%s
+                   FOR UPDATE OF provider_fetch,raw""",
+                (fetch_id, provider_id, ENDPOINT, PURPOSE),
+            ).fetchone()
+            if row is None:
+                raise HistoricalLineupsError("approved historical-lineup replay fetch is missing")
+            (
+                outcome, normalized_at, error_class, fixture_id, actual_season_id,
+                http_status, params_digest, content_digest, body, purged_at,
+            ) = row
+            if (
+                outcome != "provider_error"
+                or normalized_at is not None
+                or error_class != "HistoricalLineupsContractError"
+                or fixture_id is None
+                or actual_season_id != season_id
+                or http_status != 200
+                or body is None
+                or purged_at is not None
+                or content_digest is None
+                or params_digest is None
+            ):
+                raise HistoricalLineupsError("approved historical-lineup replay is not eligible")
+            target = _target_for_fixture(
+                conn, provider_id=provider_id, season_id=season_id, fixture_id=int(fixture_id)
+            )
+            raw = bytes(body)
+            if (
+                hashlib.sha256(raw).digest() != bytes(content_digest)
+                or bytes(params_digest) != request_params_sha256(_params(target.external_id))
+            ):
+                raise HistoricalLineupsError("approved historical-lineup replay provenance is invalid")
+            conn.execute(
+                """UPDATE source.provider_fetches
+                   SET outcome='success',
+                       sanitized_error_class='ApprovedHistoricalLineupContractReplay',
+                       sanitized_error_text='explicitly approved replay from retained anomaly raw'
+                   WHERE id=%s""",
+                (fetch_id,),
+            )
+            reopened += 1
+    return reopened
 
 
 def _load_retained_raw(conn: Connection[Any], *, provider_id: int, target: FixtureTarget, fetch_id: int) -> StoredRaw:

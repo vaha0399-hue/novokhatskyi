@@ -40,6 +40,9 @@ from app.importer.season_bootstrap import (
 MAX_PHYSICAL_CALLS = 14
 FIXTURE_CALL_COUNT = 5
 QUOTA_RESERVE = 50
+# The first fully completed historical season is the preservation baseline for
+# every subsequent multi-competition canary, not merely for new EPL seasons.
+EPL_2024_LEAGUE_EXTERNAL_ID = "39"
 
 
 class SeasonCanaryError(RuntimeError):
@@ -429,7 +432,7 @@ def _run_one_lineup(
     return True, quota
 
 
-def _epl_2024_fingerprint(conn: Connection[Any], *, provider_id: int, league_external_id: int) -> str:
+def _epl_2024_fingerprint(conn: Connection[Any], *, provider_id: int) -> str:
     row = conn.execute(
         """WITH season AS (
                 SELECT ref.season_id FROM source.season_provider_refs ref
@@ -481,7 +484,7 @@ def _epl_2024_fingerprint(conn: Connection[Any], *, provider_id: int, league_ext
                 JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
                 WHERE provider_fetch.subject_season_id=(SELECT season_id FROM season)
             ) SELECT md5(coalesce(string_agg(value,'' ORDER BY value),'')) FROM pieces""",
-        (provider_id, str(league_external_id)),
+        (provider_id, EPL_2024_LEAGUE_EXTERNAL_ID),
     ).fetchone()
     return str(row[0])
 
@@ -566,7 +569,7 @@ def _verify(
             (context.provider_id, selected_fixture_ids),
         ).fetchall()
     }
-    after = _epl_2024_fingerprint(conn, provider_id=context.provider_id, league_external_id=scope.league_external_id)
+    after = _epl_2024_fingerprint(conn, provider_id=context.provider_id)
     result = {
         "fixtures": int(fixtures),
         "fixture_provider_mappings": int(mappings),
@@ -628,9 +631,7 @@ def _run_controlled_canary_locked(
     provider_row = conn.execute("SELECT id FROM source.providers WHERE code=%s", (PROVIDER_CODE,)).fetchone()
     if provider_row is None:
         raise SeasonCanaryError("API-Football provider mapping is required")
-    epl_2024_before = _epl_2024_fingerprint(
-        conn, provider_id=int(provider_row[0]), league_external_id=scope.league_external_id
-    )
+    epl_2024_before = _epl_2024_fingerprint(conn, provider_id=int(provider_row[0]))
     player_refs_before = frozenset(
         str(row[0])
         for row in conn.execute(
