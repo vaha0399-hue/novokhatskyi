@@ -13,7 +13,7 @@ from app.importer.historical_lineups import (
     ParsedLineups,
     TeamLineup,
     _expected_player_values,
-    _first_batch_is_fully_complete,
+    _first_batch_has_valid_coverage,
     acquire_context_and_lock,
     classify_response,
     release_lock,
@@ -115,21 +115,29 @@ def test_nullable_lineup_fields_remain_none(payload: dict, target: FixtureTarget
     assert (player.shirt_number, player.position, player.grid) == (None, None, None)
 
 
-def test_second_batch_gate_requires_five_complete_two_team_results() -> None:
+def test_second_batch_gate_accepts_complete_partial_and_empty_coverage() -> None:
     complete = {
         "fixtures": [
             {"coverage_state": "complete", "team_lineups": 2}
             for _ in range(5)
         ]
     }
-    assert _first_batch_is_fully_complete(complete) is True
+    assert _first_batch_has_valid_coverage(complete) is True
 
-    for incomplete in (
+    partial_or_empty = {
+        "fixtures": [
+            *complete["fixtures"][:3],
+            {"coverage_state": "partial", "team_lineups": 1},
+            {"coverage_state": "empty", "team_lineups": 0},
+        ]
+    }
+    assert _first_batch_has_valid_coverage(partial_or_empty) is True
+
+    for invalid in (
         {"fixtures": complete["fixtures"][:4]},
-        {"fixtures": [*complete["fixtures"][:4], {"coverage_state": "partial", "team_lineups": 1}]},
-        {"fixtures": [*complete["fixtures"][:4], {"coverage_state": "complete", "team_lineups": 1}]},
+        {"fixtures": [*complete["fixtures"][:4], {"coverage_state": "unknown", "team_lineups": 0}]},
     ):
-        assert _first_batch_is_fully_complete(incomplete) is False
+        assert _first_batch_has_valid_coverage(invalid) is False
 
 
 def test_verifier_player_values_are_numeric_and_order_independent() -> None:

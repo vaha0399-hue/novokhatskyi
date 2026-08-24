@@ -95,3 +95,52 @@ def test_rejects_unreviewed_provider_status_code() -> None:
             expected_fixture_ids={1},
             allowed_status_codes={"NS", "FT"},
         )
+
+
+def test_exact_raw_only_fixture_status_is_retained_without_mapping() -> None:
+    payload = {
+        "get": "fixtures",
+        "parameters": {"league": "78", "season": "2025"},
+        "errors": {},
+        "results": 2,
+        "paging": {"current": 1, "total": 1},
+        "response": [
+            {"fixture": {"id": 1, "status": {"short": "FT"}}},
+            {"fixture": {"id": 2, "status": {"short": "AET"}}},
+        ],
+    }
+    raw_body = json.dumps(payload, separators=(",", ":")).encode()
+
+    observations = validate_fixture_status_response(
+        response_from_raw(raw_body),
+        expected_content_sha256=hashlib.sha256(raw_body).digest(),
+        expected_fixture_ids={1},
+        allowed_status_codes={"FT"},
+        excluded_fixture_status_codes={2: "AET"},
+    )
+
+    assert [(item.external_fixture_id, item.status_code) for item in observations] == [(1, "FT")]
+
+
+def test_raw_only_fixture_status_must_match_exact_reviewed_contract() -> None:
+    payload = {
+        "get": "fixtures",
+        "parameters": {"league": "78", "season": "2025"},
+        "errors": {},
+        "results": 2,
+        "paging": {"current": 1, "total": 1},
+        "response": [
+            {"fixture": {"id": 1, "status": {"short": "FT"}}},
+            {"fixture": {"id": 2, "status": {"short": "PEN"}}},
+        ],
+    }
+    raw_body = json.dumps(payload, separators=(",", ":")).encode()
+
+    with pytest.raises(ValueError, match="excluded fixture status"):
+        validate_fixture_status_response(
+            response_from_raw(raw_body),
+            expected_content_sha256=hashlib.sha256(raw_body).digest(),
+            expected_fixture_ids={1},
+            allowed_status_codes={"FT"},
+            excluded_fixture_status_codes={2: "AET"},
+        )

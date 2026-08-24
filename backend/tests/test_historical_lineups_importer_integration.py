@@ -17,6 +17,7 @@ from app.importer.historical_lineups import (
     _resume_unfinished_success_fetches,
     approve_contract_replays,
     normalize_raw,
+    run_historical_lineups_backfill,
     run_controlled_canary,
 )
 
@@ -193,7 +194,7 @@ def test_null_coach_identity_replays_retained_contract_anomaly_without_network()
         ).fetchone() == ("success", True)
 
 
-def test_runner_stops_after_first_five_partial_lineups(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runner_continues_after_partial_lineups(monkeypatch: pytest.MonkeyPatch) -> None:
     assert TEST_DB_URL is not None
     monkeypatch.setenv("SUPABASE_DB_URL", TEST_DB_URL)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
@@ -217,20 +218,60 @@ def test_runner_stops_after_first_five_partial_lineups(monkeypatch: pytest.Monke
         client=client, sleep=_no_sleep, clock=lambda: safe_clock
     )  # type: ignore[arg-type]
 
-    assert len(client.calls) == 5
-    assert report.physical_api_calls == 5
+    assert len(client.calls) == 10
+    assert report.physical_api_calls == 10
     assert report.complete == 0
-    assert report.partial == 5
-    assert report.retained_raw_replays == 0
-    assert report.replay_fixture_external_id is None
-    assert report.verification["first_batch"]["second_batch_not_run"]
+    assert report.partial == 10
+    assert report.retained_raw_replays == 1
+    assert report.replay_fixture_external_id is not None
+    assert report.verification["first_batch"]["fixtures"]
+    assert report.verification["replay"]["physical_api_calls_added"] == 0
+
+
+def test_bounded_bulk_persists_partial_lineups_and_keeps_other_domains_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bulk follows the same factual-coverage semantics as the canary."""
+    assert TEST_DB_URL is not None
+    monkeypatch.setenv("SUPABASE_DB_URL", TEST_DB_URL)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
+        provider_id = conn.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()[0]
+        home_teams = {
+            int(fixture_external_id): int(home_external_id)
+            for fixture_external_id, home_external_id in conn.execute(
+                """SELECT fixture_ref.external_id, home_ref.external_id
+                   FROM football.fixtures fixture
+                   JOIN source.fixture_provider_refs fixture_ref
+                     ON fixture_ref.provider_id=%s AND fixture_ref.fixture_id=fixture.id
+                   JOIN source.team_provider_refs home_ref
+                     ON home_ref.provider_id=%s AND home_ref.team_id=fixture.home_team_id""",
+                (provider_id, provider_id),
+            ).fetchall()
+        }
+
+    client = PartialLineupClient(home_teams)
+    report = run_historical_lineups_backfill(
+        client=client,
+        sleep=_no_sleep,
+        clock=lambda: datetime.now(UTC) + timedelta(minutes=1),
+        max_calls=3,
+    )  # type: ignore[arg-type]
+
+    assert report.physical_api_calls == 3
+    assert report.partial == 3
+    assert report.complete == report.empty == 0
+    assert report.snapshots_created == report.team_lineups_created == 3
+    assert report.lineup_players_created == 0
+    assert report.stop_reason is None
+    assert report.remaining_fixtures >= 1
+    assert all(report.verification["out_of_scope_fingerprints_unchanged"].values())
 
 
 def test_recoverable_raw_success_replays_before_new_network_work() -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         provider_id = conn.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()[0]
-        target = _existing_target(conn, provider_id, 7)
+        target = _existing_target(conn, provider_id, 360)
         now = _after_finalization(target)
         payload = {
             "get": "fixtures/lineups", "parameters": {"fixture": str(target.external_id)},
@@ -253,7 +294,7 @@ def test_empty_partial_and_contract_anomaly_are_durable_without_fabricated_rows(
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         provider_id = conn.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()[0]
-        empty_target = _existing_target(conn, provider_id, 8)
+        empty_target = _existing_target(conn, provider_id, 361)
         now = _after_finalization(empty_target)
         empty_payload = {
             "get": "fixtures/lineups", "parameters": {"fixture": str(empty_target.external_id)},
@@ -266,7 +307,7 @@ def test_empty_partial_and_contract_anomaly_are_durable_without_fabricated_rows(
         assert normalize_raw(conn, provider_id=provider_id, target=empty_target, raw=empty_raw).coverage_state == "empty"
         assert conn.execute("SELECT count(*) FROM football.fixture_historical_lineups WHERE snapshot_id=(SELECT id FROM football.fixture_historical_lineup_snapshots WHERE fixture_id=%s)", (empty_target.fixture_id,)).fetchone()[0] == 0
 
-        partial_target = _existing_target(conn, provider_id, 9)
+        partial_target = _existing_target(conn, provider_id, 362)
         partial_payload = {
             "get": "fixtures/lineups", "parameters": {"fixture": str(partial_target.external_id)},
             "errors": [], "results": 1, "paging": {"current": 1, "total": 1},
@@ -282,7 +323,7 @@ def test_empty_partial_and_contract_anomaly_are_durable_without_fabricated_rows(
         assert normalize_raw(conn, provider_id=provider_id, target=partial_target, raw=partial_raw).coverage_state == "partial"
         assert conn.execute("SELECT team_count FROM football.fixture_historical_lineup_snapshots WHERE fixture_id=%s", (partial_target.fixture_id,)).fetchone()[0] == 1
 
-        bad_target = _existing_target(conn, provider_id, 10)
+        bad_target = _existing_target(conn, provider_id, 363)
         malformed_payload = {
             "get": "fixtures/lineups", "parameters": {"fixture": "wrong"},
             "errors": [], "results": 0, "paging": {"current": 1, "total": 1}, "response": [],

@@ -32,6 +32,7 @@ from app.importer.season_bootstrap import (
     BaseRequest,
     BootstrapScope,
     CollectedBaseResponse,
+    RegularSeasonProjection,
     SeasonBootstrapError,
     base_requests,
     bootstrap_base,
@@ -56,12 +57,14 @@ class SeasonCanaryScope:
     expected_fixture_count: int
     selected_fixture_external_ids: tuple[int, ...]
     selected_fixture_expectations: tuple["FixtureExpectation", ...] = ()
+    projection: RegularSeasonProjection | None = None
 
     def __post_init__(self) -> None:
         BootstrapScope(
             league_external_id=self.league_external_id,
             season_start_year=self.season_start_year,
             expected_fixture_count=self.expected_fixture_count,
+            projection=self.projection,
         )
         if len(self.selected_fixture_external_ids) != FIXTURE_CALL_COUNT:
             raise ValueError("canary requires exactly five selected fixtures")
@@ -81,6 +84,7 @@ class SeasonCanaryScope:
             league_external_id=self.league_external_id,
             season_start_year=self.season_start_year,
             expected_fixture_count=self.expected_fixture_count,
+            projection=self.projection,
         )
 
     @property
@@ -421,14 +425,14 @@ def _run_one_lineup(
     if row is not None:
         raw = lineups._load_retained_raw(conn, provider_id=provider_id, target=target, fetch_id=int(row[0]))
         result = lineups.normalize_raw(conn, provider_id=provider_id, target=target, raw=raw)
-        if result.coverage_state != "complete":
-            raise SeasonCanaryError("canary historical lineup response is not complete")
+        if result.coverage_state not in {"complete", "partial", "empty"}:
+            raise SeasonCanaryError("canary historical lineup response has an unsupported coverage state")
         return False, {}
     result, quota = lineups._fetch_and_normalize(
         conn, client=client, provider_id=provider_id, target=target, clock=lambda: datetime.now(UTC)
     )
-    if result.coverage_state != "complete":
-        raise SeasonCanaryError("canary historical lineup response is not complete")
+    if result.coverage_state not in {"complete", "partial", "empty"}:
+        raise SeasonCanaryError("canary historical lineup response has an unsupported coverage state")
     return True, quota
 
 
@@ -505,6 +509,8 @@ def _verify(
     ).fetchone()
     stats_complete = 0
     lineups_complete = 0
+    lineups_snapshotted = 0
+    lineup_coverage = {"complete": 0, "partial": 0, "empty": 0}
     selected_fixture_ids: list[int] = []
     for target in _selected_statistics_targets(conn, context=context, scope=scope):
         if statistics._existing_pair_state(conn, provider_id=context.provider_id, target=target) == "done":
@@ -512,7 +518,12 @@ def _verify(
         selected_fixture_ids.append(target.fixture_id)
         lineup_target = _lineup_target(conn, context=context, fixture_id=target.fixture_id)
         verified = lineups._verify_fixture(conn, provider_id=context.provider_id, target=lineup_target)
-        if verified["coverage_state"] == "complete" and verified["team_lineups"] == 2:
+        coverage_state = verified["coverage_state"]
+        if coverage_state not in lineup_coverage:
+            raise AssertionError("historical lineup has an unsupported coverage state")
+        lineups_snapshotted += 1
+        lineup_coverage[coverage_state] += 1
+        if coverage_state == "complete" and verified["team_lineups"] == 2:
             lineups_complete += 1
     orphan_or_nonparticipant = conn.execute(
         """SELECT
@@ -579,6 +590,8 @@ def _verify(
         "coverage_snapshots": int(conn.execute("SELECT count(*) FROM source.season_coverage_snapshots WHERE season_id=%s", (context.season_id,)).fetchone()[0]),
         "statistics_complete": stats_complete,
         "historical_lineups_complete": lineups_complete,
+        "historical_lineup_snapshots": lineups_snapshotted,
+        "historical_lineup_coverage": lineup_coverage,
         "duplicates": int(duplicates),
         "orphans_or_nonparticipants": int(orphan_or_nonparticipant),
         "prematch_rows": int(prematch_rows),
@@ -595,7 +608,7 @@ def _verify(
         or result["standings_rows"] != scope.bootstrap_scope.expected_team_count
         or result["coverage_snapshots"] != 1
         or result["statistics_complete"] != FIXTURE_CALL_COUNT
-        or result["historical_lineups_complete"] != FIXTURE_CALL_COUNT
+        or result["historical_lineup_snapshots"] != FIXTURE_CALL_COUNT
         or result["duplicates"] != 0
         or result["orphans_or_nonparticipants"] != 0
         or result["prematch_rows"] != 0

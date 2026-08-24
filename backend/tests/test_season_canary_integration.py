@@ -17,6 +17,7 @@ from app.importer.season_canary import (
     _epl_2024_fingerprint,
     run_controlled_canary,
 )
+from app.importer.season_bootstrap import BUNDESLIGA_2025_REGULAR_SEASON_PROJECTION
 
 
 TEST_DB_URL = os.environ.get("SEASON_BOOTSTRAP_TEST_DB_URL")
@@ -66,7 +67,9 @@ def _statistics(fixture_id: int, home: dict[str, Any], away: dict[str, Any]) -> 
     return _response(payload)
 
 
-def _lineups(fixture_id: int, home: dict[str, Any], away: dict[str, Any], index: int) -> APIFootballResponse:
+def _lineups(
+    fixture_id: int, home: dict[str, Any], away: dict[str, Any], index: int, *, partial: bool = False
+) -> APIFootballResponse:
     payload = copy.deepcopy(_read(SAMPLES / "lineups.raw.json"))
     payload["parameters"] = {"fixture": str(fixture_id)}
     for team_index, (entry, team) in enumerate(zip(payload["response"], (home, away), strict=True)):
@@ -77,6 +80,9 @@ def _lineups(fixture_id: int, home: dict[str, Any], away: dict[str, Any], index:
                 wrapper["player"]["id"] = (
                     1_000_000 + index * 10_000 + team_index * 1_000 + role_index * 100 + player_index
                 )
+    if partial:
+        payload["response"] = payload["response"][:1]
+        payload["results"] = 1
     return _response(payload)
 
 
@@ -122,6 +128,18 @@ def test_epl_2024_fingerprint_is_bound_to_the_epl_baseline() -> None:
     assert connection.params == (3, "39")
 
 
+def test_canary_scope_forwards_reviewed_season_projection_to_bootstrap() -> None:
+    scope = SeasonCanaryScope(
+        league_external_id=78,
+        season_start_year=2025,
+        expected_fixture_count=306,
+        selected_fixture_external_ids=(1, 2, 3, 4, 5),
+        projection=BUNDESLIGA_2025_REGULAR_SEASON_PROJECTION,
+    )
+
+    assert scope.bootstrap_scope.projection is BUNDESLIGA_2025_REGULAR_SEASON_PROJECTION
+
+
 def test_full_14_call_canary_is_atomic_per_fixture_and_preserves_epl_2024(monkeypatch: pytest.MonkeyPatch) -> None:
     assert TEST_DB_URL is not None
     monkeypatch.setenv("SUPABASE_DB_URL", TEST_DB_URL)
@@ -143,7 +161,9 @@ def test_full_14_call_canary_is_atomic_per_fixture_and_preserves_epl_2024(monkey
     for index, fixture_id in enumerate(SELECTED):
         home, away = teams[fixture_id]
         responses[("/fixtures/statistics", (("fixture", fixture_id),))] = _statistics(fixture_id, home, away)
-        responses[("/fixtures/lineups", (("fixture", fixture_id),))] = _lineups(fixture_id, home, away, index)
+        responses[("/fixtures/lineups", (("fixture", fixture_id),))] = _lineups(
+            fixture_id, home, away, index, partial=index == 0
+        )
 
     client = QueuedClient(responses)
     report = run_controlled_canary(
@@ -162,7 +182,9 @@ def test_full_14_call_canary_is_atomic_per_fixture_and_preserves_epl_2024(monkey
     assert report.verification["fixtures"] == 380
     assert report.verification["exact_provider_statuses"] == 380
     assert report.verification["statistics_complete"] == 5
-    assert report.verification["historical_lineups_complete"] == 5
+    assert report.verification["historical_lineups_complete"] == 4
+    assert report.verification["historical_lineup_snapshots"] == 5
+    assert report.verification["historical_lineup_coverage"] == {"complete": 4, "partial": 1, "empty": 0}
     assert report.verification["duplicates"] == 0
     assert report.verification["orphans_or_nonparticipants"] == 0
     assert report.verification["prematch_rows"] == 0

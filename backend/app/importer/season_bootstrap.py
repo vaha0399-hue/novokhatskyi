@@ -44,12 +44,89 @@ class SeasonBootstrapError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ExcludedFixtureContract:
+    """One exact provider fixture retained only in season-wide raw provenance."""
+
+    external_id: int
+    home_external_id: int
+    away_external_id: int
+    round_label: str
+    status_code: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.external_id <= 0
+            or self.home_external_id <= 0
+            or self.away_external_id <= 0
+            or self.home_external_id == self.away_external_id
+            or not self.round_label
+            or not self.status_code
+        ):
+            raise ValueError("excluded fixture contract is invalid")
+
+
+@dataclass(frozen=True)
+class RegularSeasonProjection:
+    """Reviewed projection from a provider payload to a regular league season.
+
+    API-Football can include a relegation playoff in a league-season response.
+    The exact exceptional raw objects are retained, while only the validated
+    double round-robin regular season becomes canonical data.
+    """
+
+    expected_raw_team_count: int
+    expected_raw_fixture_count: int
+    excluded_team_external_ids: frozenset[int]
+    excluded_fixtures: tuple[ExcludedFixtureContract, ...]
+
+    def __post_init__(self) -> None:
+        fixture_ids = {fixture.external_id for fixture in self.excluded_fixtures}
+        if (
+            self.expected_raw_team_count <= 0
+            or self.expected_raw_fixture_count <= 0
+            or not self.excluded_team_external_ids
+            or len(fixture_ids) != len(self.excluded_fixtures)
+            or any(team_id <= 0 for team_id in self.excluded_team_external_ids)
+            or any(
+                fixture.home_external_id not in self.excluded_team_external_ids
+                and fixture.away_external_id not in self.excluded_team_external_ids
+                for fixture in self.excluded_fixtures
+            )
+        ):
+            raise ValueError("regular-season projection is invalid")
+
+    @property
+    def excluded_fixture_ids(self) -> frozenset[int]:
+        return frozenset(fixture.external_id for fixture in self.excluded_fixtures)
+
+    @property
+    def excluded_fixture_status_codes(self) -> dict[int, str]:
+        return {fixture.external_id: fixture.status_code for fixture in self.excluded_fixtures}
+
+
+# API-Football's 2025 Bundesliga payload was directly reviewed on 2026-08-24.
+# It contains the 18-team regular season plus the two-leg relegation playoff
+# involving Paderborn (185) and Wolfsburg (161). These raw objects are retained
+# for provenance but are not part of the canonical 18-team / 306-fixture season.
+BUNDESLIGA_2025_REGULAR_SEASON_PROJECTION = RegularSeasonProjection(
+    expected_raw_team_count=19,
+    expected_raw_fixture_count=308,
+    excluded_team_external_ids=frozenset({185}),
+    excluded_fixtures=(
+        ExcludedFixtureContract(1545417, 161, 185, "Final", "FT"),
+        ExcludedFixtureContract(1545418, 185, 161, "Final", "AET"),
+    ),
+)
+
+
+@dataclass(frozen=True)
 class BootstrapScope:
     """Explicit, immutable identity for one completed-season bootstrap."""
 
     league_external_id: int
     season_start_year: int
     expected_fixture_count: int
+    projection: RegularSeasonProjection | None = None
 
     def __post_init__(self) -> None:
         # Reuse the established completed-league schedule validation.
@@ -132,6 +209,7 @@ class ValidatedBase:
     fixtures: tuple[Any, ...]
     statuses: tuple[FixtureStatusObservation, ...]
     standings_payload: dict[str, Any]
+    projection: RegularSeasonProjection | None
 
 
 def base_requests(scope: BootstrapScope) -> tuple[BaseRequest, ...]:
@@ -232,8 +310,6 @@ def _league_record(payload: Mapping[str, Any], scope: BootstrapScope) -> LeagueR
 
 def _team_records(payload: Mapping[str, Any], scope: BootstrapScope, country_name: str) -> tuple[TeamRecord, ...]:
     response = payload["response"]
-    if len(response) != scope.expected_team_count:
-        raise SeasonBootstrapError(f"/teams must contain exactly {scope.expected_team_count} teams")
     records: list[TeamRecord] = []
     seen: set[int] = set()
     for item in response:
@@ -280,7 +356,9 @@ def _team_records(payload: Mapping[str, Any], scope: BootstrapScope, country_nam
     return tuple(sorted(records, key=lambda record: record.external_id))
 
 
-def _validate_standings(payload: Mapping[str, Any], scope: BootstrapScope, team_external_ids: set[int]) -> dict[str, Any]:
+def _validate_standings(
+    payload: Mapping[str, Any], scope: BootstrapScope, team_catalog_external_ids: set[int]
+) -> tuple[dict[str, Any], frozenset[int]]:
     response = payload["response"]
     if len(response) != 1 or not isinstance(response[0], Mapping):
         raise SeasonBootstrapError("/standings must return exactly one league")
@@ -304,9 +382,91 @@ def _validate_standings(payload: Mapping[str, Any], scope: BootstrapScope, team_
             record = row.get(record_name)
             if not isinstance(record, Mapping) or not isinstance(record.get("goals"), Mapping):
                 raise SeasonBootstrapError(f"standings.{record_name} has invalid structure")
-    if provider_ids != team_external_ids or ranks != set(range(1, scope.expected_team_count + 1)):
-        raise SeasonBootstrapError("standings membership or ranks do not match season teams")
-    return dict(payload)
+    if not provider_ids.issubset(team_catalog_external_ids) or ranks != set(range(1, scope.expected_team_count + 1)):
+        raise SeasonBootstrapError("standings membership or ranks do not match provider team catalog")
+    if scope.projection is None and provider_ids != team_catalog_external_ids:
+        raise SeasonBootstrapError("standings membership does not match season teams")
+    return dict(payload), frozenset(provider_ids)
+
+
+def _validate_projection(
+    payload: Mapping[str, Any],
+    *,
+    scope: BootstrapScope,
+    team_catalog_external_ids: set[int],
+    standings_team_external_ids: frozenset[int],
+) -> RegularSeasonProjection | None:
+    """Validate a reviewed raw-only postseason exception without rewriting raw."""
+    projection = scope.projection
+    if projection is None:
+        return None
+    if len(team_catalog_external_ids) != projection.expected_raw_team_count:
+        raise SeasonBootstrapError("provider team catalog count differs from reviewed projection")
+    if team_catalog_external_ids != standings_team_external_ids | projection.excluded_team_external_ids:
+        raise SeasonBootstrapError("provider team catalog differs from reviewed regular-season projection")
+
+    entries = payload.get("response")
+    if not isinstance(entries, list) or payload.get("results") != len(entries):
+        raise SeasonBootstrapError("fixture payload cannot be projected")
+    if len(entries) != projection.expected_raw_fixture_count:
+        raise SeasonBootstrapError("provider fixture count differs from reviewed projection")
+
+    seen_ids: set[int] = set()
+    by_id: dict[int, Mapping[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise SeasonBootstrapError("projected fixture entry must be an object")
+        fixture = entry.get("fixture")
+        league = entry.get("league")
+        teams = entry.get("teams")
+        if not all(isinstance(value, Mapping) for value in (fixture, league, teams)):
+            raise SeasonBootstrapError("projected fixture entry has invalid structure")
+        assert isinstance(fixture, Mapping)
+        assert isinstance(league, Mapping)
+        assert isinstance(teams, Mapping)
+        fixture_id = _require_positive_int(fixture.get("id"), "fixture.id")
+        if fixture_id in seen_ids:
+            raise SeasonBootstrapError("provider fixture payload contains duplicate fixture IDs")
+        seen_ids.add(fixture_id)
+        if league.get("id") != scope.league_external_id or league.get("season") != scope.season_start_year:
+            raise SeasonBootstrapError("projected fixture belongs to an unexpected league or season")
+        home = teams.get("home")
+        away = teams.get("away")
+        if not isinstance(home, Mapping) or not isinstance(away, Mapping):
+            raise SeasonBootstrapError("projected fixture teams are invalid")
+        home_id = _require_positive_int(home.get("id"), "teams.home.id")
+        away_id = _require_positive_int(away.get("id"), "teams.away.id")
+        if home_id == away_id:
+            raise SeasonBootstrapError("projected fixture has identical participants")
+        if fixture_id not in projection.excluded_fixture_ids and (
+            home_id not in standings_team_external_ids or away_id not in standings_team_external_ids
+        ):
+            raise SeasonBootstrapError("unreviewed non-regular-season fixture is present in provider payload")
+        by_id[fixture_id] = entry
+
+    if projection.excluded_fixture_ids - seen_ids:
+        raise SeasonBootstrapError("reviewed excluded fixture is missing from provider payload")
+    for expected in projection.excluded_fixtures:
+        entry = by_id[expected.external_id]
+        fixture = entry["fixture"]
+        league = entry["league"]
+        teams = entry["teams"]
+        assert isinstance(fixture, Mapping)
+        assert isinstance(league, Mapping)
+        assert isinstance(teams, Mapping)
+        status = fixture.get("status")
+        home = teams.get("home")
+        away = teams.get("away")
+        if not isinstance(status, Mapping) or not isinstance(home, Mapping) or not isinstance(away, Mapping):
+            raise SeasonBootstrapError("reviewed excluded fixture has invalid provider structure")
+        if (
+            _require_positive_int(home.get("id"), "teams.home.id") != expected.home_external_id
+            or _require_positive_int(away.get("id"), "teams.away.id") != expected.away_external_id
+            or _optional_string(league.get("round"), "league.round") != expected.round_label
+            or status.get("short") != expected.status_code
+        ):
+            raise SeasonBootstrapError("reviewed excluded fixture differs from provider contract")
+    return projection
 
 
 def validate_base_responses(
@@ -332,21 +492,35 @@ def validate_base_responses(
         external_league_id=scope.league_external_id,
         external_season=scope.season_start_year,
     )
-    teams = _team_records(by_endpoint["/teams"].response.data, scope, league.country_name)
+    provider_team_catalog = _team_records(by_endpoint["/teams"].response.data, scope, league.country_name)
+    provider_team_ids = {team.external_id for team in provider_team_catalog}
+    standings, standing_team_ids = _validate_standings(
+        by_endpoint["/standings"].response.data, scope, provider_team_ids
+    )
+    projection = _validate_projection(
+        by_endpoint["/fixtures"].response.data,
+        scope=scope,
+        team_catalog_external_ids=provider_team_ids,
+        standings_team_external_ids=standing_team_ids,
+    )
+    teams = tuple(team for team in provider_team_catalog if team.external_id in standing_team_ids)
     team_ids = {team.external_id for team in teams}
+    if len(teams) != scope.expected_team_count:
+        raise SeasonBootstrapError("canonical season team count does not match standings")
     fixtures = validate_fixture_season_response(
         by_endpoint["/fixtures"].response,
         allowed_team_external_ids=team_ids,
         scope=scope.season_scope,
+        excluded_fixture_external_ids=() if projection is None else projection.excluded_fixture_ids,
     )
     statuses = validate_fixture_status_response(
         by_endpoint["/fixtures"].response,
         expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(),
         expected_fixture_ids={fixture.external_id for fixture in fixtures},
         allowed_status_codes={"FT"},
+        excluded_fixture_status_codes=None if projection is None else projection.excluded_fixture_status_codes,
     )
-    standings = _validate_standings(by_endpoint["/standings"].response.data, scope, team_ids)
-    return ValidatedBase(scope, league, coverage, teams, tuple(fixtures), statuses, standings)
+    return ValidatedBase(scope, league, coverage, teams, tuple(fixtures), statuses, standings, projection)
 
 
 def _provider_id(conn: Connection[Any]) -> int:
@@ -458,7 +632,10 @@ def _persist_fetch(
     provider_id: int,
     collected: CollectedBaseResponse,
     season_id: int,
+    retention_class: str = "standard",
 ) -> int:
+    if retention_class not in {"standard", "contract_sample"}:
+        raise ValueError("unsupported bootstrap raw retention class")
     payload = collected.response.data
     paging = payload["paging"]
     fetch_id = int(
@@ -489,12 +666,13 @@ def _persist_fetch(
     conn.execute(
         """INSERT INTO source.provider_raw_payloads(
                 fetch_id,inline_body,content_type,byte_count,retention_class,expires_at
-            ) VALUES(%s,%s,'application/json',%s,'standard',%s)""",
+            ) VALUES(%s,%s,'application/json',%s,%s,%s)""",
         (
             fetch_id,
             collected.response.raw_body,
             len(collected.response.raw_body),
-            collected.response_received_at + timedelta(days=RAW_RETENTION_DAYS),
+            retention_class,
+            None if retention_class == "contract_sample" else collected.response_received_at + timedelta(days=RAW_RETENTION_DAYS),
         ),
     )
     return fetch_id
@@ -615,9 +793,14 @@ def bootstrap_base(
             conn, provider_id=provider_id, league_id=league_id, league=validated.league, scope=scope
         )
 
+        retention_class = "contract_sample" if validated.projection is not None else "standard"
         fetch_ids = {
             endpoint: _persist_fetch(
-                conn, provider_id=provider_id, collected=by_endpoint[endpoint], season_id=season_id
+                conn,
+                provider_id=provider_id,
+                collected=by_endpoint[endpoint],
+                season_id=season_id,
+                retention_class=retention_class,
             )
             for endpoint in ("/leagues", "/teams", "/standings", "/fixtures")
         }
@@ -666,6 +849,9 @@ def bootstrap_base(
             context=context,
             fetch=fixture_fetch,
             records=validated.fixtures,
+            excluded_fixture_status_codes=(
+                None if validated.projection is None else validated.projection.excluded_fixture_status_codes
+            ),
         )
         if statuses != validated.statuses:
             raise SeasonBootstrapError("provider status contract changed after base validation")

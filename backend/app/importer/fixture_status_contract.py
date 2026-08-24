@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,12 +29,16 @@ def validate_fixture_status_response(
     expected_content_sha256: bytes,
     expected_fixture_ids: Collection[int],
     allowed_status_codes: Collection[str],
+    excluded_fixture_status_codes: Mapping[int, str] | None = None,
 ) -> tuple[FixtureStatusObservation, ...]:
     """Validate raw bytes and return exact fixture/status memberships.
 
-    ``expected_fixture_ids`` must describe the complete requested result set,
-    not merely a subset. Unknown status codes fail closed and require contract
-    review before a new database mapping can be introduced.
+    ``expected_fixture_ids`` normally describes the complete requested result
+    set. A reviewed bootstrap projection may additionally declare exact raw
+    fixtures that must remain provenance-only (for example relegation
+    playoffs returned in a league-season payload). Those IDs and their status
+    values are matched exactly, but are deliberately not normalized or mapped.
+    Unknown canonical status codes always fail closed.
     """
 
     if len(expected_content_sha256) != 32:
@@ -61,6 +65,16 @@ def validate_fixture_status_response(
         raise ValueError("provider fixture results count does not match response array")
 
     allowed = frozenset(allowed_status_codes)
+    excluded = dict(excluded_fixture_status_codes or {})
+    expected_ids = frozenset(expected_fixture_ids)
+    if expected_ids & excluded.keys():
+        raise ValueError("canonical and excluded fixture status memberships overlap")
+    if any(
+        not isinstance(fixture_id, int) or isinstance(fixture_id, bool) or fixture_id <= 0
+        or not isinstance(status_code, str) or not status_code
+        for fixture_id, status_code in excluded.items()
+    ):
+        raise ValueError("excluded fixture status contract is invalid")
     observations: list[FixtureStatusObservation] = []
     observed_ids: set[int] = set()
     for item in items:
@@ -76,15 +90,18 @@ def validate_fixture_status_response(
         if not isinstance(status, dict) or not isinstance(status.get("short"), str):
             raise ValueError("provider fixture status.short must be a string")
         status_code = status["short"]
-        if status_code not in allowed:
-            raise ValueError(f"unreviewed provider fixture status code: {status_code}")
         if external_fixture_id in observed_ids:
             raise ValueError("provider fixture response contains a duplicate fixture id")
         observed_ids.add(external_fixture_id)
+        if external_fixture_id in excluded:
+            if status_code != excluded[external_fixture_id]:
+                raise ValueError("excluded fixture status does not match reviewed contract")
+            continue
+        if status_code not in allowed:
+            raise ValueError(f"unreviewed provider fixture status code: {status_code}")
         observations.append(FixtureStatusObservation(external_fixture_id, status_code))
 
-    expected_ids = frozenset(expected_fixture_ids)
-    if observed_ids != expected_ids:
+    if observed_ids != expected_ids | frozenset(excluded):
         raise ValueError("provider fixture response membership does not match requested fixtures")
 
     return tuple(observations)

@@ -41,6 +41,10 @@ ANOMALY_RETENTION_DAYS = 90
 MAX_CANARY_CALLS = 10
 FIRST_BATCH_CALLS = 5
 QUOTA_RESERVE = 25
+# Keep the sequential historical-lineup importer below API-Football Pro's
+# 300 requests/minute limit, with material headroom and no concurrency.
+BULK_PACE_SECONDS = 1.1
+DEFAULT_BULK_CALL_CAP = 90
 
 Sleep = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
@@ -182,6 +186,34 @@ class HistoricalLineupsCanaryReport:
     quota: Mapping[str, str]
     selected_fixture_external_ids: tuple[int, ...]
     replay_fixture_external_id: int | None
+    verification: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class HistoricalLineupsBatchReport:
+    """One bounded, resumable historical-lineups bulk batch.
+
+    ``complete``, ``partial`` and ``empty`` describe the factual provider
+    coverage that was durably stored.  They are not synthetic success states.
+    A transport/provider/contract/integrity failure raises instead of allowing
+    the next fixture to be requested.
+    """
+
+    physical_api_calls: int
+    retained_raw_replays: int
+    complete: int
+    empty: int
+    partial: int
+    snapshots_created: int
+    team_lineups_created: int
+    lineup_players_created: int
+    players_created: int
+    players_reused: int
+    coaches_created: int
+    coaches_reused: int
+    stop_reason: str | None
+    quota: Mapping[str, str]
+    remaining_fixtures: int
     verification: Mapping[str, Any]
 
 
@@ -1117,6 +1149,132 @@ def _verify_canary(
     return verification
 
 
+def _verify_bulk_batch(
+    conn: Connection[Any], *, provider_id: int, targets: tuple[FixtureTarget, ...],
+    out_of_scope_before: Mapping[str, str],
+) -> dict[str, Any]:
+    """Verify a large batch without the canary's per-fixture round trips.
+
+    Canary runs intentionally re-parse and compare every selected raw response
+    field-by-field.  For an established importer, repeating that remote query
+    pattern for 90 fixtures makes the verifier dominate the API work.  Bulk
+    relies on the same normalizer plus database constraints, and verifies every
+    selected snapshot's raw hash/provenance and all global relational invariants
+    in set-based SQL.
+    """
+    fixture_ids = [target.fixture_id for target in targets]
+    if fixture_ids:
+        snapshots, valid_provenance, coverage_mismatches = conn.execute(
+            """SELECT
+                    count(*),
+                    count(*) FILTER (
+                      WHERE provider_fetch.endpoint=%s
+                        AND provider_fetch.purpose=%s
+                        AND provider_fetch.provider_id=%s
+                        AND provider_fetch.subject_fixture_id=snapshot.fixture_id
+                        AND provider_fetch.subject_season_id=fixture.season_id
+                        AND provider_fetch.outcome='success'
+                        AND provider_fetch.normalized_at IS NOT NULL
+                        AND raw.purged_at IS NULL
+                        AND raw.inline_body IS NOT NULL
+                        AND snapshot.content_sha256=provider_fetch.content_sha256
+                        AND provider_fetch.content_sha256=sha256(raw.inline_body)
+                        AND raw.byte_count=octet_length(raw.inline_body)
+                        AND snapshot.captured_at=provider_fetch.response_received_at
+                        AND snapshot.available_at=provider_fetch.response_received_at
+                        AND snapshot.availability_basis='reconstructed_conservative'
+                    ),
+                    count(*) FILTER (
+                      WHERE snapshot.team_count <> coalesce(lineup_counts.team_count, 0)
+                    )
+                FROM football.fixture_historical_lineup_snapshots snapshot
+                JOIN football.fixtures fixture ON fixture.id=snapshot.fixture_id
+                JOIN source.provider_fetches provider_fetch ON provider_fetch.id=snapshot.source_fetch_id
+                JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
+                LEFT JOIN LATERAL (
+                  SELECT count(*)::smallint AS team_count
+                  FROM football.fixture_historical_lineups lineup
+                  WHERE lineup.snapshot_id=snapshot.id
+                ) lineup_counts ON true
+                WHERE snapshot.fixture_id=ANY(%s)""",
+            (ENDPOINT, PURPOSE, provider_id, fixture_ids),
+        ).fetchone()
+    else:
+        snapshots = valid_provenance = coverage_mismatches = 0
+
+    duplicate_headers = conn.execute(
+        """SELECT count(*) FROM (
+             SELECT snapshot_id, team_id FROM football.fixture_historical_lineups
+             GROUP BY snapshot_id, team_id HAVING count(*) > 1
+           ) duplicates"""
+    ).fetchone()[0]
+    duplicate_players = conn.execute(
+        """SELECT count(*) FROM (
+             SELECT snapshot_id, player_id FROM football.fixture_historical_lineup_players
+             GROUP BY snapshot_id, player_id HAVING count(*) > 1
+           ) duplicates"""
+    ).fetchone()[0]
+    orphan_or_nonparticipant = conn.execute(
+        """SELECT count(*)
+           FROM football.fixture_historical_lineups header
+           JOIN football.fixture_historical_lineup_snapshots snapshot ON snapshot.id=header.snapshot_id
+           JOIN football.fixtures fixture ON fixture.id=snapshot.fixture_id
+           LEFT JOIN football.teams team ON team.id=header.team_id
+           WHERE team.id IS NULL OR header.team_id NOT IN (fixture.home_team_id, fixture.away_team_id)"""
+    ).fetchone()[0]
+    count_mismatch = conn.execute(
+        """SELECT count(*)
+           FROM football.fixture_historical_lineups header
+           WHERE header.starter_count <> (
+                   SELECT count(*) FROM football.fixture_historical_lineup_players player
+                   WHERE player.snapshot_id=header.snapshot_id AND player.team_id=header.team_id
+                     AND player.lineup_role='starter'
+                 )
+              OR header.substitute_count <> (
+                   SELECT count(*) FROM football.fixture_historical_lineup_players player
+                   WHERE player.snapshot_id=header.snapshot_id AND player.team_id=header.team_id
+                     AND player.lineup_role='substitute'
+                 )"""
+    ).fetchone()[0]
+    provider_orphans = conn.execute(
+        """SELECT
+             (SELECT count(*) FROM source.player_provider_refs ref LEFT JOIN football.players player ON player.id=ref.player_id WHERE player.id IS NULL) +
+             (SELECT count(*) FROM source.coach_provider_refs ref LEFT JOIN football.coaches coach ON coach.id=ref.coach_id WHERE coach.id IS NULL)"""
+    ).fetchone()[0]
+    after = {table: _table_fingerprint(conn, table) for table in out_of_scope_before}
+    verification = {
+        "processed_fixtures": len(fixture_ids),
+        "snapshots": int(snapshots),
+        "raw_provenance_valid": int(valid_provenance),
+        "coverage_mismatches": int(coverage_mismatches),
+        "duplicate_headers": int(duplicate_headers),
+        "duplicate_players": int(duplicate_players),
+        "orphan_or_nonparticipant_rows": int(orphan_or_nonparticipant),
+        "role_count_mismatches": int(count_mismatch),
+        "provider_mapping_orphans": int(provider_orphans),
+        "out_of_scope_fingerprints_unchanged": {
+            table: out_of_scope_before[table] == after[table] for table in out_of_scope_before
+        },
+    }
+    if (
+        (verification["snapshots"], verification["raw_provenance_valid"], verification["coverage_mismatches"])
+        != (len(fixture_ids), len(fixture_ids), 0)
+        or any(
+            verification[key] != 0
+            for key in (
+                "duplicate_headers",
+                "duplicate_players",
+                "orphan_or_nonparticipant_rows",
+                "role_count_mismatches",
+                "provider_mapping_orphans",
+            )
+        )
+        or not all(verification["out_of_scope_fingerprints_unchanged"].values())
+    ):
+        raise AssertionError("historical lineup bulk verification failed")
+    return verification
+
+
 def _add_result(
     aggregate: dict[str, int], result: NormalizationResult) -> None:
     aggregate[result.coverage_state] += 1
@@ -1129,15 +1287,21 @@ def _add_result(
     aggregate["coaches_reused"] += result.entities.coaches_reused
 
 
-def _first_batch_is_fully_complete(verification: Mapping[str, Any]) -> bool:
+def _first_batch_has_valid_coverage(verification: Mapping[str, Any]) -> bool:
+    """Accept factual empty/partial lineups without treating them as errors.
+
+    A completed historical fixture can legitimately have no published lineup or
+    a lineup for only one team. `_verify_canary` has already checked raw
+    provenance and canonical integrity; this guard only ensures that all five
+    responses reached one of the supported durable coverage states.
+    """
     fixtures = verification.get("fixtures")
     return (
         isinstance(fixtures, list)
         and len(fixtures) == FIRST_BATCH_CALLS
         and all(
             isinstance(fixture, Mapping)
-            and fixture.get("coverage_state") == "complete"
-            and fixture.get("team_lineups") == 2
+            and fixture.get("coverage_state") in {"complete", "partial", "empty"}
             for fixture in fixtures
         )
     )
@@ -1195,20 +1359,8 @@ def run_controlled_canary(
             first_verification = _verify_canary(
                 conn, provider_id=provider_id, targets=tuple(first_targets), out_of_scope_before=out_of_scope_before
             )
-            if not _first_batch_is_fully_complete(first_verification):
-                first_verification["second_batch_not_run"] = "first batch did not have five complete two-team lineups"
-                return HistoricalLineupsCanaryReport(
-                    physical_api_calls=physical_calls,
-                    retained_raw_replays=len(resumed),
-                    complete=aggregate["complete"], empty=aggregate["empty"], partial=aggregate["partial"],
-                    errors=0, snapshots_created=aggregate["snapshots_created"],
-                    team_lineups_created=aggregate["team_lineups_created"],
-                    lineup_players_created=aggregate["lineup_players_created"],
-                    players_created=aggregate["players_created"], players_reused=aggregate["players_reused"],
-                    coaches_created=aggregate["coaches_created"], coaches_reused=aggregate["coaches_reused"],
-                    quota=quota, selected_fixture_external_ids=tuple(target.external_id for target in selected),
-                    replay_fixture_external_id=None, verification={"first_batch": first_verification},
-                )
+            if not _first_batch_has_valid_coverage(first_verification):
+                raise AssertionError("historical lineup canary first batch lacks durable coverage")
             replay_target = first_targets[0]
             replay_fetch_id = first_verification["fixtures"][0]["source_fetch_id"]
             replay_raw = _load_retained_raw(
@@ -1265,18 +1417,161 @@ def run_controlled_canary(
             release_lock(conn, scope=scope)
 
 
+def _count_remaining_snapshots(
+    conn: Connection[Any], *, season_id: int
+) -> int:
+    """Return finalized fixtures that do not yet have a durable raw snapshot."""
+    return int(
+        conn.execute(
+            """SELECT count(*)
+               FROM football.fixtures fixture
+               WHERE fixture.season_id=%s
+                 AND fixture.lifecycle_state='completed'
+                 AND fixture.result_finalized_at IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM football.fixture_historical_lineup_snapshots snapshot
+                   WHERE snapshot.fixture_id=fixture.id
+                 )""",
+            (season_id,),
+        ).fetchone()[0]
+    )
+
+
+def _new_aggregate() -> dict[str, int]:
+    return {
+        "complete": 0,
+        "empty": 0,
+        "partial": 0,
+        "snapshots_created": 0,
+        "team_lineups_created": 0,
+        "lineup_players_created": 0,
+        "players_created": 0,
+        "players_reused": 0,
+        "coaches_created": 0,
+        "coaches_reused": 0,
+    }
+
+
+def run_historical_lineups_backfill(
+    *,
+    client: APIFootballClient | None = None,
+    clock: Clock = _utcnow,
+    sleep: Sleep = asyncio.sleep,
+    max_calls: int = DEFAULT_BULK_CALL_CAP,
+    scope: HistoricalLineupsScope = DEFAULT_HISTORICAL_LINEUPS_SCOPE,
+) -> HistoricalLineupsBatchReport:
+    """Run one no-concurrency, quota-bounded historical-lineups batch.
+
+    Retained successful raw responses are normalized first without a network
+    request.  Each subsequent fixture is fetched and normalized atomically by
+    the existing importer.  Factual missing/incomplete lineups are persisted as
+    ``empty``/``partial`` snapshots; any provider, contract, or integrity error
+    is a hard stop before another fixture is requested.
+    """
+    if not 1 <= max_calls <= DEFAULT_BULK_CALL_CAP:
+        raise ValueError(f"max_calls must be between 1 and {DEFAULT_BULK_CALL_CAP}")
+
+    api = client or APIFootballClient.from_environment()
+    with psycopg.connect(_database_url(), autocommit=True) as conn:
+        provider_id, season_id = acquire_context_and_lock(conn, scope=scope)
+        try:
+            out_of_scope_before = {
+                table: _table_fingerprint(conn, table) for table in OUT_OF_SCOPE_TABLES
+            }
+            aggregate = _new_aggregate()
+            resumed = _resume_unfinished_success_fetches(
+                conn, provider_id=provider_id, season_id=season_id, clock=clock
+            )
+            for result in resumed:
+                _add_result(aggregate, result)
+
+            targets = _targets_without_historical_attempts(
+                conn,
+                provider_id=provider_id,
+                season_id=season_id,
+                limit=max_calls,
+                scope=scope,
+            )
+            quota: dict[str, str] = {}
+            stop_reason: str | None = None
+            processed_targets: list[FixtureTarget] = []
+            for index, target in enumerate(targets, start=1):
+                result, headers = _fetch_and_normalize(
+                    conn,
+                    client=api,
+                    provider_id=provider_id,
+                    target=target,
+                    clock=clock,
+                )
+                processed_targets.append(target)
+                _add_result(aggregate, result)
+                quota = dict(headers)
+                remaining_quota = quota.get("x-ratelimit-requests-remaining")
+                if (
+                    remaining_quota is not None
+                    and remaining_quota.isdigit()
+                    and int(remaining_quota) <= QUOTA_RESERVE
+                ):
+                    stop_reason = "daily_quota_reserve"
+                    break
+                if index < len(targets):
+                    asyncio.run(sleep(BULK_PACE_SECONDS))
+
+            verification = _verify_bulk_batch(
+                conn,
+                provider_id=provider_id,
+                targets=tuple(processed_targets),
+                out_of_scope_before=out_of_scope_before,
+            )
+            return HistoricalLineupsBatchReport(
+                physical_api_calls=len(processed_targets),
+                retained_raw_replays=len(resumed),
+                complete=aggregate["complete"],
+                empty=aggregate["empty"],
+                partial=aggregate["partial"],
+                snapshots_created=aggregate["snapshots_created"],
+                team_lineups_created=aggregate["team_lineups_created"],
+                lineup_players_created=aggregate["lineup_players_created"],
+                players_created=aggregate["players_created"],
+                players_reused=aggregate["players_reused"],
+                coaches_created=aggregate["coaches_created"],
+                coaches_reused=aggregate["coaches_reused"],
+                stop_reason=stop_reason,
+                quota=quota,
+                remaining_fixtures=_count_remaining_snapshots(conn, season_id=season_id),
+                verification=verification,
+            )
+        finally:
+            release_lock(conn, scope=scope)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a ten-call historical lineup canary")
     parser.add_argument("--league-external-id", default=LEAGUE_EXTERNAL_ID)
     parser.add_argument("--season-start-year", type=int, default=SEASON_START_YEAR)
     parser.add_argument("--expected-fixture-count", type=int, default=EXPECTED_FIXTURE_COUNT)
+    parser.add_argument(
+        "--bulk",
+        action="store_true",
+        help="Run one bounded historical-lineups bulk batch instead of the 10-call canary",
+    )
+    parser.add_argument(
+        "--max-calls",
+        type=int,
+        default=DEFAULT_BULK_CALL_CAP,
+        help=f"Maximum physical API calls for --bulk (1-{DEFAULT_BULK_CALL_CAP})",
+    )
     args = parser.parse_args()
-    report = run_controlled_canary(
-        scope=HistoricalLineupsScope(
-            league_external_id=args.league_external_id,
-            season_start_year=args.season_start_year,
-            expected_fixture_count=args.expected_fixture_count,
-        )
+    scope = HistoricalLineupsScope(
+        league_external_id=args.league_external_id,
+        season_start_year=args.season_start_year,
+        expected_fixture_count=args.expected_fixture_count,
+    )
+    report = (
+        run_historical_lineups_backfill(scope=scope, max_calls=args.max_calls)
+        if args.bulk
+        else run_controlled_canary(scope=scope)
     )
     print(json.dumps(asdict(report), default=str, sort_keys=True))
 

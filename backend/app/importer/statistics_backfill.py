@@ -34,7 +34,10 @@ PURPOSE = "bootstrap"
 MAPPING_VERSION = "api-football-v1"
 RAW_RETENTION_DAYS = 30
 ANOMALY_RETENTION_DAYS = 90
-PACE_SECONDS = 6.5
+# Pro quota permits 300 requests/minute.  Keep sequential work well below it
+# (about 55 requests/minute) while retaining headroom for retries and operator
+# checks; no concurrency is used by this importer.
+PACE_SECONDS = 1.1
 DEFAULT_RUN_ATTEMPT_CAP = 90
 QUOTA_RESERVE = 5
 DATASET_ATTEMPT_CAP = 385

@@ -205,8 +205,15 @@ def validate_fixture_season_response(
     *,
     allowed_team_external_ids: Iterable[int],
     scope: SeasonBackfillScope = DEFAULT_SCOPE,
+    excluded_fixture_external_ids: Iterable[int] = (),
 ) -> list[FixtureRecord]:
-    """Validate the entire season response before any normalized database DML."""
+    """Validate canonical regular-season fixtures before normalized DML.
+
+    Most league-season payloads contain exactly the canonical double round-
+    robin schedule. A separately reviewed bootstrap projection may identify a
+    small set of provenance-only fixture IDs; they stay in raw provider bytes
+    but cannot become canonical fixtures for this season scope.
+    """
     payload = response.data
     expected_parameters = {key: str(value) for key, value in scope.request_params.items()}
     if payload.get("parameters") != expected_parameters:
@@ -219,14 +226,16 @@ def validate_fixture_season_response(
     entries = payload.get("response")
     if not isinstance(entries, list):
         raise ValueError("season fixtures response must be an array")
-    if payload.get("results") != scope.expected_fixture_count or len(entries) != scope.expected_fixture_count:
-        raise ValueError(
-            f"season fixtures response must contain exactly {scope.expected_fixture_count} fixtures"
-        )
-
     allowed_teams = set(allowed_team_external_ids)
+    excluded_ids = frozenset(excluded_fixture_external_ids)
+    if any(
+        not isinstance(external_id, int) or isinstance(external_id, bool) or external_id <= 0
+        for external_id in excluded_ids
+    ):
+        raise ValueError("excluded fixture IDs must be positive integers")
     records: list[FixtureRecord] = []
     seen_ids: set[int] = set()
+    seen_excluded_ids: set[int] = set()
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise ValueError("fixture entry must be an object")
@@ -252,9 +261,6 @@ def validate_fixture_season_response(
             or league.get("season") != scope.season_start_year
         ):
             raise ValueError("fixture belongs to an unexpected league or season")
-        status = fixture.get("status")
-        if not isinstance(status, Mapping) or status.get("short") != "FT":
-            raise ValueError("historical season backfill accepts only FT fixtures")
         home = teams.get("home")
         away = teams.get("away")
         if not isinstance(home, Mapping) or not isinstance(away, Mapping):
@@ -263,8 +269,16 @@ def validate_fixture_season_response(
         away_external_id = _required_positive_integer(away.get("id"), field="teams.away.id")
         if home_external_id == away_external_id:
             raise ValueError("fixture home and away teams must differ")
+        if external_id in excluded_ids:
+            if home_external_id in allowed_teams and away_external_id in allowed_teams:
+                raise ValueError("reviewed excluded fixture has only canonical season participants")
+            seen_excluded_ids.add(external_id)
+            continue
         if home_external_id not in allowed_teams or away_external_id not in allowed_teams:
             raise ValueError("fixture participant is not mapped to the season")
+        status = fixture.get("status")
+        if not isinstance(status, Mapping) or status.get("short") != "FT":
+            raise ValueError("historical season backfill accepts only FT fixtures")
 
         kickoff_raw = fixture.get("date")
         if not isinstance(kickoff_raw, str):
@@ -320,15 +334,28 @@ def validate_fixture_season_response(
             )
         )
 
+    if seen_excluded_ids != excluded_ids:
+        raise ValueError("reviewed excluded fixtures are missing from season response")
+    if payload.get("results") != len(entries) or len(records) != scope.expected_fixture_count:
+        raise ValueError(
+            f"season fixtures response must contain exactly {scope.expected_fixture_count} canonical fixtures"
+        )
+
     records.sort(key=lambda item: item.external_id)
     home_counts = {team_id: 0 for team_id in allowed_teams}
     away_counts = {team_id: 0 for team_id in allowed_teams}
+    directed_pairs: set[tuple[int, int]] = set()
     for record in records:
+        pair = (record.home_external_id, record.away_external_id)
+        if pair in directed_pairs:
+            raise ValueError("season fixtures contain a duplicate directed team pairing")
+        directed_pairs.add(pair)
         home_counts[record.home_external_id] += 1
         away_counts[record.away_external_id] += 1
     expected_home_or_away = scope.expected_team_count - 1
     if (
         len(allowed_teams) != scope.expected_team_count
+        or len(directed_pairs) != scope.expected_fixture_count
         or set(home_counts.values()) != {expected_home_or_away}
         or set(away_counts.values()) != {expected_home_or_away}
     ):
@@ -928,6 +955,7 @@ def _validate_provider_statuses(
     context: SeasonContext,
     fetch: StoredFetch,
     records: Sequence[FixtureRecord],
+    excluded_fixture_status_codes: Mapping[int, str] | None = None,
 ) -> tuple[FixtureStatusObservation, ...]:
     """Validate exact status membership against the reviewed DB mapping."""
 
@@ -947,6 +975,7 @@ def _validate_provider_statuses(
         expected_content_sha256=hashlib.sha256(fetch.response.raw_body).digest(),
         expected_fixture_ids={record.external_id for record in records},
         allowed_status_codes=allowed_status_codes,
+        excluded_fixture_status_codes=excluded_fixture_status_codes,
     )
 
 
