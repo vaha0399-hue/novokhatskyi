@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from decimal import Decimal
 
 from app.analytics import AnalyticsEngine
@@ -9,11 +10,16 @@ from app.analytics.models import AnalyticsScope, AverageMetric, RateMetric, Wind
 
 from .dtos import (
     AverageMetricSummary, FixtureAnalyticsResponse, FixtureAnalyticsSide, FixtureScore,
-    FixtureSummary, GoalTotalsRateSummary, MetricSummary, PaginationMetadata,
-    RateMetricSummary, SeasonFixturesResponse, StreakSummary, TeamAnalyticsResponse,
-    TeamReference,
+    FixtureStatisticsResponse, FixtureStatisticsSide, FixtureSummary, FixtureTeamStatistics,
+    GoalTotalsRateSummary, LeagueListResponse, LeagueReference, LeagueSeasonsResponse,
+    MetricSummary, PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
+    SeasonReference, SeasonStandingRow, SeasonStandingsResponse, StandingsGroup,
+    StreakSummary, TeamAnalyticsResponse, TeamReference,
 )
-from .repository import FixtureRecord, TeamRecord, WebReadRepository
+from .repository import (
+    FixtureRecord, FixtureStatisticsRecord, LeagueRecord, SeasonRecord, TeamRecord,
+    WebReadRepository,
+)
 
 
 class WebNotFoundError(LookupError):
@@ -61,6 +67,20 @@ def _team(value: TeamRecord) -> TeamReference:
     return TeamReference(id=value.id, name=value.name)
 
 
+def _league(value: LeagueRecord) -> LeagueReference:
+    return LeagueReference(
+        id=value.id, name=value.name, country_name=value.country_name,
+        logo_url=value.logo_url, competition_type=value.competition_type,
+    )
+
+
+def _season(value: SeasonRecord) -> SeasonReference:
+    return SeasonReference(
+        id=value.id, league=_league(value.league), start_year=value.start_year,
+        label=value.label, starts_on=value.starts_on, ends_on=value.ends_on,
+    )
+
+
 def _fixture(value: FixtureRecord) -> FixtureSummary:
     score = None
     if value.lifecycle_state == "completed" and value.result_finalized_at is not None:
@@ -74,10 +94,61 @@ def _fixture(value: FixtureRecord) -> FixtureSummary:
     )
 
 
+def _fixture_statistics(value: FixtureStatisticsRecord) -> FixtureTeamStatistics:
+    return FixtureTeamStatistics(
+        shots_on_goal=value.shots_on_goal, shots_off_goal=value.shots_off_goal,
+        total_shots=value.total_shots, blocked_shots=value.blocked_shots,
+        shots_inside_box=value.shots_inside_box, shots_outside_box=value.shots_outside_box,
+        fouls=value.fouls, corner_kicks=value.corner_kicks, offsides=value.offsides,
+        yellow_cards=value.yellow_cards, red_cards=value.red_cards,
+        goalkeeper_saves=value.goalkeeper_saves, total_passes=value.total_passes,
+        passes_accurate=value.passes_accurate, possession_pct=_number(value.possession_pct),
+        pass_accuracy_pct=_number(value.pass_accuracy_pct), expected_goals=_number(value.expected_goals),
+        goals_prevented=_number(value.goals_prevented),
+    )
+
+
 class WebReadService:
     def __init__(self, repository: WebReadRepository, analytics: AnalyticsEngine) -> None:
         self._repository = repository
         self._analytics = analytics
+
+    def leagues(self) -> LeagueListResponse:
+        return LeagueListResponse(leagues=[_league(item) for item in self._repository.list_leagues()])
+
+    def league_seasons(self, *, league_id: int) -> LeagueSeasonsResponse:
+        league = self._repository.league(league_id=league_id)
+        if league is None:
+            raise WebNotFoundError("league_not_found")
+        return LeagueSeasonsResponse(
+            league=_league(league),
+            seasons=[_season(item) for item in self._repository.list_league_seasons(league_id=league_id)],
+        )
+
+    def season_standings(self, *, season_id: int) -> SeasonStandingsResponse:
+        season = self._repository.season(season_id=season_id)
+        if season is None:
+            raise WebNotFoundError("season_not_found")
+        latest = self._repository.latest_season_standings(season_id=season_id)
+        if latest is None:
+            raise WebValidationError("season_standings_not_available")
+        captured_at, rows = latest
+        grouped: dict[int, list[SeasonStandingRow]] = defaultdict(list)
+        names: dict[int, str | None] = {}
+        for item in rows:
+            grouped[item.group_index].append(
+                SeasonStandingRow(
+                    rank=item.rank, team=_team(item.team), points=item.points, played=item.played,
+                    wins=item.wins, draws=item.draws, losses=item.losses, goals_for=item.goals_for,
+                    goals_against=item.goals_against, goals_diff=item.goals_diff, form=item.form,
+                    status=item.status, description=item.description,
+                )
+            )
+            names[item.group_index] = item.group_name
+        return SeasonStandingsResponse(
+            season=_season(season), captured_at=captured_at,
+            groups=[StandingsGroup(name=names[index], rows=grouped[index]) for index in sorted(grouped)],
+        )
 
     def season_fixtures(self, *, season_id: int, limit: int, offset: int) -> SeasonFixturesResponse:
         if not self._repository.season_exists(season_id=season_id):
@@ -115,4 +186,19 @@ class WebReadService:
             fixture=_fixture(fixture), window=window, historical_cutoff_at=fixture.context.kickoff_at,
             home=FixtureAnalyticsSide(team=_team(fixture.home_team), overall=_metrics(analytics.home_overall.windows[window]), venue_split=_metrics(analytics.home_home.windows[window])),
             away=FixtureAnalyticsSide(team=_team(fixture.away_team), overall=_metrics(analytics.away_overall.windows[window]), venue_split=_metrics(analytics.away_away.windows[window])),
+        )
+
+    def fixture_statistics(self, *, fixture_id: int) -> FixtureStatisticsResponse:
+        fixture = self._repository.fixture(fixture_id=fixture_id)
+        if fixture is None:
+            raise WebNotFoundError("fixture_not_found")
+        statistics = {item.team_id: _fixture_statistics(item) for item in self._repository.fixture_statistics(fixture_id=fixture_id)}
+        return FixtureStatisticsResponse(
+            fixture=_fixture(fixture),
+            home=FixtureStatisticsSide(
+                team=_team(fixture.home_team), metrics=statistics.get(fixture.context.home_team_id),
+            ),
+            away=FixtureStatisticsSide(
+                team=_team(fixture.away_team), metrics=statistics.get(fixture.context.away_team_id),
+            ),
         )

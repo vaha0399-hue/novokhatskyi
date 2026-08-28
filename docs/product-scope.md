@@ -247,11 +247,13 @@ future stage.
    stage, then add timestamped Odds snapshots in another stage.
 7. After those contracts are stable, import EPL 2025/26, then EPL 2026/27,
    then the remaining Top-5 leagues.
-8. Only then begin the minimal Next.js frontend, using the stable backend
-   contracts rather than allowing UI needs to dictate analytical computation.
-9. Add Supabase Auth, account/free access, premium design, and finally
-   subscriptions/payments in later independent stages.
+8. The stable Analytics Engine and FastAPI Read API are now available, so an
+   initial **visual Next.js frontend and Supabase Auth foundation are approved
+   now**. They must consume existing DTOs and may not dictate database,
+   importer, or analytical-calculation changes.
+9. Add backend JWT verification, account/free access policy, premium design,
+   and finally subscriptions/payments in later independent stages.
 
-Do not start frontend implementation before the Analytics Engine, its
-historical validation layer, and the FastAPI read contracts are stable. The
-statistics importer must not be changed merely because of this roadmap update.
+The frontend began only after the Analytics Engine, its historical validation
+layer, and FastAPI read contracts became stable. The statistics importer must
+not be changed merely because of frontend requirements.

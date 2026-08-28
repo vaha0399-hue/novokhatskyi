@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
+from datetime import date, datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -14,6 +13,59 @@ class WebDTO(BaseModel):
 class TeamReference(WebDTO):
     id: int
     name: str
+
+
+class LeagueReference(WebDTO):
+    id: int
+    name: str
+    country_name: str | None
+    logo_url: str | None
+    competition_type: str | None
+
+
+class LeagueListResponse(WebDTO):
+    leagues: list[LeagueReference]
+
+
+class SeasonReference(WebDTO):
+    id: int
+    league: LeagueReference
+    start_year: int
+    label: str
+    starts_on: date | None
+    ends_on: date | None
+
+
+class LeagueSeasonsResponse(WebDTO):
+    league: LeagueReference
+    seasons: list[SeasonReference]
+
+
+class SeasonStandingRow(WebDTO):
+    rank: int = Field(gt=0)
+    team: TeamReference
+    points: int = Field(ge=0)
+    played: int = Field(ge=0)
+    wins: int = Field(ge=0)
+    draws: int = Field(ge=0)
+    losses: int = Field(ge=0)
+    goals_for: int = Field(ge=0)
+    goals_against: int = Field(ge=0)
+    goals_diff: int
+    form: str | None
+    status: str | None
+    description: str | None
+
+
+class StandingsGroup(WebDTO):
+    name: str | None
+    rows: list[SeasonStandingRow]
+
+
+class SeasonStandingsResponse(WebDTO):
+    season: SeasonReference
+    captured_at: datetime
+    groups: list[StandingsGroup]
 
 
 class FixtureScore(WebDTO):
@@ -117,3 +169,35 @@ class FixtureAnalyticsResponse(WebDTO):
     historical_cutoff_at: datetime
     home: FixtureAnalyticsSide
     away: FixtureAnalyticsSide
+
+
+class FixtureTeamStatistics(WebDTO):
+    shots_on_goal: int | None
+    shots_off_goal: int | None
+    total_shots: int | None
+    blocked_shots: int | None
+    shots_inside_box: int | None
+    shots_outside_box: int | None
+    fouls: int | None
+    corner_kicks: int | None
+    offsides: int | None
+    yellow_cards: int | None
+    red_cards: int | None
+    goalkeeper_saves: int | None
+    total_passes: int | None
+    passes_accurate: int | None
+    possession_pct: float | None
+    pass_accuracy_pct: float | None
+    expected_goals: float | None
+    goals_prevented: float | None
+
+
+class FixtureStatisticsSide(WebDTO):
+    team: TeamReference
+    metrics: FixtureTeamStatistics | None
+
+
+class FixtureStatisticsResponse(WebDTO):
+    fixture: FixtureSummary
+    home: FixtureStatisticsSide
+    away: FixtureStatisticsSide

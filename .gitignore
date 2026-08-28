@@ -232,3 +232,9 @@ pnpm-debug.log*
 # JavaScript / TypeScript test and build artifacts
 *.tsbuildinfo
 frontend/coverage/
+
+# Editor recovery files can contain unsaved local environment values.
+*.swp
+
+# Locally cached, provider-derived media. These assets are not source code.
+backend/var/assets/

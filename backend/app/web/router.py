@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.analytics.models import AnalyticsScope
 
 from .dependencies import get_web_read_service
-from .dtos import FixtureAnalyticsResponse, SeasonFixturesResponse, TeamAnalyticsResponse
+from .dtos import (
+    FixtureAnalyticsResponse, FixtureStatisticsResponse, LeagueListResponse,
+    LeagueSeasonsResponse, SeasonFixturesResponse, SeasonStandingsResponse,
+    TeamAnalyticsResponse,
+)
 from .service import WebNotFoundError, WebReadService, WebValidationError
 
 
@@ -27,6 +31,19 @@ def _error(error: WebNotFoundError | WebValidationError) -> HTTPException:
     return HTTPException(status_code=404 if isinstance(error, WebNotFoundError) else 422, detail={"code": error.code})
 
 
+@router.get("/leagues", response_model=LeagueListResponse)
+def leagues(service: Service) -> LeagueListResponse:
+    return service.leagues()
+
+
+@router.get("/leagues/{league_id}/seasons", response_model=LeagueSeasonsResponse)
+def league_seasons(league_id: int, service: Service) -> LeagueSeasonsResponse:
+    try:
+        return service.league_seasons(league_id=league_id)
+    except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
+
+
 @router.get("/seasons/{season_id}/fixtures", response_model=SeasonFixturesResponse)
 def season_fixtures(
     season_id: int,
@@ -36,6 +53,14 @@ def season_fixtures(
 ) -> SeasonFixturesResponse:
     try:
         return service.season_fixtures(season_id=season_id, limit=limit, offset=offset)
+    except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
+
+
+@router.get("/seasons/{season_id}/standings", response_model=SeasonStandingsResponse)
+def season_standings(season_id: int, service: Service) -> SeasonStandingsResponse:
+    try:
+        return service.season_standings(season_id=season_id)
     except (WebNotFoundError, WebValidationError) as error:
         raise _error(error) from error
 
@@ -64,5 +89,13 @@ def fixture_analytics(
     window = _validated_window(window)
     try:
         return service.fixture_analytics(fixture_id=fixture_id, window=window)
+    except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
+
+
+@router.get("/fixtures/{fixture_id}/statistics", response_model=FixtureStatisticsResponse)
+def fixture_statistics(fixture_id: int, service: Service) -> FixtureStatisticsResponse:
+    try:
+        return service.fixture_statistics(fixture_id=fixture_id)
     except (WebNotFoundError, WebValidationError) as error:
         raise _error(error) from error

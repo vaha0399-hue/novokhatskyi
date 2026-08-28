@@ -17,6 +17,27 @@ historical response caching without changing the payload shape.
 
 ## Endpoints
 
+### `GET /web/v1/leagues`
+
+Returns active canonical competitions, ordered deterministically by country,
+name, and internal ID. Each DTO includes only presentation-safe canonical
+metadata (`id`, `name`, `country_name`, `logo_url`, `competition_type`). It
+does not expose provider IDs or provider provenance.
+
+### `GET /web/v1/leagues/{league_id}/seasons`
+
+Returns a league and its canonical seasons in descending `start_year, id`
+order. This is the navigation contract for a multi-league, multi-season UI;
+the frontend must not hard-code EPL or a particular year.
+
+### `GET /web/v1/seasons/{season_id}/standings`
+
+Returns the latest retained normalized standings snapshot for a season. The
+response includes `captured_at`, all provider grouping rows, and the canonical
+team, rank, points, W/D/L, goals, and form fields. It returns 422
+`season_standings_not_available` when the known season has no standings
+snapshot; it does not fabricate a table from fixture rows.
+
 ### `GET /web/v1/seasons/{season_id}/fixtures`
 
 Query parameters:
@@ -86,6 +107,22 @@ The target fixture itself, a fixture at the same kickoff, and a later fixture
 are excluded: all history obeys `historical.kickoff_at < target.kickoff_at`.
 This endpoint returns analytics, never a win probability or prediction.
 
+### `GET /web/v1/fixtures/{fixture_id}/statistics`
+
+Returns the completed fixture metadata plus typed, canonical final
+team-statistics for its home and away participants. It exposes the reviewed
+metric set only:
+
+- shots, shots on goal/off goal/blocked/inside/outside box;
+- fouls, corners, offsides, cards, saves, and passes;
+- possession and pass accuracy percentages;
+- xG and goals prevented.
+
+A side with no normalized statistics row returns `metrics: null`. A nullable
+metric within an existing row remains JSON `null`, not `0` or an empty string.
+`extra_metrics`, raw payloads, provider fetches, SHA-256 values, and provider
+IDs remain internal provenance rather than browser DTO fields.
+
 ```text
 GET /web/v1/fixtures/103/analytics?window=5
 ```
@@ -95,9 +132,11 @@ GET /web/v1/fixtures/103/analytics?window=5
 | Condition | Status | `detail.code` |
 | --- | --- | --- |
 | Unknown season | 404 | `season_not_found` |
+| Unknown league | 404 | `league_not_found` |
 | Unknown team or team absent from requested season | 404 | `team_not_found_in_season` |
 | Unknown fixture | 404 | `fixture_not_found` |
 | Team has no completed fixture in selected season | 422 | `team_has_no_completed_fixture_in_season` |
+| Known season without a standings snapshot | 422 | `season_standings_not_available` |
 | Unsupported `scope`, `window`, invalid pagination/query type | 422 | FastAPI validation detail, or `invalid_window` |
 
 The selected URLs intentionally contain no `fixture_id + season_id` pair, so a
@@ -110,5 +149,6 @@ not enrolled in the requested season.
 All identifiers are internal IDs. The contract is season-scoped and has no EPL
 or year-specific constant, so additional leagues and seasons are data additions.
 Future scanner endpoints can reuse the same DTO families and read-only service
-boundary. Players, lineups, odds, authentication, premium gating, frontend,
-and caching infrastructure are separate stages.
+boundary. The Next.js UI is a thin server-side consumer of this contract;
+players, lineups, odds, backend JWT gating, premium access, and caching-policy
+expansion remain separate stages.
