@@ -1,0 +1,27 @@
+{
+  "endpoint": "/players/topcards",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T04:25:22.232110Z",
+  "response_received_at": "2026-08-29T04:25:22.302904Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "295",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7491"
+  },
+  "content_sha256": "7415a13b6e21be79fbb202254767b06153be2035790e86df2f179d3d3dd52402",
+  "byte_count": 202,
+  "results": 0,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": {
+    "endpoint": "The Players/topcards endpoint does not exist."
+  },
+  "curl_exit_code": 0
+}

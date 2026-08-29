@@ -1,0 +1,26 @@
+{
+  "endpoint": "/teams/statistics",
+  "parameters": {
+    "league": 39,
+    "season": 2026,
+    "team": 42
+  },
+  "request_started_at": "2026-08-29T04:25:22.409059Z",
+  "response_received_at": "2026-08-29T04:25:22.483112Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "293",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7489"
+  },
+  "content_sha256": "28fd17684471e8ae486127bb91a15246a6aae444a3e7d412325d503be71881fe",
+  "byte_count": 2941,
+  "results": 11,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

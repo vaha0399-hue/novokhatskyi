@@ -1,0 +1,24 @@
+{
+  "endpoint": "/fixtures/players",
+  "parameters": {
+    "fixture": 1557367
+  },
+  "request_started_at": "2026-08-29T04:25:22.732785Z",
+  "response_received_at": "2026-08-29T04:25:22.809573Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "289",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7485"
+  },
+  "content_sha256": "2bd0cea4e0503c64cb2b4ab1214865a4c8347191c9d82d98b36bc51611b9d9c9",
+  "byte_count": 26217,
+  "results": 2,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

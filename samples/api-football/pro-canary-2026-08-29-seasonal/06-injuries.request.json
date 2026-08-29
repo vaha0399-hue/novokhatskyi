@@ -1,0 +1,25 @@
+{
+  "endpoint": "/injuries",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T04:25:22.303354Z",
+  "response_received_at": "2026-08-29T04:25:22.406247Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "294",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7490"
+  },
+  "content_sha256": "8468c933d34c46f85207d7d6d10262ba45d6ccf5bf22ab4ca4401a7866b2dd70",
+  "byte_count": 171513,
+  "results": 304,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

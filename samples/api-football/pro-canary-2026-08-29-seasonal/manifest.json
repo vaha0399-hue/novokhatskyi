@@ -1,0 +1,365 @@
+{
+  "campaign": "api-football-pro-seasonal-contract-canary-2026-08-29",
+  "physical_api_calls_this_campaign": 13,
+  "secrets_included": false,
+  "calls": [
+    {
+      "sequence": 1,
+      "name": "01-players-page-1",
+      "endpoint": "/players",
+      "parameters": {
+        "league": 39,
+        "season": 2026,
+        "page": 1
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 1,
+        "total": 20
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "299",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7495"
+      },
+      "content_sha256": "89bfb93e1131a3dca056126f4bbd1baeb6fdd89e32cd6c02a60efb87f82ace39",
+      "byte_count": 24545,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "01-players-page-1.raw.json",
+      "request_file": "01-players-page-1.request.json"
+    },
+    {
+      "sequence": 2,
+      "name": "02-players-page-2",
+      "endpoint": "/players",
+      "parameters": {
+        "league": 39,
+        "season": 2026,
+        "page": 2
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 2,
+        "total": 20
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "298",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7494"
+      },
+      "content_sha256": "d44a344897c67107f15c92357b01bdb3f54e79c3c6422e181c2edd4eac5a055b",
+      "byte_count": 24470,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "02-players-page-2.raw.json",
+      "request_file": "02-players-page-2.request.json"
+    },
+    {
+      "sequence": 3,
+      "name": "03-topscorers",
+      "endpoint": "/players/topscorers",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "297",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7493"
+      },
+      "content_sha256": "a8bc0588203c651914010590243d820e599133f9b89bab191128dd60fab59b9e",
+      "byte_count": 24292,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "03-topscorers.raw.json",
+      "request_file": "03-topscorers.request.json"
+    },
+    {
+      "sequence": 4,
+      "name": "04-topassists",
+      "endpoint": "/players/topassists",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "296",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7492"
+      },
+      "content_sha256": "91524904eb2f11ea6757b19d6df88c50c29963d1daba5b42bcac4bc6e7228ff8",
+      "byte_count": 24384,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "04-topassists.raw.json",
+      "request_file": "04-topassists.request.json"
+    },
+    {
+      "sequence": 5,
+      "name": "05-topcards",
+      "endpoint": "/players/topcards",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 0,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "295",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7491"
+      },
+      "content_sha256": "7415a13b6e21be79fbb202254767b06153be2035790e86df2f179d3d3dd52402",
+      "byte_count": 202,
+      "provider_errors": {
+        "endpoint": "The Players/topcards endpoint does not exist."
+      },
+      "curl_exit_code": 0,
+      "raw_file": "05-topcards.raw.json",
+      "request_file": "05-topcards.request.json"
+    },
+    {
+      "sequence": 6,
+      "name": "06-injuries",
+      "endpoint": "/injuries",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 304,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "294",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7490"
+      },
+      "content_sha256": "8468c933d34c46f85207d7d6d10262ba45d6ccf5bf22ab4ca4401a7866b2dd70",
+      "byte_count": 171513,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "06-injuries.raw.json",
+      "request_file": "06-injuries.request.json"
+    },
+    {
+      "sequence": 7,
+      "name": "07-team-statistics-42",
+      "endpoint": "/teams/statistics",
+      "parameters": {
+        "league": 39,
+        "season": 2026,
+        "team": 42
+      },
+      "http_status": 200,
+      "results": 11,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "293",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7489"
+      },
+      "content_sha256": "28fd17684471e8ae486127bb91a15246a6aae444a3e7d412325d503be71881fe",
+      "byte_count": 2941,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "07-team-statistics-42.raw.json",
+      "request_file": "07-team-statistics-42.request.json"
+    },
+    {
+      "sequence": 8,
+      "name": "08-fixture-events-1557367",
+      "endpoint": "/fixtures/events",
+      "parameters": {
+        "fixture": 1557367
+      },
+      "http_status": 200,
+      "results": 14,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "292",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7488"
+      },
+      "content_sha256": "ca3f8d82e3edc1f37be25cfc983c6bd5dea86949780a68ddc0aba443d95c07bd",
+      "byte_count": 3989,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "08-fixture-events-1557367.raw.json",
+      "request_file": "08-fixture-events-1557367.request.json"
+    },
+    {
+      "sequence": 9,
+      "name": "09-fixture-lineups-1557367",
+      "endpoint": "/fixtures/lineups",
+      "parameters": {
+        "fixture": 1557367
+      },
+      "http_status": 200,
+      "results": 2,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "291",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7487"
+      },
+      "content_sha256": "0429d6ba690fd78ef2f5c9b83476ad63f400f9682c06981513ec222c0fc36a9c",
+      "byte_count": 4093,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "09-fixture-lineups-1557367.raw.json",
+      "request_file": "09-fixture-lineups-1557367.request.json"
+    },
+    {
+      "sequence": 10,
+      "name": "10-fixture-statistics-1557367",
+      "endpoint": "/fixtures/statistics",
+      "parameters": {
+        "fixture": 1557367
+      },
+      "http_status": 200,
+      "results": 2,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "290",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7486"
+      },
+      "content_sha256": "1432a3d5e5a21086bad30fe9dbba797e9c4ca72a2341032ee00b72ae8349b83f",
+      "byte_count": 1489,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "10-fixture-statistics-1557367.raw.json",
+      "request_file": "10-fixture-statistics-1557367.request.json"
+    },
+    {
+      "sequence": 11,
+      "name": "11-fixture-players-1557367",
+      "endpoint": "/fixtures/players",
+      "parameters": {
+        "fixture": 1557367
+      },
+      "http_status": 200,
+      "results": 2,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "289",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7485"
+      },
+      "content_sha256": "2bd0cea4e0503c64cb2b4ab1214865a4c8347191c9d82d98b36bc51611b9d9c9",
+      "byte_count": 26217,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "11-fixture-players-1557367.raw.json",
+      "request_file": "11-fixture-players-1557367.request.json"
+    },
+    {
+      "sequence": 12,
+      "name": "12-transfers-team-42",
+      "endpoint": "/transfers",
+      "parameters": {
+        "team": 42
+      },
+      "http_status": 200,
+      "results": 302,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "288",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7484"
+      },
+      "content_sha256": "e136747714a8658dee5eeca9a19c94e3072df151f7d09e486db0710778a5b533",
+      "byte_count": 234863,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "12-transfers-team-42.raw.json",
+      "request_file": "12-transfers-team-42.request.json"
+    },
+    {
+      "sequence": 13,
+      "name": "13-predictions-1557383",
+      "endpoint": "/predictions",
+      "parameters": {
+        "fixture": 1557383
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "287",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7483"
+      },
+      "content_sha256": "8dd7c7c46f1e3704c62ccec7eaa77adce732da3876dea5e132eb39fc9031fa7a",
+      "byte_count": 15183,
+      "provider_errors": [],
+      "curl_exit_code": 0,
+      "raw_file": "13-predictions-1557383.raw.json",
+      "request_file": "13-predictions-1557383.request.json"
+    }
+  ],
+  "summary": {
+    "http_status_counts": {
+      "200": 13
+    },
+    "provider_error_calls": [
+      "05-topcards"
+    ]
+  }
+}
