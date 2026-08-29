@@ -1,0 +1,26 @@
+{
+  "endpoint": "/players",
+  "parameters": {
+    "league": 39,
+    "season": 2026,
+    "page": 1
+  },
+  "request_started_at": "2026-08-29T04:25:21.795172Z",
+  "response_received_at": "2026-08-29T04:25:21.874697Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "299",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7495"
+  },
+  "content_sha256": "89bfb93e1131a3dca056126f4bbd1baeb6fdd89e32cd6c02a60efb87f82ace39",
+  "byte_count": 24545,
+  "results": 20,
+  "paging": {
+    "current": 1,
+    "total": 20
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

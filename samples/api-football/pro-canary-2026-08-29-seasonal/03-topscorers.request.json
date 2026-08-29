@@ -1,0 +1,25 @@
+{
+  "endpoint": "/players/topscorers",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T04:25:22.026892Z",
+  "response_received_at": "2026-08-29T04:25:22.109538Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "297",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7493"
+  },
+  "content_sha256": "a8bc0588203c651914010590243d820e599133f9b89bab191128dd60fab59b9e",
+  "byte_count": 24292,
+  "results": 20,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

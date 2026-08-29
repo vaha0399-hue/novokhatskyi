@@ -1,0 +1,24 @@
+{
+  "endpoint": "/transfers",
+  "parameters": {
+    "team": 42
+  },
+  "request_started_at": "2026-08-29T04:25:22.810235Z",
+  "response_received_at": "2026-08-29T04:25:22.920810Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "288",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7484"
+  },
+  "content_sha256": "e136747714a8658dee5eeca9a19c94e3072df151f7d09e486db0710778a5b533",
+  "byte_count": 234863,
+  "results": 302,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

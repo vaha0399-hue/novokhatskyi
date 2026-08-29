@@ -1,0 +1,25 @@
+{
+  "endpoint": "/players/topassists",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T04:25:22.110149Z",
+  "response_received_at": "2026-08-29T04:25:22.231465Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "296",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7492"
+  },
+  "content_sha256": "91524904eb2f11ea6757b19d6df88c50c29963d1daba5b42bcac4bc6e7228ff8",
+  "byte_count": 24384,
+  "results": 20,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

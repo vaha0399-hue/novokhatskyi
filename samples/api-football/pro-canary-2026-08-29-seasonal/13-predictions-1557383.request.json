@@ -1,0 +1,24 @@
+{
+  "endpoint": "/predictions",
+  "parameters": {
+    "fixture": 1557383
+  },
+  "request_started_at": "2026-08-29T04:25:22.923428Z",
+  "response_received_at": "2026-08-29T04:25:22.995736Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "287",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7483"
+  },
+  "content_sha256": "8dd7c7c46f1e3704c62ccec7eaa77adce732da3876dea5e132eb39fc9031fa7a",
+  "byte_count": 15183,
+  "results": 1,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}

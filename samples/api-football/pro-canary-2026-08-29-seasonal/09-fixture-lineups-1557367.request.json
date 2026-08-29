@@ -1,0 +1,24 @@
+{
+  "endpoint": "/fixtures/lineups",
+  "parameters": {
+    "fixture": 1557367
+  },
+  "request_started_at": "2026-08-29T04:25:22.566603Z",
+  "response_received_at": "2026-08-29T04:25:22.646748Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "291",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7487"
+  },
+  "content_sha256": "0429d6ba690fd78ef2f5c9b83476ad63f400f9682c06981513ec222c0fc36a9c",
+  "byte_count": 4093,
+  "results": 2,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "provider_errors": [],
+  "curl_exit_code": 0
+}
