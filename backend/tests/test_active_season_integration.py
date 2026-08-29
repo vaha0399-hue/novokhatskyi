@@ -9,6 +9,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
+import app.importer.active_season as active_season
 from app.api_football import APIFootballResponse
 from app.importer.active_season import (
     ActiveSeasonScope,
@@ -55,14 +56,25 @@ def _collected(received_at: datetime) -> tuple[CollectedBaseResponse, ...]:
     )
 
 
-def test_real_epl_2026_active_base_is_idempotent() -> None:
+def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replay retained provider bytes only; never call API-Football or Supabase."""
     assert TEST_DB_URL is not None
     first_received_at = datetime.now(UTC)
+    initial_bulk_calls: list[int] = []
+    original_bulk_insert = active_season._bulk_insert_initial_fixtures
+
+    def observe_initial_bulk_insert(*args: object, **kwargs: object) -> dict[int, int]:
+        records = kwargs["records"]
+        assert isinstance(records, tuple)
+        initial_bulk_calls.append(len(records))
+        return original_bulk_insert(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(active_season, "_bulk_insert_initial_fixtures", observe_initial_bulk_insert)
     with psycopg.connect(TEST_DB_URL) as conn:
         first = import_active_base(conn, collected=_collected(first_received_at), scope=SCOPE)
         report = verify_active_season(conn, scope=SCOPE)
 
+        assert initial_bulk_calls == [380]
         assert first.season_id == report.season_id
         assert (report.team_count, report.fixture_count, report.fixture_mapping_count) == (20, 380, 380)
         assert report.standing_row_count == 20
@@ -79,6 +91,32 @@ def test_real_epl_2026_active_base_is_idempotent() -> None:
                GROUP BY status.status_code ORDER BY status.status_code""",
             (first.season_id,),
         ).fetchall() == [("FT", 11), ("NS", 369)]
+        assert conn.execute(
+            """SELECT count(*)
+               FROM source.fixture_provider_refs ref
+               JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+               WHERE ref.provider_id=(SELECT id FROM source.providers WHERE code='api-football')
+                 AND fixture.season_id=%s""",
+            (first.season_id,),
+        ).fetchone()[0] == 380
+        assert conn.execute(
+            """SELECT count(*)
+               FROM source.fixture_provider_status status
+               JOIN football.fixtures fixture ON fixture.id=status.fixture_id
+               WHERE status.provider_id=(SELECT id FROM source.providers WHERE code='api-football')
+                 AND fixture.season_id=%s""",
+            (first.season_id,),
+        ).fetchone()[0] == 380
+        assert conn.execute(
+            """SELECT count(*)
+               FROM football.fixtures fixture
+               JOIN source.venue_provider_refs venue_ref
+                 ON venue_ref.venue_id=fixture.venue_id
+                AND venue_ref.provider_id=(SELECT id FROM source.providers WHERE code='api-football')
+               WHERE fixture.season_id=%s
+                 AND venue_ref.last_seen_at >= %s""",
+            (first.season_id, first_received_at),
+        ).fetchone()[0] == 380
 
         second = import_active_base(
             conn,

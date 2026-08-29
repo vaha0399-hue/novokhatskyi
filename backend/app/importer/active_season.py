@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from psycopg import Connection
+from psycopg.types.json import Jsonb
 
 from app.api_football import APIFootballResponse
 from app.importer.canary import _normalize_standings, parse_datetime
@@ -366,6 +367,138 @@ def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: 
     return fixture_id
 
 
+def _initial_fixture_venue_ids(
+    conn: Connection[Any], *, context: SeasonContext, records: Sequence[ActiveFixtureRecord], seen_at: datetime
+) -> dict[int, int | None] | None:
+    """Return fixture-venue mappings when a new season can be inserted in bulk.
+
+    Team normalization normally creates the same provider venue mappings used by
+    fixtures.  A missing mapping means this is an unusual provider response, so
+    the caller deliberately falls back to the conservative per-fixture path.
+    """
+    external_ids = sorted({str(record.venue_external_id) for record in records if record.venue_external_id is not None})
+    if not external_ids:
+        return {record.external_id: None for record in records}
+    rows = conn.execute(
+        """SELECT external_id, venue_id FROM source.venue_provider_refs
+           WHERE provider_id=%s AND external_id=ANY(%s)""",
+        (context.provider_id, external_ids),
+    ).fetchall()
+    mapped = {str(external_id): int(venue_id) for external_id, venue_id in rows}
+    if set(mapped) != set(external_ids):
+        return None
+    conn.execute(
+        """UPDATE source.venue_provider_refs
+           SET last_seen_at=greatest(last_seen_at,%s)
+           WHERE provider_id=%s AND external_id=ANY(%s)""",
+        (seen_at, context.provider_id, external_ids),
+    )
+    return {
+        record.external_id: None if record.venue_external_id is None else mapped[str(record.venue_external_id)]
+        for record in records
+    }
+
+
+def _bulk_insert_initial_fixtures(
+    conn: Connection[Any], *, context: SeasonContext, fetch: StoredFetch,
+    records: Sequence[ActiveFixtureRecord], venue_ids: Mapping[int, int | None],
+) -> dict[int, int]:
+    """Insert an entirely new season's fixtures with set-based writes.
+
+    This path is intentionally available only after the caller proves that the
+    season has neither canonical fixtures nor provider fixture mappings.  That
+    keeps all refresh/finalization checks in :func:`_normalize_fixture`.
+    """
+    rows = [
+        {
+            "external_id": str(record.external_id),
+            "home_team_id": context.team_ids[record.home_external_id],
+            "away_team_id": context.team_ids[record.away_external_id],
+            "venue_id": venue_ids[record.external_id],
+            "round_label": record.round_label,
+            "kickoff_at": record.kickoff_at.isoformat(),
+            "source_timezone": record.source_timezone,
+            "referee_name": record.referee_name,
+            "lifecycle_state": "completed" if record.status_code == "FT" else "scheduled",
+            "home_goals": record.home_goals,
+            "away_goals": record.away_goals,
+            "home_halftime_goals": record.home_halftime_goals,
+            "away_halftime_goals": record.away_halftime_goals,
+            "home_fulltime_goals": record.home_fulltime_goals,
+            "away_fulltime_goals": record.away_fulltime_goals,
+            "home_extratime_goals": record.home_extratime_goals,
+            "away_extratime_goals": record.away_extratime_goals,
+            "home_penalty_goals": record.home_penalty_goals,
+            "away_penalty_goals": record.away_penalty_goals,
+            "terminal_status_observed_at": fetch.response_received_at.isoformat() if record.status_code == "FT" else None,
+        }
+        for record in records
+    ]
+    cursor = conn.execute(
+        """WITH input AS (
+                SELECT * FROM jsonb_to_recordset(%s::jsonb) AS item(
+                    external_id text, home_team_id bigint, away_team_id bigint, venue_id bigint,
+                    round_label text, kickoff_at timestamptz, source_timezone text, referee_name text,
+                    lifecycle_state text, home_goals smallint, away_goals smallint,
+                    home_halftime_goals smallint, away_halftime_goals smallint,
+                    home_fulltime_goals smallint, away_fulltime_goals smallint,
+                    home_extratime_goals smallint, away_extratime_goals smallint,
+                    home_penalty_goals smallint, away_penalty_goals smallint,
+                    terminal_status_observed_at timestamptz
+                )
+            ), inserted AS (
+                INSERT INTO football.fixtures (
+                    season_id,home_team_id,away_team_id,venue_id,round_label,kickoff_at,source_timezone,
+                    referee_name,lifecycle_state,home_goals,away_goals,home_halftime_goals,
+                    away_halftime_goals,home_fulltime_goals,away_fulltime_goals,home_extratime_goals,
+                    away_extratime_goals,home_penalty_goals,away_penalty_goals,terminal_status_observed_at,
+                    result_available_at,availability_basis,first_seen_at,last_seen_at,last_source_fetch_id
+                )
+                SELECT %s,home_team_id,away_team_id,venue_id,round_label,kickoff_at,source_timezone,
+                    referee_name,lifecycle_state::football.fixture_lifecycle_state,home_goals,away_goals,
+                    home_halftime_goals,away_halftime_goals,home_fulltime_goals,away_fulltime_goals,
+                    home_extratime_goals,away_extratime_goals,home_penalty_goals,away_penalty_goals,
+                    terminal_status_observed_at,terminal_status_observed_at,'observed',%s,%s,%s
+                FROM input
+                RETURNING id,home_team_id,away_team_id,kickoff_at
+            )
+            INSERT INTO source.fixture_provider_refs(
+                provider_id,external_id,fixture_id,first_seen_at,last_seen_at
+            )
+            SELECT %s,input.external_id,inserted.id,%s,%s
+            FROM input JOIN inserted USING(home_team_id,away_team_id,kickoff_at)""",
+        (
+            Jsonb(rows), context.season_id, fetch.response_received_at, fetch.response_received_at,
+            fetch.fetch_id, context.provider_id, fetch.response_received_at, fetch.response_received_at,
+        ),
+    )
+    if cursor.rowcount != len(records):
+        raise ActiveSeasonImportError("bulk fixture insert did not create every provider mapping")
+    status_rows = [{"external_id": str(record.external_id), "status_code": record.status_code} for record in records]
+    cursor = conn.execute(
+        """WITH input AS (
+                SELECT * FROM jsonb_to_recordset(%s::jsonb) AS item(external_id text,status_code text)
+            )
+            INSERT INTO source.fixture_provider_status(
+                provider_id,fixture_id,status_code,observed_at,source_fetch_id
+            )
+            SELECT %s,ref.fixture_id,input.status_code,%s,%s
+            FROM input JOIN source.fixture_provider_refs ref
+              ON ref.provider_id=%s AND ref.external_id=input.external_id""",
+        (Jsonb(status_rows), context.provider_id, fetch.response_received_at, fetch.fetch_id, context.provider_id),
+    )
+    if cursor.rowcount != len(records):
+        raise ActiveSeasonImportError("bulk fixture status insert did not create every provider status")
+    mappings = conn.execute(
+        """SELECT external_id,fixture_id FROM source.fixture_provider_refs
+           WHERE provider_id=%s AND external_id=ANY(%s)""",
+        (context.provider_id, [str(record.external_id) for record in records]),
+    ).fetchall()
+    if len(mappings) != len(records):
+        raise ActiveSeasonImportError("bulk fixture mapping lookup is incomplete")
+    return {int(external_id): int(fixture_id) for external_id, fixture_id in mappings}
+
+
 def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBaseResponse], scope: ActiveSeasonScope) -> SeasonContext:
     """Atomically create or refresh canonical scheduled/finished season data."""
     validated = validate_base_responses(collected, scope=scope)
@@ -386,9 +519,40 @@ def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBa
         context = SeasonContext(provider_id, league_id, season_id, team_ids, scope.season_scope)
         fixture_item = by_endpoint["/fixtures"]
         fetch = StoredFetch(fetch_ids["/fixtures"], fixture_item.response, fixture_item.request_started_at, fixture_item.response_received_at, None, False)
-        fixture_ids = {record.external_id: _normalize_fixture(conn, context=context, fetch=fetch, record=record) for record in validated.fixtures}
-        for status in validated.statuses:
-            conn.execute("""INSERT INTO source.fixture_provider_status(provider_id,fixture_id,status_code,observed_at,source_fetch_id) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(provider_id,fixture_id) DO UPDATE SET status_code=excluded.status_code,observed_at=excluded.observed_at,source_fetch_id=excluded.source_fetch_id WHERE source.fixture_provider_status.observed_at < excluded.observed_at""", (provider_id, fixture_ids[status.external_fixture_id], status.status_code, fixture.response_received_at, fetch.fetch_id))
+        existing = conn.execute(
+            """SELECT
+                    EXISTS(SELECT 1 FROM football.fixtures WHERE season_id=%s),
+                    EXISTS(
+                        SELECT 1 FROM source.fixture_provider_refs ref
+                        JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                        WHERE ref.provider_id=%s AND fixture.season_id=%s
+                    )""",
+            (season_id, provider_id, season_id),
+        ).fetchone()
+        assert existing is not None
+        venue_ids = None if any(existing) else _initial_fixture_venue_ids(
+            conn, context=context, records=validated.fixtures, seen_at=fixture_item.response_received_at
+        )
+        if venue_ids is not None:
+            _bulk_insert_initial_fixtures(
+                conn, context=context, fetch=fetch, records=validated.fixtures, venue_ids=venue_ids
+            )
+        else:
+            fixture_ids = {
+                record.external_id: _normalize_fixture(conn, context=context, fetch=fetch, record=record)
+                for record in validated.fixtures
+            }
+            for status in validated.statuses:
+                conn.execute(
+                    """INSERT INTO source.fixture_provider_status(provider_id,fixture_id,status_code,observed_at,source_fetch_id)
+                       VALUES(%s,%s,%s,%s,%s)
+                       ON CONFLICT(provider_id,fixture_id) DO UPDATE
+                       SET status_code=excluded.status_code,observed_at=excluded.observed_at,
+                           source_fetch_id=excluded.source_fetch_id
+                       WHERE source.fixture_provider_status.observed_at < excluded.observed_at""",
+                    (provider_id, fixture_ids[status.external_fixture_id], status.status_code,
+                     fetch.response_received_at, fetch.fetch_id),
+                )
         _normalize_standings(conn, provider_id=provider_id, season_id=season_id, fetch_id=fetch_ids["/standings"], captured_at=by_endpoint["/standings"].response_received_at, payload=validated.standings_payload)
         conn.execute("UPDATE source.provider_fetches SET normalized_at=coalesce(normalized_at,clock_timestamp()) WHERE id=ANY(%s)", (list(fetch_ids.values()),))
         return context
