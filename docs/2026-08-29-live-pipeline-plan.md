@@ -75,6 +75,27 @@ Live statistics and T-60 predictions remain follow-on slices. SSE, WebSocket,
 Redis Pub/Sub/Streams, distributed coordination, and a large refactor are
 explicitly out of scope.
 
+## Execution checkpoint — paused at the live-domain boundary
+
+Recorded on 2026-08-29 because this execution was paused by the session
+limit. The canonical gate (implementation-order step 1) is complete:
+
+- The retained API-Football Premier League 2026/27 canary was replayed into
+  Supabase without a new provider request.
+- Independent verification returned 20 season teams, 380 fixtures, 380
+  API-Football-to-`football.fixtures.id` mappings, and 20 standings rows.
+  The schedule contains 369 future `scheduled` fixtures and 11 `completed`
+  fixtures.
+- The narrow active-season importer and its initial-load batch path are
+  committed in `2370ec1` and `7cfeac0`; existing historical import paths were
+  not broadened.
+
+**Resume at implementation-order step 2: live contracts.** Add
+`backend/app/live` normalisation and internal fixture-ID resolution first,
+then the reusable API client, Redis state, worker, REST endpoint, and minimal
+frontend in that order. Do not replay the completed season import or make a
+new API-Football call merely to resume this work.
+
 ## 1. Synchronise the canonical base
 
 1. Reconcile this repository's product documentation with the current Notion
