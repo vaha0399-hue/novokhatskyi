@@ -1,0 +1,18 @@
+{
+  "endpoint": "/standings",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T03:41:20.937944343Z",
+  "response_received_at": "2026-08-29T03:41:21.022895888Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "296",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7496"
+  },
+  "content_sha256": "00889cc620f0fb092314f6aed78a178cbeb4c4471f58550832c3ad7ac4003098",
+  "byte_count": 10087
+}
