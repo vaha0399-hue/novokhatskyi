@@ -226,11 +226,11 @@ bypass the backend.
 
 ## Acceptance checklist
 
-- [ ] Product, architecture, README, and API-Football overview no longer say
+- [x] Product, architecture, README, and API-Football overview no longer say
       that the approved scope excludes live or predictions.
-- [ ] Premier League `season=2026` has been verified in the canonical model:
+- [x] Premier League `season=2026` has been verified in the canonical model:
       20 teams, mappings, full fixtures, standings, and fixture-ID resolution.
-- [ ] `app/live` normalisation, ID resolution, and their tests exist.
+- [x] `app/live` normalisation, ID resolution, and their tests exist.
 - [ ] The async API-Football client reuses connections and the live interval is
       read from `LIVE_POLL_INTERVAL_SECONDS`.
 - [ ] A single central worker writes only current live state to the two Redis
