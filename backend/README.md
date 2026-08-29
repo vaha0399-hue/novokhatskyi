@@ -31,6 +31,22 @@ This invokes exactly seven research-only endpoint groups: fixtures, teams, stand
 statistics, fixture statistics, injuries, and lineups. The production target remains season
 2026; the research season is recorded in the sample manifest.
 
+### One-shot live contract sample
+
+The live collector makes exactly one `GET /fixtures?live=all` request, writes
+no database rows, and retains the unmodified response body with sanitised
+metadata and a compact summary. Use a new empty output directory for every
+collection:
+
+```bash
+uv run python -m scripts.collect_live_fixture_sample \
+  --output-dir ../samples/api-football/live-fixtures-YYYY-MM-DDTHHMMZ
+```
+
+This sample is for provider-contract research. The production worker will poll
+the configured competition scope (initially Premier League `live=39`) rather
+than the global `live=all` feed.
+
 ## Active-season canonical replay
 
 The active-season importer is separate from the completed-season backfill. It

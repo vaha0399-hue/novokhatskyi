@@ -1,0 +1,21 @@
+{
+  "endpoint": "/fixtures",
+  "parameters": {
+    "live": "all"
+  },
+  "fetched_at": "2026-08-29T06:48:24.810910+00:00",
+  "http_status": 200,
+  "results": 13,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "rate_limit": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "299",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7482"
+  },
+  "content_sha256": "2c3669debd37122637743f834ef2a2c4ebddfca33558728c5a729e3e98a1c142",
+  "byte_count": 22405
+}

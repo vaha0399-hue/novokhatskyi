@@ -1,0 +1,440 @@
+{
+  "response_fixture_count": 13,
+  "summarized_fixture_count": 13,
+  "status_counts": {
+    "1H": 2,
+    "2H": 10,
+    "HT": 1
+  },
+  "fixtures": [
+    {
+      "fixture_id": 1635234,
+      "home_team": "Cooma Tigers FC",
+      "away_team": "Canberra Juventus",
+      "status": {
+        "short": "1H",
+        "long": "First Half",
+        "elapsed": 35,
+        "extra": null
+      },
+      "goals": {
+        "home": 0,
+        "away": 2
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 2
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1635486,
+      "home_team": "Broadmeadow Magic",
+      "away_team": "Weston Bears",
+      "status": {
+        "short": "1H",
+        "long": "First Half",
+        "elapsed": 43,
+        "extra": null
+      },
+      "goals": {
+        "home": 0,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522010,
+      "home_team": "Avondale",
+      "away_team": "Hume City",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 90,
+        "extra": null
+      },
+      "goals": {
+        "home": 2,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522011,
+      "home_team": "Heidelberg United",
+      "away_team": "Bentleigh Greens",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 86,
+        "extra": null
+      },
+      "goals": {
+        "home": 2,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 2,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522012,
+      "home_team": "Oakleigh Cannons",
+      "away_team": "Dandenong City",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 90,
+        "extra": 2
+      },
+      "goals": {
+        "home": 2,
+        "away": 3
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 2
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522013,
+      "home_team": "Sunshine Georgies",
+      "away_team": "South Melbourne",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 90,
+        "extra": null
+      },
+      "goals": {
+        "home": 1,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522015,
+      "home_team": "St. Albans Saints",
+      "away_team": "Dandenong Thunder",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 90,
+        "extra": 1
+      },
+      "goals": {
+        "home": 5,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 4,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1522041,
+      "home_team": "Melbourne City II",
+      "away_team": "Green Gully",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 89,
+        "extra": null
+      },
+      "goals": {
+        "home": 1,
+        "away": 1
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1541377,
+      "home_team": "Moreland City",
+      "away_team": "Essendon Royals SC",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 88,
+        "extra": null
+      },
+      "goals": {
+        "home": 2,
+        "away": 2
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 1
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1541465,
+      "home_team": "Keilor Park",
+      "away_team": "Altona City",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 85,
+        "extra": null
+      },
+      "goals": {
+        "home": 2,
+        "away": 1
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 1
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1632451,
+      "home_team": "Adelaide Blue Eagles",
+      "away_team": "Adelaide Raiders",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 56,
+        "extra": null
+      },
+      "goals": {
+        "home": 0,
+        "away": 2
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 2
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1633979,
+      "home_team": "Playford City Patriots",
+      "away_team": "Adelaide City",
+      "status": {
+        "short": "2H",
+        "long": "Second Half",
+        "elapsed": 51,
+        "extra": null
+      },
+      "goals": {
+        "home": 1,
+        "away": 2
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 2
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture_id": 1529987,
+      "home_team": "Yenisey W",
+      "away_team": "Rostov W",
+      "status": {
+        "short": "HT",
+        "long": "Halftime",
+        "elapsed": 45,
+        "extra": null
+      },
+      "goals": {
+        "home": 1,
+        "away": 2
+      },
+      "score": {
+        "halftime": {
+          "home": 1,
+          "away": 2
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    }
+  ]
+}

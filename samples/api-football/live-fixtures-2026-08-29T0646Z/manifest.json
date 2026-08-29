@@ -1,0 +1,33 @@
+{
+  "campaign": "api-football-live-fixtures-contract-sample",
+  "purpose": "contract-research-only",
+  "physical_api_calls_this_campaign": 1,
+  "secrets_included": false,
+  "calls": [
+    {
+      "sequence": 1,
+      "name": "fixtures-live-all",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "live": "all"
+      },
+      "http_status": 200,
+      "results": 13,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "299",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7482"
+      },
+      "content_sha256": "2c3669debd37122637743f834ef2a2c4ebddfca33558728c5a729e3e98a1c142",
+      "byte_count": 22405,
+      "raw_file": "fixtures-live-all.raw.json",
+      "request_file": "fixtures-live-all.request.json",
+      "summary_file": "fixtures-live-all.summary.json"
+    }
+  ]
+}
