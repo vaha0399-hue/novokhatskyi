@@ -29,6 +29,52 @@ state, and FastAPI endpoint work together with automated coverage for status
 normalisation and internal-fixture resolution. A browser must never call
 API-Football directly.
 
+## Implementation order
+
+This is the minimal implementation sequence reviewed by the Architect on
+2026-08-29. It keeps the existing historical importer, analytics engine, and
+web read layer intact unless a narrow integration change is required.
+
+1. **Canonical gate — active Premier League season.** Before creating a worker
+   or Redis state, verify the live Supabase database. If 2026/27 is absent,
+   add a narrow active-season bootstrap for `league=39`, `season=2026`; do not
+   broaden the completed-season importer. It must establish 20 season teams,
+   the 380-fixture schedule (future and completed), current standings, and
+   complete API-Football fixture-ID mappings.
+2. **Live contracts.** Version the reviewed real provider samples, then add
+   `app/live` provider DTOs, normalised domain states, current score/time
+   selection, and PostgreSQL provider-fixture-ID resolution. Cover them with
+   deterministic tests before introducing a worker or Redis.
+3. **Client, configuration, and ephemeral store.** Refactor the existing
+   API-Football client to own one reusable `httpx.AsyncClient` connection pool.
+   Add `LIVE_POLL_INTERVAL_SECONDS=25`, a Redis connection setting, and a
+   generic competition scope. The first Redis store has only
+   `live:fixture:{fixture_id}` and `live:active_fixtures`.
+4. **One central worker.** Implement a testable `poll_once()` before the
+   25-second runtime loop. It polls only fixtures eligible from the canonical
+   schedule, normalises provider responses, resolves internal IDs, and writes
+   current state. It is the single live-state writer.
+5. **Terminal reconciliation.** Do not assume a provider live response always
+   includes `FT`. A fixture which disappears from the live feed after being
+   active must be reconciled against canonical/provider final status before it
+   is removed from Redis active state. No distributed locks or Pub/Sub are
+   needed for this single-worker slice.
+6. **REST contract.** Add a dedicated asynchronous live router and dependency;
+   do not couple Redis to the historical PostgreSQL `WebReadService`.
+   `GET /web/v1/live` reads Redis only and returns a stable `LiveFixtureDTO`.
+7. **Minimal frontend, in the same slice.** After the REST contract is tested,
+   add a small client component and a no-store backend read path. The browser
+   polls FastAPI approximately every 15 seconds and never API-Football. Reuse
+   the existing fixture/team presentation primitives rather than redesigning
+   the web application.
+8. **Verification and deployment.** Run unit, Redis integration, ASGI endpoint,
+   worker-cycle, frontend typecheck/test/build, and a real match-day smoke
+   check. Deploy exactly one worker process on the backend/VPS.
+
+Live statistics and T-60 predictions remain follow-on slices. SSE, WebSocket,
+Redis Pub/Sub/Streams, distributed coordination, and a large refactor are
+explicitly out of scope.
+
 ## 1. Synchronise the canonical base
 
 1. Reconcile this repository's product documentation with the current Notion
@@ -152,9 +198,10 @@ Schedule → T-60 worker → API-Football /predictions → Supabase → FastAPI
 
 ### Minimal UI
 
-Only after the backend checkpoint is stable, add the minimal Next.js live UI.
-It consumes `GET /web/v1/live`; it does not own polling of API-Football and
-does not bypass FastAPI.
+The minimal Next.js live UI completes this first vertical slice, but begins
+only after the Redis-backed REST contract is tested. It consumes
+`GET /web/v1/live` through FastAPI; it does not own polling of API-Football or
+bypass the backend.
 
 ## Acceptance checklist
 
@@ -168,5 +215,6 @@ does not bypass FastAPI.
 - [ ] A single central worker writes only current live state to the two Redis
       key families and removes finished fixtures from the active set.
 - [ ] `GET /web/v1/live` reads Redis and returns a stable `LiveFixtureDTO`.
+- [ ] A minimal Next.js client polls FastAPI only and displays live score/status.
 - [ ] Live statistics and T-60 predictions remain separately scheduled follow-on
       slices; neither expands this first checkpoint.
