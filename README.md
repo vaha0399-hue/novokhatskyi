@@ -2,21 +2,25 @@
 
 Football Analytics is a web-first football analytics platform. It provides
 historical match data, calculated statistical indicators, team comparisons,
-and analytical views through a responsive Next.js website. It does not produce
-match predictions or win probabilities.
+analytical views, and a planned backend-owned live match-state pipeline through
+a responsive Next.js website. Provider-derived predictions are a separate,
+post-live-slice T-60 workflow; they are not Redis live state and do not change
+after kickoff.
 
 ## Product canon
 
 The approved and current product boundary is recorded in
-[`docs/product-scope.md`](docs/product-scope.md). It supersedes older references
-to prediction functionality.
+[`docs/product-scope.md`](docs/product-scope.md), including the live-first,
+provider-prediction-later delivery order.
 
 ## Current phase
 
 Stage 1 established the tested project foundation. API-Football contract
 research, the reviewed development schema, completed historical imports, the
 Analytics Engine, and FastAPI Read API are complete for the currently loaded
-development seasons.
+development seasons. The approved plan for 2026-08-29 is the first Premier
+League 2026/27 live technical checkpoint: API-Football → central 25-second
+worker → live domain → Redis current state → `GET /web/v1/live`.
 
 The current repository contains:
 
@@ -28,6 +32,11 @@ The current repository contains:
 - a cutoff-safe Analytics Engine and stable FastAPI read DTOs;
 - a responsive Next.js App Router frontend with a Supabase Auth SSR foundation;
 - reviewed database migrations.
+
+The live worker, Redis state, and `/web/v1/live` endpoint are planned work,
+not a claim that the current checkout already runs a live service. The ordered
+implementation scope and acceptance checklist are in
+[`docs/2026-08-29-live-pipeline-plan.md`](docs/2026-08-29-live-pipeline-plan.md).
 
 The current frontend implementation and controlled next iterations are in
 [`docs/frontend-implementation-plan.md`](docs/frontend-implementation-plan.md).
@@ -74,5 +83,7 @@ The health endpoint is available at `GET http://127.0.0.1:8000/health`.
 - Never commit secrets or real credentials.
 - The browser frontend must never call API-Football directly.
 - User requests must not trigger API-Football requests.
+- `GET /web/v1/live` will read current state from Redis; API-Football polling
+  remains the responsibility of one backend worker.
 - Database changes must eventually be made only through reviewed files in
   `supabase/migrations/`.

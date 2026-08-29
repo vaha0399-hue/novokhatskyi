@@ -3,8 +3,9 @@
 > **Current evidence:** Pro-plan access to EPL seasons 2025 and 2026 was
 > verified on 2026-08-22. See
 > [the Pro contract canary](pro-canary-2025-2026.md). The current product canon
-> is an analytics platform without predictions or live ingestion; older scope
-> wording below is retained only as historical Stage 2 context.
+> schedules a backend-owned live pipeline first and a separate, later T-60
+> prediction workflow. This document remains historical Stage 2 contract
+> research; it is not evidence that either new pipeline is already deployed.
 
 ## Scope and season boundary
 
@@ -14,8 +15,9 @@ remains **season `2026`**. Season 2024 was used only because the configured free
 plan returned a plan error for 2026; the research samples must never be treated
 as current 2026 football data.
 
-No Supabase connection, schema, migration, importer, cron job, Feature Engine,
-Prediction Engine, or frontend integration was created.
+This historical research run did not create a Supabase connection, schema,
+migration, importer, cron job, Feature Engine, Prediction Engine, or frontend
+integration.
 
 ## Request accounting
 

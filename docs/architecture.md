@@ -3,17 +3,19 @@
 ## Canon
 
 The approved product scope is recorded in
-[`product-scope.md`](product-scope.md). It supersedes earlier references to a
-prediction product.
+[`product-scope.md`](product-scope.md). It defines the current live-first,
+provider-prediction-later delivery order.
 
-## MVP scope
+## Current scope
 
 Football Analytics is currently a web-only MVP. The user-facing application
 will be a responsive Next.js + TypeScript website supporting desktop and mobile
 browsers.
 
-The first supported competition will be the Premier League. Broader league
-support is not part of the initial MVP.
+The first supported competition is the Premier League. The immediate technical
+checkpoint is its 2026/27 season (`season=2026` for API-Football): canonical
+season data plus a backend-owned live score/status pipeline. Broader league
+support is not part of this checkpoint.
 
 ## Target data flow
 
@@ -28,6 +30,17 @@ API-Football
     -> User
 ```
 
+The live path is deliberately separate from historical import and analytics:
+
+```text
+API-Football
+    -> one central Live Worker (LIVE_POLL_INTERVAL_SECONDS=25)
+    -> app/live normaliser
+    -> Redis current live state
+    -> FastAPI GET /web/v1/live
+    -> Next.js website
+```
+
 This is a directional boundary, not a Stage 1 implementation specification.
 Concrete database tables and payload models must not be designed until real
 API-Football responses have been collected and analysed in a later stage.
@@ -38,25 +51,49 @@ API-Football responses have been collected and analysed in a later stage.
 2. API-Football is an upstream data source, not a browser-facing service.
 3. The frontend must never receive `API_FOOTBALL_KEY` or other server secrets.
 4. The frontend must never call API-Football directly.
-5. User requests must not trigger live API-Football requests.
+5. User requests must not trigger API-Football requests, including live ones.
 6. Football data must be synchronised to our database ahead of user requests.
 7. Database changes must be versioned as migrations in
    `supabase/migrations/` after source-data analysis.
 8. Imports must eventually be idempotent and must not create duplicates.
-9. Analytics must report factual and derived historical indicators without
-   producing outcome predictions or win probabilities.
+9. Analytics remains a historical, factual calculation layer. Provider
+   predictions are a later, separate T-60 pipeline from schedule to Supabase
+   to FastAPI; they are never Redis live state and do not change after kickoff.
 10. No mobile app, desktop app, browser extension, or standalone public API is
     being designed at the current stage.
 
+## Live domain boundary
+
+`backend/app/live/` owns provider-payload normalisation and provider fixture-ID
+resolution before current state is published. For the first slice it maps
+`1H`, `HT`, `2H`, and `FT` to stable internal states `first_half`,
+`half_time`, `second_half`, and `finished`.
+
+It obtains the current score only from `goals.home` and `goals.away`; it does
+not use `score.fulltime` as a live score. The displayed minute comes from
+`fixture.status.elapsed` and optional added time from `fixture.status.extra`.
+
+Only the central worker can write the two initial Redis key families:
+
+```text
+live:fixture:{fixture_id}
+live:active_fixtures
+```
+
+Redis is not canonical storage or a live-event archive. When a fixture reaches
+`FT`, the worker removes it from the active set and final-result reconciliation
+belongs in Supabase. `GET /web/v1/live` reads Redis only and returns a stable
+`LiveFixtureDTO`; neither FastAPI's read endpoint nor Next.js calls
+API-Football.
+
+Live fixture statistics are a subsequent, separately scheduled layer. It will
+query `/fixtures/statistics?fixture={provider_fixture_id}` only for selected
+active/hot fixtures, initially at `LIVE_STATS_INTERVAL_SECONDS=90`.
+
 ## Stage discipline
 
-The EPL 2024 historical fixture-statistics backfill is complete and provides
-380 fixtures with 760 team-level statistics rows. The immediate next step is a
-dedicated Git checkpoint for the associated code, tests, and documentation;
-Supabase-imported data itself is not committed.
-
-After that checkpoint, implement the Analytics Engine and its historical SQL
-validation layer before the FastAPI read contract. For a target fixture, every
-derived metric must use only fixtures with an earlier kickoff. Frontend and
-authentication integration begin only after those backend contracts are stable.
-The canonical detailed roadmap is in [`product-scope.md`](product-scope.md).
+The historical analytics and read contracts remain independent from the live
+slice. The next execution plan is
+[`2026-08-29-live-pipeline-plan.md`](2026-08-29-live-pipeline-plan.md); it
+requires narrow additive work and explicitly excludes a broad refactor of the
+existing analytics, importer, or web modules.

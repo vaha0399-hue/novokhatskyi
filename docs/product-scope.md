@@ -1,31 +1,28 @@
 # Product Scope Canon
 
 Status: **approved**
-Effective date: **2026-08-22**
+Effective date: **2026-08-29**
 
 This document is the canonical product scope for Football Analytics. If an
-older document describes the product as a prediction service, this document
-takes precedence.
+older document conflicts with the live or provider-prediction delivery order,
+this document takes precedence.
 
 ## Product direction
 
 Football Analytics is a **web football analytics platform**. It gives users
 historical match data, calculated statistical indicators, team comparisons,
-and analytical views. The user makes their own decisions from factual data.
+analytical views, and backend-synchronised live match state. The user makes
+their own decisions from factual data.
 
-Football Analytics is **not a prediction service**. The current product and
-roadmap exclude:
+The approved delivery order adds a narrowly scoped Premier League live
+pipeline first. Provider-derived fixture predictions are a separate, later
+T-60 workflow: they are stored in Supabase before kickoff, delivered through
+FastAPI, and never treated as current live state. Their presentation contract
+is defined with that separate workflow.
 
-- a Prediction Engine or ML prediction workflow;
-- HOME/DRAW/AWAY probabilities or win probability;
-- prediction API endpoints and prediction UI;
-- statements that a team will win;
-- live scores, live polling, live timelines, minute-by-minute events,
-  WebSocket/SSE ingestion, or calculations during a match.
-
-Existing inactive `ml` database structures are not part of the active product
-roadmap. They must not be used or extended. Removing them would require a
-separately reviewed and approved migration.
+Existing inactive `ml` database structures must not be assumed suitable for
+the later provider-prediction workflow. Reusing, extending, or removing them
+requires a separately reviewed and approved migration.
 
 ## Product boundary
 
@@ -54,6 +51,13 @@ API-Football
     -> FastAPI
     -> Next.js
     -> User
+
+API-Football
+    -> central Live Worker (every 25 seconds)
+    -> Live Domain / normalizer
+    -> Redis current live state
+    -> FastAPI `GET /web/v1/live`
+    -> Next.js
 ```
 
 Authentication flow:
@@ -81,8 +85,12 @@ Architecture invariants:
    in FastAPI and the Analytics Engine.
 5. FastAPI returns stable DTOs, not PostgreSQL rows copied one-to-one.
 6. Historical completed-match data is the foundation for analytics.
-7. There is no live pipeline. A completed fixture may receive a bounded final
-   reconciliation, but this is not live ingestion.
+7. Live data is collected only by one backend worker. The browser and its
+   requests never initiate an API-Football call.
+8. Redis holds only current live state. Supabase remains authoritative for
+   canonical fixtures and final results.
+9. Provider predictions are a separate pre-kickoff Supabase workflow, not
+   Redis live state, and are immutable after kickoff.
 
 ## FastAPI web read contract
 
@@ -98,6 +106,7 @@ GET /web/v1/seasons/{season_id}/fixtures
 GET /web/v1/fixtures/{fixture_id}
 GET /web/v1/fixtures/{fixture_id}/statistics
 GET /web/v1/fixtures/{fixture_id}/analytics
+GET /web/v1/live
 
 GET /web/v1/teams/{team_id}
 GET /web/v1/teams/{team_id}/fixtures
@@ -106,9 +115,11 @@ GET /web/v1/teams/{team_id}/analytics
 GET /web/v1/me
 ```
 
-There is no prediction endpoint. IDs in this contract identify internal
-domain entities unless the DTO explicitly states otherwise. No route may
-hardcode Premier League or season 2024.
+`GET /web/v1/live` returns Redis-backed current state as a stable
+`LiveFixtureDTO`; it must not call API-Football. IDs in this contract identify
+internal domain entities unless the DTO explicitly states otherwise. No route
+may hardcode Premier League or season 2024. A prediction read contract follows
+only after the separate T-60 prediction workflow is implemented.
 
 ## Analytics Engine scope
 
@@ -178,7 +189,10 @@ The fixture page shows fixture metadata, final score for completed matches,
 table positions, factual match statistics, team form, home/away splits,
 xG/xGA, attacking and defensive metrics, and later H2H. A future fixture may
 show pre-match analytics calculated only from information available before
-kickoff. It never shows live data or predictions.
+kickoff. The first live UI is deliberately deferred until the backend live
+slice is stable; it will read FastAPI's Redis-backed live DTO. Provider-derived
+predictions, when the later T-60 workflow exists, remain separate from that
+live state.
 
 The team page shows a selected season, match history, overall/home/away and
 Last N views, aggregate metrics, and trends. The frontend consumes aggregates
@@ -217,43 +231,22 @@ future stage.
 
 ## Approved development order
 
-### Checkpoint
+The current technical checkpoint and its acceptance criteria are in
+[`2026-08-29-live-pipeline-plan.md`](2026-08-29-live-pipeline-plan.md).
 
-1. Check `git status` and create a dedicated Git checkpoint for any code,
-   documentation, and tests produced during the backfill work.
-2. Confirm Stage 3D is present in `origin/develop` and that no secret or local
-   environment file is staged. Supabase-imported data itself is not committed.
+1. Verify and bootstrap Premier League 2026/27 in the existing canonical
+   model: 20 teams and their provider mappings, full fixture schedule,
+   standings, and provider-to-internal fixture-ID resolution.
+2. Deliver the backend-only live score/status slice: a reusable async provider
+   client, central 25-second worker, `app/live` normaliser, Redis current
+   state, and `GET /web/v1/live`.
+3. Add live fixture-statistics polling only after score/status is reliable;
+   it uses a separate, configurable cadence and active/hot fixtures only.
+4. Add the separate T-60 prediction workflow after the first live slice. It
+   persists provider predictions in Supabase, never Redis, and does not mutate
+   them after kickoff.
+5. Add a minimal Next.js live UI after the backend checkpoint. It consumes
+   FastAPI and never calls API-Football.
 
-### Analytics foundation before UI
-
-3. Implement **Analytics Engine v1** from canonical PostgreSQL data only:
-   - Last 5 / 10 / 15 / 20;
-   - overall, home-only, and away-only splits;
-   - W/D/L, PPG, goals scored/conceded, xG/xGA;
-   - shots, shots on target, possession, corners, and cards;
-   - clean sheets, failed to score, BTTS, over/under 0.5 / 1.5 / 2.5 / 3.5,
-     and streaks.
-4. Implement a historical SQL validation layer for every metric. For target
-   fixture **N**, its analytics input must include only fixtures whose
-   `kickoff_at` is strictly before fixture N's kickoff. This anti-leakage rule
-   applies to overall, home, away, Last N, streak, and rate calculations.
-5. Design and implement stable FastAPI read DTOs/contracts over the validated
-   Analytics Engine: team analytics, season fixtures, fixture analytics, and
-   later scanner endpoints.
-
-### Subsequent data stages and UI
-
-6. Add Players + Lineups + Formations in a separately reviewed additive data
-   stage, then add timestamped Odds snapshots in another stage.
-7. After those contracts are stable, import EPL 2025/26, then EPL 2026/27,
-   then the remaining Top-5 leagues.
-8. The stable Analytics Engine and FastAPI Read API are now available, so an
-   initial **visual Next.js frontend and Supabase Auth foundation are approved
-   now**. They must consume existing DTOs and may not dictate database,
-   importer, or analytical-calculation changes.
-9. Add backend JWT verification, account/free access policy, premium design,
-   and finally subscriptions/payments in later independent stages.
-
-The frontend began only after the Analytics Engine, its historical validation
-layer, and FastAPI read contracts became stable. The statistics importer must
-not be changed merely because of frontend requirements.
+No step above authorises a broad refactor of the existing analytics, importer,
+or web modules.
