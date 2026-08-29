@@ -1,0 +1,134 @@
+{
+  "campaign": "api-football-pro-contract-canary-2026-08-29",
+  "physical_api_calls_this_campaign": 4,
+  "secrets_included": false,
+  "calls": [
+    {
+      "sequence": 1,
+      "name": "leagues-epl-2026",
+      "endpoint": "/leagues",
+      "parameters": {
+        "id": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "299",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7499"
+      },
+      "content_sha256": "a6d4f762621a722e5171b96fdf6ddc3d25bec619c6e1dd7fffddaab699026297",
+      "byte_count": 681,
+      "raw_file": "01-leagues-epl-2026.raw.json",
+      "request_file": "01-leagues-epl-2026.request.json"
+    },
+    {
+      "sequence": 2,
+      "name": "teams-epl-2026",
+      "endpoint": "/teams",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 20,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "298",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7498"
+      },
+      "content_sha256": "bdb284ba0831e2b6e80574c8704f69947fd08240eab425641b4db1df5abfc313",
+      "byte_count": 7555,
+      "raw_file": "02-teams-epl-2026.raw.json",
+      "request_file": "02-teams-epl-2026.request.json"
+    },
+    {
+      "sequence": 3,
+      "name": "fixtures-epl-2026",
+      "endpoint": "/fixtures",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 380,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "297",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7497"
+      },
+      "content_sha256": "91053d98cb5f80d8a55212ea741aac61f502226786ab10653abce12b7d4e3c97",
+      "byte_count": 369463,
+      "raw_file": "03-fixtures-epl-2026.raw.json",
+      "request_file": "03-fixtures-epl-2026.request.json"
+    },
+    {
+      "sequence": 4,
+      "name": "standings-epl-2026",
+      "endpoint": "/standings",
+      "parameters": {
+        "league": 39,
+        "season": 2026
+      },
+      "http_status": 200,
+      "results": 1,
+      "paging": {
+        "current": 1,
+        "total": 1
+      },
+      "safe_rate_limit_headers": {
+        "x-ratelimit-limit": "300",
+        "x-ratelimit-remaining": "296",
+        "x-ratelimit-requests-limit": "7500",
+        "x-ratelimit-requests-remaining": "7496"
+      },
+      "content_sha256": "00889cc620f0fb092314f6aed78a178cbeb4c4471f58550832c3ad7ac4003098",
+      "byte_count": 10087,
+      "raw_file": "04-standings-epl-2026.raw.json",
+      "request_file": "04-standings-epl-2026.request.json"
+    }
+  ],
+  "standings_shape": {
+    "groups": 1,
+    "rows": 20,
+    "group_fields": [
+      "country",
+      "flag",
+      "id",
+      "logo",
+      "name",
+      "season",
+      "standings"
+    ],
+    "row_fields": [
+      "all",
+      "away",
+      "description",
+      "form",
+      "goalsDiff",
+      "group",
+      "home",
+      "points",
+      "rank",
+      "status",
+      "team",
+      "update"
+    ]
+  }
+}
