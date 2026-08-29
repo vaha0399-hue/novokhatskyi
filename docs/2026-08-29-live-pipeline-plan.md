@@ -75,10 +75,9 @@ Live statistics and T-60 predictions remain follow-on slices. SSE, WebSocket,
 Redis Pub/Sub/Streams, distributed coordination, and a large refactor are
 explicitly out of scope.
 
-## Execution checkpoint — paused at the live-domain boundary
+## Execution checkpoint — paused before Redis state
 
-Recorded on 2026-08-29 because this execution was paused by the session
-limit. The canonical gate (implementation-order step 1) is complete:
+Updated on 2026-08-29 because execution was paused for the night. Completed:
 
 - The retained API-Football Premier League 2026/27 canary was replayed into
   Supabase without a new provider request.
@@ -89,12 +88,25 @@ limit. The canonical gate (implementation-order step 1) is complete:
 - The narrow active-season importer and its initial-load batch path are
   committed in `2370ec1` and `7cfeac0`; existing historical import paths were
   not broadened.
+- The reviewed real `GET /fixtures?live=all` contract sample and collector are
+  committed in `8b21724`. It contains real `1H`, `HT`, and `2H` payloads but is
+  intentionally not treated as EPL canonical data.
+- `backend/app/live` now provides fail-closed `1H`/`HT`/`2H`/`FT`
+  normalisation, current score from `goals`, elapsed/added time, and strict
+  API-Football fixture/team/season resolution against canonical PostgreSQL.
+  The domain slice is committed in `be1f788` and its real read-only Supabase
+  resolution tests pass.
+- The API-Football client owns one reusable asynchronous HTTP connection pool
+  and exposes explicit async close/context-manager lifecycle.
 
-**Resume at implementation-order step 2: live contracts.** Add
-`backend/app/live` normalisation and internal fixture-ID resolution first,
-then the reusable API client, Redis state, worker, REST endpoint, and minimal
-frontend in that order. Do not replay the completed season import or make a
-new API-Football call merely to resume this work.
+**Resume at implementation-order step 3: configuration and ephemeral Redis
+state.** Add `LIVE_POLL_INTERVAL_SECONDS=25`, generic league scope,
+`REDIS_URL`, the async Redis dependency/client lifecycle, and only the
+`live:fixture:{fixture_id}` plus `live:active_fixtures` key contract. Then
+continue with `poll_once()`, terminal reconciliation, REST, and the minimal
+frontend. Do not replay the completed season import or make a new
+API-Football call merely to resume this work. The untracked prediction sample
+belongs to the later prediction slice and must remain separate.
 
 ## 1. Synchronise the canonical base
 

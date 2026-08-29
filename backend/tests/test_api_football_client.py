@@ -47,6 +47,39 @@ def test_request_uses_header_and_preserves_raw_body() -> None:
     }
 
 
+def test_client_reuses_one_async_http_pool_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+    calls: list[str] = []
+    closed = False
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+        async def get(self, endpoint: str, *, params: object = None) -> httpx.Response:
+            calls.append(endpoint)
+            return httpx.Response(200, content=b'{"errors":{},"response":[]}')
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    async def exercise() -> None:
+        async with APIFootballClient("test-secret") as client:
+            await client.get("/fixtures", params={"live": 39})
+            await client.get("/fixtures", params={"id": 1})
+
+    asyncio.run(exercise())
+
+    assert len(created) == 1
+    assert calls == ["/fixtures", "/fixtures"]
+    assert closed is True
+
+
 def test_http_error_is_sanitized_and_not_retried() -> None:
     calls = 0
 

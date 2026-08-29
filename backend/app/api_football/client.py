@@ -44,7 +44,7 @@ class APIFootballResponse:
 
 
 class APIFootballClient:
-    """Minimal async client with no retries and no request logging."""
+    """Reusable async client with one connection pool and no request logging."""
 
     def __init__(
         self,
@@ -58,9 +58,12 @@ class APIFootballClient:
             raise APIFootballConfigurationError("API_FOOTBALL_KEY is required.")
 
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
-        self._transport = transport
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"x-apisports-key": api_key},
+            timeout=timeout,
+            transport=transport,
+        )
 
     @classmethod
     def from_environment(cls, **kwargs: Any) -> "APIFootballClient":
@@ -75,17 +78,11 @@ class APIFootballClient:
     ) -> APIFootballResponse:
         """Make one GET request. This method deliberately does not retry requests."""
         normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={"x-apisports-key": self._api_key},
-            timeout=self._timeout,
-            transport=self._transport,
-        ) as client:
-            try:
-                response = await client.get(normalized_endpoint, params=params)
-            except httpx.HTTPError as error:
-                # Do not include the underlying message: it can contain the request URL.
-                raise APIFootballHTTPError(0) from error
+        try:
+            response = await self._client.get(normalized_endpoint, params=params)
+        except httpx.HTTPError as error:
+            # Do not include the underlying message: it can contain the request URL.
+            raise APIFootballHTTPError(0) from error
 
         if response.is_error:
             raise APIFootballHTTPError(
@@ -124,6 +121,16 @@ class APIFootballClient:
             status_code=response.status_code,
             headers=dict(response.headers),
         )
+
+    async def aclose(self) -> None:
+        """Close the reusable connection pool owned by this client."""
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "APIFootballClient":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
 
     def response_contains_api_key(self, body: bytes) -> bool:
         """Check a response before persistence without exposing the configured key."""
