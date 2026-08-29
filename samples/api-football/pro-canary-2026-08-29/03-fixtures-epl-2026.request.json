@@ -1,0 +1,18 @@
+{
+  "endpoint": "/fixtures",
+  "parameters": {
+    "league": 39,
+    "season": 2026
+  },
+  "request_started_at": "2026-08-29T03:41:20.769076519Z",
+  "response_received_at": "2026-08-29T03:41:20.897091684Z",
+  "http_status": 200,
+  "safe_rate_limit_headers": {
+    "x-ratelimit-limit": "300",
+    "x-ratelimit-remaining": "297",
+    "x-ratelimit-requests-limit": "7500",
+    "x-ratelimit-requests-remaining": "7497"
+  },
+  "content_sha256": "91053d98cb5f80d8a55212ea741aac61f502226786ab10653abce12b7d4e3c97",
+  "byte_count": 369463
+}
