@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
@@ -11,12 +11,13 @@ from app.web.dependencies import get_web_read_service
 from app.web.dtos import (
     AverageMetricSummary, FixtureAnalyticsResponse, FixtureAnalyticsSide, FixtureScore,
     FixtureStatisticsResponse, FixtureStatisticsSide, FixtureSummary, FixtureTeamStatistics,
-    GoalTotalsRateSummary, LeagueListResponse, LeagueReference, LeagueSeasonsResponse,
-    MetricSummary, PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
+    GoalTotalsRateSummary, LeagueListResponse, LeagueMatchesResponse, LeagueReference,
+    LeagueSeasonsResponse, MatchDateLeagueSummary, MatchDateLeaguesResponse, MetricSummary,
+    PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
     SeasonReference, SeasonStandingRow, SeasonStandingsResponse, StandingsGroup,
     StreakSummary, TeamAnalyticsResponse, TeamReference,
 )
-from app.web.service import WebNotFoundError
+from app.web.service import WebNotFoundError, WebValidationError
 
 
 NOW = datetime(2024, 10, 1, 15, tzinfo=UTC)
@@ -54,9 +55,35 @@ class FakeService:
         self.season_calls: list[tuple[int, int, int]] = []
         self.team_calls: list[tuple[int, int, object, int]] = []
         self.fixture_calls: list[tuple[int, int]] = []
+        self.match_date_calls: list[tuple[date, str]] = []
+        self.league_match_calls: list[tuple[date, int, str]] = []
 
     def leagues(self):
         return LeagueListResponse(leagues=[LEAGUE])
+
+    def match_date_leagues(self, *, match_date: date, timezone: str):
+        if timezone == "Not/A_Timezone":
+            raise WebValidationError("invalid_timezone")
+        self.match_date_calls.append((match_date, timezone))
+        return MatchDateLeaguesResponse(
+            date=match_date,
+            timezone=timezone,
+            leagues=[MatchDateLeagueSummary(league=LEAGUE, fixture_count=2)],
+        )
+
+    def league_matches(self, *, match_date: date, league_id: int, timezone: str):
+        if league_id == 404:
+            raise WebNotFoundError("league_not_found")
+        self.league_match_calls.append((match_date, league_id, timezone))
+        return LeagueMatchesResponse(
+            date=match_date,
+            timezone=timezone,
+            league=LEAGUE,
+            fixtures=[
+                _fixture(1, kickoff_at=NOW),
+                _fixture(2, kickoff_at=NOW.replace(hour=17), completed=False),
+            ],
+        )
 
     def league_seasons(self, *, league_id: int):
         if league_id == 404:
@@ -168,6 +195,37 @@ def test_discovery_and_standings_contracts(client_and_service) -> None:
     assert standings.json()["groups"][0]["rows"][0]["points"] == 3
 
 
+def test_match_date_league_discovery_is_lightweight_and_timezone_explicit(client_and_service) -> None:
+    client, service = client_and_service
+
+    response = client.get(
+        "/web/v1/matches/leagues?date=2026-08-30&timezone=Asia%2FTokyo"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "date": "2026-08-30",
+        "timezone": "Asia/Tokyo",
+        "leagues": [{"league": LEAGUE.model_dump(), "fixture_count": 2}],
+    }
+    assert service.match_date_calls == [(date(2026, 8, 30), "Asia/Tokyo")]
+
+
+def test_selected_league_matches_contract_reuses_fixture_summary(client_and_service) -> None:
+    client, service = client_and_service
+
+    response = client.get(
+        "/web/v1/matches?date=2026-08-30&league_id=3&timezone=UTC"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["league"]["id"] == 3
+    assert [fixture["id"] for fixture in body["fixtures"]] == [1, 2]
+    assert body["fixtures"][1]["final_score"] is None
+    assert service.league_match_calls == [(date(2026, 8, 30), 3, "UTC")]
+
+
 def test_fixture_statistics_contract_keeps_missing_metric_as_null(client_and_service) -> None:
     client, _ = client_and_service
     response = client.get("/web/v1/fixtures/1/statistics")
@@ -184,6 +242,9 @@ def test_fixture_statistics_contract_keeps_missing_metric_as_null(client_and_ser
     "/web/v1/teams/10/analytics?season_id=3&window=7",
     "/web/v1/fixtures/1/analytics?window=7",
     "/web/v1/seasons/3/fixtures?limit=0",
+    "/web/v1/matches/leagues?date=2026-08-30",
+    "/web/v1/matches/leagues?date=not-a-date&timezone=UTC",
+    "/web/v1/matches?date=2026-08-30&league_id=0&timezone=UTC",
 ])
 def test_invalid_query_contract_is_422(client_and_service, path: str) -> None:
     client, _ = client_and_service
@@ -198,12 +259,22 @@ def test_invalid_query_contract_is_422(client_and_service, path: str) -> None:
     ("/web/v1/teams/404/analytics?season_id=3", "team_not_found_in_season"),
     ("/web/v1/fixtures/404/analytics", "fixture_not_found"),
     ("/web/v1/fixtures/404/statistics", "fixture_not_found"),
+    ("/web/v1/matches?date=2026-08-30&league_id=404&timezone=UTC", "league_not_found"),
 ])
 def test_not_found_contract_is_stable(client_and_service, path: str, code: str) -> None:
     client, _ = client_and_service
     response = client.get(path)
     assert response.status_code == 404
     assert response.json() == {"detail": {"code": code}}
+
+
+def test_unknown_timezone_contract_is_stable(client_and_service) -> None:
+    client, _ = client_and_service
+    response = client.get(
+        "/web/v1/matches/leagues?date=2026-08-30&timezone=Not%2FA_Timezone"
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "invalid_timezone"}}
 
 
 def test_team_analytics_and_fixture_comparison_contract(client_and_service) -> None:

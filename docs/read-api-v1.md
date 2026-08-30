@@ -15,6 +15,12 @@ non-user-specific responses; no cache header is committed yet, but the
 deterministic IDs, fixture ordering, and finalized-score semantics allow later
 historical response caching without changing the payload shape.
 
+Calendar-date endpoints require an IANA timezone supplied by the browser.
+PostgreSQL timestamps remain UTC; FastAPI converts the selected local date to
+an index-friendly half-open UTC range (`kickoff_at >= start AND kickoff_at <
+end`). There is no league or server-timezone hardcode, and daylight-saving
+transitions are handled by the timezone database.
+
 ## Endpoints
 
 ### `GET /web/v1/leagues`
@@ -29,6 +35,52 @@ does not expose provider IDs or provider provenance.
 Returns a league and its canonical seasons in descending `start_year, id`
 order. This is the navigation contract for a multi-league, multi-season UI;
 the frontend must not hard-code EPL or a particular year.
+
+### `GET /web/v1/matches/leagues`
+
+Required query parameters:
+
+- `date`: selected calendar date in `YYYY-MM-DD` format;
+- `timezone`: browser-resolved IANA zone, for example `Asia/Tokyo` or
+  `America/Los_Angeles`.
+
+Returns only leagues that have at least one canonical fixture in the selected
+user-local day. Each item contains the presentation-safe `LeagueReference` and
+`fixture_count`; fixture arrays are deliberately omitted so desktop and mobile
+clients can render the first navigation step without downloading all matches.
+Results are ordered deterministically by country, league name, and internal
+league ID.
+
+```json
+{
+  "date": "2026-08-30",
+  "timezone": "Asia/Tokyo",
+  "leagues": [{
+    "league": {
+      "id": 3,
+      "name": "Premier League",
+      "country_name": "England",
+      "logo_url": null,
+      "competition_type": "league"
+    },
+    "fixture_count": 8
+  }]
+}
+```
+
+### `GET /web/v1/matches`
+
+Required query parameters:
+
+- `date`: selected calendar date in `YYYY-MM-DD` format;
+- `league_id`: canonical internal league ID;
+- `timezone`: browser-resolved IANA zone.
+
+Returns the selected league and its fixtures for that user-local day, ordered
+by `kickoff_at ASC, id ASC`. It reuses `FixtureSummary`, including future,
+completed, postponed, cancelled, and other canonical lifecycle states. A known
+league with no fixtures returns an empty `fixtures` array; an unknown league
+returns `league_not_found`.
 
 ### `GET /web/v1/seasons/{season_id}/standings`
 
@@ -135,9 +187,11 @@ GET /web/v1/fixtures/103/analytics?window=5
 | Unknown league | 404 | `league_not_found` |
 | Unknown team or team absent from requested season | 404 | `team_not_found_in_season` |
 | Unknown fixture | 404 | `fixture_not_found` |
+| Unknown browser timezone | 422 | `invalid_timezone` |
+| Calendar date has no representable next day | 422 | `invalid_match_date` |
 | Team has no completed fixture in selected season | 422 | `team_has_no_completed_fixture_in_season` |
 | Known season without a standings snapshot | 422 | `season_standings_not_available` |
-| Unsupported `scope`, `window`, invalid pagination/query type | 422 | FastAPI validation detail, or `invalid_window` |
+| Missing timezone, unsupported `scope`/`window`, or invalid query type | 422 | FastAPI validation detail, `invalid_timezone`, or `invalid_window` |
 
 The selected URLs intentionally contain no `fixture_id + season_id` pair, so a
 fixture/season mismatch cannot be silently accepted. Fixture analytics derives

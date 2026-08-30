@@ -91,6 +91,9 @@ Architecture invariants:
    canonical fixtures and final results.
 9. Provider predictions are a separate pre-kickoff Supabase workflow, not
    Redis live state, and are immutable after kickoff.
+10. Calendar-day reads use the user's browser-resolved IANA timezone. The
+    frontend sends it explicitly; neither Next.js nor FastAPI hardcodes a
+    product timezone.
 
 ## FastAPI web read contract
 
@@ -99,6 +102,9 @@ The planned internal browser-facing read contract is:
 ```text
 GET /web/v1/leagues
 GET /web/v1/leagues/{league_id}/seasons
+
+GET /web/v1/matches/leagues?date={date}&timezone={iana_timezone}
+GET /web/v1/matches?date={date}&league_id={league_id}&timezone={iana_timezone}
 
 GET /web/v1/seasons/{season_id}/standings
 GET /web/v1/seasons/{season_id}/fixtures
@@ -170,17 +176,34 @@ MVP routes:
 
 ```text
 /
+/matches?date={date}&timezone={iana_timezone}
+/matches/leagues/{league_id}?date={date}&timezone={iana_timezone}
+/leagues
 /leagues/{league}
 /leagues/{league}/seasons/{season}
 /fixtures/{fixture_id}
 /teams/{team_id}
+/analytics
+/predictions
+/favorites
 /login
 /register
 /forgot-password
 /account
 ```
 
-Future routes may include `/pricing`, `/favorites`, and `/saved-filters`.
+The approved global navigation order is **Матчи | Лиги | Аналитика | Прогнозы
+| Избранное**. Routes may initially expose empty or staged product sections;
+the visual navigation is implemented only in its separately approved UI step.
+Future routes may include `/pricing` and `/saved-filters`.
+
+The Matches route keeps the selected date and timezone in the URL. Its date
+strip covers ±7 days, labels the current user-local day as «Сегодня», supports
+range arrows, arbitrary calendar selection, and horizontal mobile swipe. Date
+selection first loads only leagues with fixtures and their counts; selecting a
+league then loads only that league's fixtures for the day. Selecting a fixture
+opens `/fixtures/{fixture_id}`. This two-step contract avoids preloading every
+match on narrow mobile screens.
 
 The season page shows the league, dynamic season selection, standings,
 rounds, fixtures, results, and links to fixtures and teams.

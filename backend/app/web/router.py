@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,8 +12,8 @@ from app.analytics.models import AnalyticsScope
 from .dependencies import get_web_read_service
 from .dtos import (
     FixtureAnalyticsResponse, FixtureStatisticsResponse, LeagueListResponse,
-    LeagueSeasonsResponse, SeasonFixturesResponse, SeasonStandingsResponse,
-    TeamAnalyticsResponse,
+    LeagueMatchesResponse, LeagueSeasonsResponse, MatchDateLeaguesResponse,
+    SeasonFixturesResponse, SeasonStandingsResponse, TeamAnalyticsResponse,
 )
 from .service import WebNotFoundError, WebReadService, WebValidationError
 
@@ -34,6 +35,33 @@ def _error(error: WebNotFoundError | WebValidationError) -> HTTPException:
 @router.get("/leagues", response_model=LeagueListResponse)
 def leagues(service: Service) -> LeagueListResponse:
     return service.leagues()
+
+
+@router.get("/matches/leagues", response_model=MatchDateLeaguesResponse)
+def match_date_leagues(
+    service: Service,
+    match_date: Annotated[date, Query(alias="date")],
+    timezone: Annotated[str, Query(min_length=1, max_length=128)],
+) -> MatchDateLeaguesResponse:
+    try:
+        return service.match_date_leagues(match_date=match_date, timezone=timezone)
+    except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
+
+
+@router.get("/matches", response_model=LeagueMatchesResponse)
+def league_matches(
+    service: Service,
+    match_date: Annotated[date, Query(alias="date")],
+    league_id: Annotated[int, Query(gt=0)],
+    timezone: Annotated[str, Query(min_length=1, max_length=128)],
+) -> LeagueMatchesResponse:
+    try:
+        return service.league_matches(
+            match_date=match_date, league_id=league_id, timezone=timezone
+        )
+    except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
 
 
 @router.get("/leagues/{league_id}/seasons", response_model=LeagueSeasonsResponse)

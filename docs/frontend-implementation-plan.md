@@ -15,19 +15,27 @@
 
 ## Next controlled iterations
 
-1. **Interactive preview acceptance**: configure the two public Supabase
+1. **Matches navigation contract (data layer implemented; visual pending)**:
+   global order is Матчи, Лиги, Аналитика, Прогнозы, Избранное. The Matches URL
+   owns `date` and the browser-resolved IANA timezone. A ±7-day date strip,
+   arrows, calendar picker and mobile horizontal swipe are presentation-only.
+   The first request returns lightweight league/count rows; a second request
+   returns fixtures for one league. Both browser timezone discovery and the
+   server-only FastAPI client are shared utilities; no component may substitute
+   `Europe/London` or the server timezone.
+2. **Interactive preview acceptance**: configure the two public Supabase
    values and Dashboard redirects; start backend and frontend locally; complete
    one real signup, confirmation, login, logout, and recovery flow.
-2. **Visual QA**: review desktop and mobile screenshots against the actual
+3. **Visual QA**: review desktop and mobile screenshots against the actual
    loaded development dataset; adjust hierarchy, density, empty states and
    accessibility without changing analytics calculations.
-3. **Local logo delivery** — when a league/team has a canonical provider logo
+4. **Local logo delivery** — when a league/team has a canonical provider logo
    URL already stored in the backend, a controlled operator job may cache the
    PNG locally. The browser requests only same-origin Next.js `/media/...`
    routes; the backend serves only cached files and never contacts a provider
    during a page request. Bundesliga 2025/26 is the first visual target.
-4. **Backend access-control stage**: verify Supabase JWT in FastAPI and add
+5. **Backend access-control stage**: verify Supabase JWT in FastAPI and add
    public/free/premium policy gates. Do not put authorization logic into React.
-5. **Product expansion**: favourites/saved filters, player/lineup analytics,
+6. **Product expansion**: favourites/saved filters, player/lineup analytics,
    odds snapshots, and premium UI are separate reviewed stages. Payments remain
    out of scope.

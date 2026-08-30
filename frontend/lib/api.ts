@@ -3,12 +3,15 @@ import "server-only";
 import type {
   FixtureAnalyticsResponse,
   FixtureStatisticsResponse,
+  LeagueMatchesResponse,
   LeagueReference,
+  MatchDateLeaguesResponse,
   SeasonFixturesResponse,
   SeasonReference,
   SeasonStandingsResponse,
   TeamAnalyticsResponse,
 } from "@/lib/contracts";
+import { matchNavigationQuery } from "@/lib/match-navigation";
 
 const DEFAULT_REVALIDATE_SECONDS = 300;
 
@@ -44,6 +47,23 @@ async function readApi<T>(path: string, revalidate = DEFAULT_REVALIDATE_SECONDS)
 
 export async function getLeagues(): Promise<LeagueReference[]> {
   return (await readApi<{ leagues: LeagueReference[] }>("/leagues")).leagues;
+}
+
+export async function getMatchDateLeagues(
+  date: string,
+  timezone: string,
+): Promise<MatchDateLeaguesResponse> {
+  return readApi(`/matches/leagues?${matchNavigationQuery({ date, timezone })}`);
+}
+
+export async function getLeagueMatches(
+  date: string,
+  leagueId: number,
+  timezone: string,
+): Promise<LeagueMatchesResponse> {
+  return readApi(
+    `/matches?${matchNavigationQuery({ date, timezone, leagueId })}`,
+  );
 }
 
 export async function getLeagueSeasons(leagueId: number): Promise<{ league: LeagueReference; seasons: SeasonReference[] }> {

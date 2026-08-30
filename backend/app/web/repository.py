@@ -90,6 +90,12 @@ class FixtureRecord:
     result_finalized_at: datetime | None
 
 
+@dataclass(frozen=True)
+class MatchDateLeagueRecord:
+    league: LeagueRecord
+    fixture_count: int
+
+
 class WebReadRepository:
     """All methods are SELECT-only and accept canonical internal IDs."""
 
@@ -176,6 +182,44 @@ class WebReadRepository:
             (season_id, limit, offset),
         ).fetchall()
         return total, [self._fixture_record(row) for row in rows]
+
+    def list_match_date_leagues(
+        self, *, start_at: datetime, end_at: datetime
+    ) -> list[MatchDateLeagueRecord]:
+        rows = self._connection.execute(
+            """SELECT l.id,l.name,l.country_name,l.logo_url,l.competition_type,count(*)
+                 FROM football.fixtures f
+                 JOIN football.seasons s ON s.id=f.season_id
+                 JOIN football.leagues l ON l.id=s.league_id
+                 WHERE f.kickoff_at >= %s AND f.kickoff_at < %s
+                 GROUP BY l.id,l.name,l.country_name,l.logo_url,l.competition_type
+                 ORDER BY l.country_name NULLS LAST,l.name ASC,l.id ASC""",
+            (start_at, end_at),
+        ).fetchall()
+        return [
+            MatchDateLeagueRecord(
+                league=self._league_record(row[:5]), fixture_count=int(row[5])
+            )
+            for row in rows
+        ]
+
+    def list_league_matches(
+        self, *, league_id: int, start_at: datetime, end_at: datetime
+    ) -> list[FixtureRecord]:
+        rows = self._connection.execute(
+            """SELECT f.id,f.season_id,f.kickoff_at,f.home_team_id,f.away_team_id,
+                      f.round_label,f.lifecycle_state::text,f.home_goals,f.away_goals,f.result_finalized_at,
+                      home.name,away.name
+                 FROM football.fixtures f
+                 JOIN football.seasons s ON s.id=f.season_id
+                 JOIN football.teams home ON home.id=f.home_team_id
+                 JOIN football.teams away ON away.id=f.away_team_id
+                 WHERE s.league_id=%s
+                   AND f.kickoff_at >= %s AND f.kickoff_at < %s
+                 ORDER BY f.kickoff_at ASC,f.id ASC""",
+            (league_id, start_at, end_at),
+        ).fetchall()
+        return [self._fixture_record(row) for row in rows]
 
     def team_in_season(self, *, team_id: int, season_id: int) -> TeamRecord | None:
         row = self._connection.execute(

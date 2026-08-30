@@ -104,6 +104,24 @@ class FixtureSummary(WebDTO):
     final_score: FixtureScore | None
 
 
+class MatchDateLeagueSummary(WebDTO):
+    league: LeagueReference
+    fixture_count: int = Field(gt=0)
+
+
+class MatchDateLeaguesResponse(WebDTO):
+    date: date
+    timezone: str
+    leagues: list[MatchDateLeagueSummary]
+
+
+class LeagueMatchesResponse(WebDTO):
+    date: date
+    timezone: str
+    league: LeagueReference
+    fixtures: list[FixtureSummary]
+
+
 class PaginationMetadata(WebDTO):
     total: int = Field(ge=0)
     limit: int = Field(ge=1)

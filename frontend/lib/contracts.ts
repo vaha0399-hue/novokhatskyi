@@ -36,6 +36,24 @@ export type FixtureSummary = {
   final_score: FixtureScore | null;
 };
 
+export type MatchDateLeagueSummary = {
+  league: LeagueReference;
+  fixture_count: number;
+};
+
+export type MatchDateLeaguesResponse = {
+  date: string;
+  timezone: string;
+  leagues: MatchDateLeagueSummary[];
+};
+
+export type LeagueMatchesResponse = {
+  date: string;
+  timezone: string;
+  league: LeagueReference;
+  fixtures: FixtureSummary[];
+};
+
 export type PaginationMetadata = {
   total: number;
   limit: number;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime, time, timedelta
 
 import httpx
 import psycopg
@@ -95,3 +96,55 @@ def test_development_discovery_standings_and_statistics_are_read_only(monkeypatc
     assert standings.json()["groups"]
     assert len(statistics.json()["home"]["metrics"]) == 18
     assert len(statistics.json()["away"]["metrics"]) == 18
+
+
+def test_development_match_date_navigation_matches_canonical_utc_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    monkeypatch.setenv("SUPABASE_DB_URL", TEST_DB_URL)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        target_kickoff = connection.execute(
+            "SELECT kickoff_at FROM football.fixtures ORDER BY kickoff_at ASC,id ASC LIMIT 1"
+        ).fetchone()[0]
+        target_date = target_kickoff.astimezone(UTC).date()
+        start_at = datetime.combine(target_date, time.min, tzinfo=UTC)
+        end_at = start_at + timedelta(days=1)
+        expected_leagues = connection.execute(
+            """SELECT l.id,count(*)
+                 FROM football.fixtures f
+                 JOIN football.seasons s ON s.id=f.season_id
+                 JOIN football.leagues l ON l.id=s.league_id
+                 WHERE f.kickoff_at >= %s AND f.kickoff_at < %s
+                 GROUP BY l.id,l.name,l.country_name
+                 ORDER BY l.country_name NULLS LAST,l.name ASC,l.id ASC""",
+            (start_at, end_at),
+        ).fetchall()
+        league_id = int(expected_leagues[0][0])
+        expected_fixture_ids = [
+            row[0]
+            for row in connection.execute(
+                """SELECT f.id FROM football.fixtures f
+                     JOIN football.seasons s ON s.id=f.season_id
+                     WHERE s.league_id=%s
+                       AND f.kickoff_at >= %s AND f.kickoff_at < %s
+                     ORDER BY f.kickoff_at ASC,f.id ASC""",
+                (league_id, start_at, end_at),
+            ).fetchall()
+        ]
+
+    leagues = asyncio.run(
+        _get(f"/web/v1/matches/leagues?date={target_date.isoformat()}&timezone=UTC")
+    )
+    matches = asyncio.run(
+        _get(
+            f"/web/v1/matches?date={target_date.isoformat()}&league_id={league_id}&timezone=UTC"
+        )
+    )
+
+    assert leagues.status_code == matches.status_code == 200
+    assert [
+        (item["league"]["id"], item["fixture_count"])
+        for item in leagues.json()["leagues"]
+    ] == [(int(league), int(count)) for league, count in expected_leagues]
+    assert [item["id"] for item in matches.json()["fixtures"]] == expected_fixture_ids

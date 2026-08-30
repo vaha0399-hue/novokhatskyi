@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.analytics import AnalyticsEngine
 from app.analytics.models import AnalyticsScope, AverageMetric, RateMetric, WindowAnalytics
@@ -11,8 +13,9 @@ from app.analytics.models import AnalyticsScope, AverageMetric, RateMetric, Wind
 from .dtos import (
     AverageMetricSummary, FixtureAnalyticsResponse, FixtureAnalyticsSide, FixtureScore,
     FixtureStatisticsResponse, FixtureStatisticsSide, FixtureSummary, FixtureTeamStatistics,
-    GoalTotalsRateSummary, LeagueListResponse, LeagueReference, LeagueSeasonsResponse,
-    MetricSummary, PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
+    GoalTotalsRateSummary, LeagueListResponse, LeagueMatchesResponse, LeagueReference,
+    LeagueSeasonsResponse, MatchDateLeagueSummary, MatchDateLeaguesResponse, MetricSummary,
+    PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
     SeasonReference, SeasonStandingRow, SeasonStandingsResponse, StandingsGroup,
     StreakSummary, TeamAnalyticsResponse, TeamReference,
 )
@@ -94,6 +97,22 @@ def _fixture(value: FixtureRecord) -> FixtureSummary:
     )
 
 
+def _match_date_window(match_date: date, timezone: str) -> tuple[datetime, datetime, str]:
+    try:
+        zone = ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise WebValidationError("invalid_timezone") from error
+
+    try:
+        next_date = match_date + timedelta(days=1)
+    except OverflowError as error:
+        raise WebValidationError("invalid_match_date") from error
+
+    start_at = datetime.combine(match_date, time.min, tzinfo=zone)
+    end_at = datetime.combine(next_date, time.min, tzinfo=zone)
+    return start_at.astimezone(UTC), end_at.astimezone(UTC), zone.key
+
+
 def _fixture_statistics(value: FixtureStatisticsRecord) -> FixtureTeamStatistics:
     return FixtureTeamStatistics(
         shots_on_goal=value.shots_on_goal, shots_off_goal=value.shots_off_goal,
@@ -115,6 +134,41 @@ class WebReadService:
 
     def leagues(self) -> LeagueListResponse:
         return LeagueListResponse(leagues=[_league(item) for item in self._repository.list_leagues()])
+
+    def match_date_leagues(
+        self, *, match_date: date, timezone: str
+    ) -> MatchDateLeaguesResponse:
+        start_at, end_at, normalized_timezone = _match_date_window(match_date, timezone)
+        leagues = self._repository.list_match_date_leagues(
+            start_at=start_at, end_at=end_at
+        )
+        return MatchDateLeaguesResponse(
+            date=match_date,
+            timezone=normalized_timezone,
+            leagues=[
+                MatchDateLeagueSummary(
+                    league=_league(item.league), fixture_count=item.fixture_count
+                )
+                for item in leagues
+            ],
+        )
+
+    def league_matches(
+        self, *, match_date: date, league_id: int, timezone: str
+    ) -> LeagueMatchesResponse:
+        start_at, end_at, normalized_timezone = _match_date_window(match_date, timezone)
+        league = self._repository.league(league_id=league_id)
+        if league is None:
+            raise WebNotFoundError("league_not_found")
+        fixtures = self._repository.list_league_matches(
+            league_id=league_id, start_at=start_at, end_at=end_at
+        )
+        return LeagueMatchesResponse(
+            date=match_date,
+            timezone=normalized_timezone,
+            league=_league(league),
+            fixtures=[_fixture(item) for item in fixtures],
+        )
 
     def league_seasons(self, *, league_id: int) -> LeagueSeasonsResponse:
         league = self._repository.league(league_id=league_id)
