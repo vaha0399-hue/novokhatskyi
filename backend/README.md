@@ -14,6 +14,23 @@ uv run pytest
 uv run uvicorn app.main:app --reload
 ```
 
+## Live configuration
+
+The first live slice polls Premier League by default while retaining a
+generic, configuration-driven league scope:
+
+```dotenv
+REDIS_URL=redis://localhost:6379/0
+LIVE_POLL_INTERVAL_SECONDS=25
+LIVE_LEAGUE_EXTERNAL_IDS=39
+LIVE_REDIS_MAX_CONNECTIONS=10
+```
+
+Multiple league IDs may be comma- or hyphen-separated. The worker converts
+them to API-Football's `live=39-2-140` form. Redis contains only current live
+state under `live:fixture:{fixture_id}` and `live:active_fixtures`; it is not a
+historical result store.
+
 ## API-Football sample collection
 
 The manual collector is for Stage 2 contract research only; it is not an importer or a
