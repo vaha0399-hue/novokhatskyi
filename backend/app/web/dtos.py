@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -71,6 +73,24 @@ class SeasonStandingsResponse(WebDTO):
 class FixtureScore(WebDTO):
     home: int = Field(ge=0)
     away: int = Field(ge=0)
+
+
+class LiveFixtureDTO(WebDTO):
+    fixture_id: int = Field(gt=0)
+    season_id: int = Field(gt=0)
+    league_id: int = Field(gt=0)
+    kickoff_at: datetime
+    home_team: TeamReference
+    away_team: TeamReference
+    status: Literal["first_half", "half_time", "second_half"]
+    score: FixtureScore
+    elapsed_minute: int | None = Field(default=None, ge=0)
+    added_time: int | None = Field(default=None, ge=0)
+    observed_at: datetime
+
+
+class LiveFixturesResponse(WebDTO):
+    fixtures: list[LiveFixtureDTO]
 
 
 class FixtureSummary(WebDTO):

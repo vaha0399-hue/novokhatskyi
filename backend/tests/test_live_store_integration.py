@@ -54,7 +54,9 @@ def _state(fixture_id: int):
 def test_real_redis_current_state_round_trip_and_terminal_cleanup() -> None:
     assert TEST_REDIS_URL is not None
     parsed = urlsplit(TEST_REDIS_URL)
-    assert parsed.hostname in {"127.0.0.1", "localhost"}, "integration Redis must be local"
+    assert (
+        parsed.scheme == "unix" and parsed.path.startswith("/tmp/")
+    ) or parsed.hostname in {"127.0.0.1", "localhost"}, "integration Redis must be local"
 
     async def exercise() -> None:
         client = Redis.from_url(TEST_REDIS_URL, decode_responses=True)

@@ -196,6 +196,16 @@ def test_terminal_state_cannot_be_persisted_as_current() -> None:
     assert client.executed == []
 
 
+def test_reader_rejects_a_terminal_state_left_in_the_active_set() -> None:
+    client = FakeRedis()
+    terminal = replace(_state(), status=LiveFixtureStatus.FINISHED)
+    client.values[fixture_key(terminal.fixture_id)] = encode_live_state(terminal)
+    client.sets[ACTIVE_FIXTURES_KEY] = {str(terminal.fixture_id)}
+
+    with pytest.raises(LiveStateConsistencyError, match="terminal"):
+        asyncio.run(RedisLiveStore(client).active())  # type: ignore[arg-type]
+
+
 def test_store_rejects_active_finished_overlap_before_redis_write() -> None:
     client = FakeRedis()
 

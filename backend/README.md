@@ -55,6 +55,20 @@ early live response itself is never treated as final provenance. Transient
 PostgreSQL or Redis connection failures recreate that infrastructure session;
 malformed provider/domain data remains fail-closed.
 
+## Live REST contract
+
+`GET /web/v1/live` reads one atomic Redis snapshot through the FastAPI
+process's reusable async connection pool. It never calls API-Football or
+PostgreSQL, and every response is marked `Cache-Control: no-store`. An empty
+live window returns `{"fixtures": []}`; an unavailable or inconsistent Redis snapshot returns `503` with
+`{"detail": {"code": "live_state_unavailable"}}`.
+
+Each `LiveFixtureDTO` contains only internal fixture, season, league, and team
+identifiers plus team names, kickoff time, normalised status, current score,
+elapsed/added time, and the provider observation timestamp. Provider fixture
+IDs and credentials are not part of the browser contract. Team logos remain
+available through the existing internal-ID asset route.
+
 ## API-Football sample collection
 
 The manual collector is for Stage 2 contract research only; it is not an importer or a

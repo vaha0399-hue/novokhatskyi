@@ -86,8 +86,10 @@ Confirmed `FT` first ensures the existing Supabase reconciliation state, whose
 schema guard keeps finalization at or after `kickoff + 3 hours`; only then is
 Redis state removed. `FT` already present in the league response needs no
 second provider request. `GET /web/v1/live` reads Redis only and returns a
-stable `LiveFixtureDTO`; neither FastAPI's read endpoint nor Next.js calls
-API-Football.
+stable `LiveFixtureDTO` through a process-owned reusable async Redis pool;
+neither FastAPI's read endpoint nor Next.js calls API-Football. The DTO exposes
+only internal IDs and normalised presentation state, and Redis failures remain
+a `503` boundary rather than falling through to a provider request.
 
 The worker shares one secondary provider-request budget per cycle between a
 disappeared-fixture check and one due post-match reconciliation task.

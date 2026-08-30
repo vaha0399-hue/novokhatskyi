@@ -175,6 +175,8 @@ class RedisLiveStore:
         if any(value in (None, "", b"") for value in values):
             raise LiveStateConsistencyError("active live fixture state is incomplete")
         states = tuple(decode_live_state(value) for value in values)
+        if any(state.status.is_terminal for state in states):
+            raise LiveStateConsistencyError("active live fixture state is terminal")
         if any(state.fixture_id != fixture_id for fixture_id, state in zip(fixture_ids, states)):
             raise LiveStateConsistencyError("active live fixture ID does not match its key")
         return tuple(sorted(states, key=lambda state: (state.kickoff_at, state.fixture_id)))

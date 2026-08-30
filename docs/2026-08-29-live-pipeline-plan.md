@@ -124,12 +124,14 @@ Updated on 2026-08-30. Completed:
   canonical finalization; the full backend suite passes without any prediction
   work.
 
-**Resume at implementation-order step 6: the Redis-backed REST contract.** Add
-the dedicated async `GET /web/v1/live` router/dependency and stable
-`LiveFixtureDTO`, then continue with the minimal frontend. Do not replay the
-completed season import or make a new
-API-Football call merely to resume this work. The untracked prediction sample
-belongs to the later prediction slice and must remain separate.
+**The Redis-backed REST contract is complete; pause before implementation-order
+step 7.** The dedicated async `GET /web/v1/live` route reads an atomic Redis
+snapshot through one process-owned connection pool and returns the stable
+`LiveFixtureDTO`. Unit and real-Redis ASGI checks cover populated, empty, and
+unavailable state. The minimal frontend waits for its separate visual
+direction. Do not replay the completed season import or make a new API-Football
+call merely to resume this work. The untracked prediction sample belongs to the
+later prediction slice and must remain separate.
 
 ## 1. Synchronise the canonical base
 
@@ -275,7 +277,7 @@ bypass the backend.
       read from `LIVE_POLL_INTERVAL_SECONDS`.
 - [x] A single central worker writes only current live state to the two Redis
       key families and removes finished fixtures from the active set.
-- [ ] `GET /web/v1/live` reads Redis and returns a stable `LiveFixtureDTO`.
+- [x] `GET /web/v1/live` reads Redis and returns a stable `LiveFixtureDTO`.
 - [ ] A minimal Next.js client polls FastAPI only and displays live score/status.
 - [ ] Live statistics and T-60 predictions remain separately scheduled follow-on
       slices; neither expands this first checkpoint.

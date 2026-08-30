@@ -8,9 +8,10 @@ from typing import Any
 
 import psycopg
 from psycopg import Connection
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from app.analytics import AnalyticsEngine, PostgresAnalyticsRepository
+from app.live import RedisLiveStore
 
 from .repository import WebReadRepository
 from .service import WebReadService
@@ -37,3 +38,11 @@ def get_web_read_service(
         WebReadRepository(connection),
         AnalyticsEngine(PostgresAnalyticsRepository(connection)),
     )
+
+
+def get_live_store(request: Request) -> RedisLiveStore:
+    """Return the process-owned Redis live-state reader."""
+    store = getattr(request.app.state, "live_store", None)
+    if not isinstance(store, RedisLiveStore):
+        raise RuntimeError("live Redis store is not initialized")
+    return store
