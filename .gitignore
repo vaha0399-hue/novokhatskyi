@@ -229,6 +229,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Application source, not a Python environment library directory.
+!frontend/lib/
+!frontend/lib/**
+
 # JavaScript / TypeScript test and build artifacts
 *.tsbuildinfo
 frontend/coverage/

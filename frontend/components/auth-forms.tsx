@@ -5,8 +5,9 @@ import { useRouter } from "next/navigation";
 import { type FormEvent, useState } from "react";
 
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { signUpErrorMessage } from "@/lib/supabase/auth-messages";
 
-type AuthFormProps = { nextPath?: string };
+type AuthFormProps = { nextPath?: string; initialMessage?: string | null };
 
 function FormMessage({ value, kind = "error" }: { value: string | null; kind?: "error" | "success" }) {
   return value ? <p className={`auth-message auth-message-${kind}`} role={kind === "error" ? "alert" : "status"}>{value}</p> : null;
@@ -16,9 +17,9 @@ function missingConfig(): string {
   return "Supabase Auth is not configured in this environment yet.";
 }
 
-export function SignInForm({ nextPath = "/account" }: AuthFormProps) {
+export function SignInForm({ nextPath = "/account", initialMessage = null }: AuthFormProps) {
   const router = useRouter();
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(initialMessage);
   const [pending, setPending] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -29,13 +30,18 @@ export function SignInForm({ nextPath = "/account" }: AuthFormProps) {
     if (!supabase) return setMessage(missingConfig());
     const data = new FormData(form);
     setPending(true);
-    const { error } = await supabase.auth.signInWithPassword({
-      email: String(data.get("email") ?? ""), password: String(data.get("password") ?? ""),
-    });
-    setPending(false);
-    if (error) return setMessage(error.message);
-    router.replace(nextPath);
-    router.refresh();
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: String(data.get("email") ?? ""), password: String(data.get("password") ?? ""),
+      });
+      if (error) return setMessage(error.message);
+      router.replace(nextPath);
+      router.refresh();
+    } catch {
+      setMessage("Sign in is temporarily unavailable. Please try again.");
+    } finally {
+      setPending(false);
+    }
   }
 
   return <form className="auth-form" onSubmit={submit}>
@@ -48,6 +54,7 @@ export function SignInForm({ nextPath = "/account" }: AuthFormProps) {
 }
 
 export function SignUpForm({ nextPath = "/account" }: AuthFormProps) {
+  const router = useRouter();
   const [message, setMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -61,15 +68,26 @@ export function SignUpForm({ nextPath = "/account" }: AuthFormProps) {
     const password = String(data.get("password") ?? "");
     if (password.length < 8) return setMessage("Use at least 8 characters for your password.");
     setPending(true);
-    const { error } = await supabase.auth.signUp({
-      email: String(data.get("email") ?? ""),
-      password,
-      options: { emailRedirectTo: `${window.location.origin}/auth/confirm?next=${encodeURIComponent(nextPath)}` },
-    });
-    setPending(false);
-    if (error) return setMessage(error.message);
-    setMessage("Check your email to confirm your account, then return here to sign in.");
-    form.reset();
+    try {
+      const { data: authData, error } = await supabase.auth.signUp({
+        email: String(data.get("email") ?? ""),
+        password,
+        options: { emailRedirectTo: `${window.location.origin}/auth/confirm?next=${encodeURIComponent(nextPath)}` },
+      });
+      const signupError = signUpErrorMessage(authData, error);
+      if (signupError) return setMessage(signupError);
+      form.reset();
+      if (authData.session) {
+        router.replace(nextPath);
+        router.refresh();
+        return;
+      }
+      setMessage("Check your email to confirm your account, then return here to sign in.");
+    } catch {
+      setMessage("Account creation is temporarily unavailable. Please try again.");
+    } finally {
+      setPending(false);
+    }
   }
 
   return <form className="auth-form" onSubmit={submit}>
@@ -81,8 +99,8 @@ export function SignUpForm({ nextPath = "/account" }: AuthFormProps) {
   </form>;
 }
 
-export function ForgotPasswordForm() {
-  const [message, setMessage] = useState<string | null>(null);
+export function ForgotPasswordForm({ initialMessage = null }: Pick<AuthFormProps, "initialMessage">) {
+  const [message, setMessage] = useState<string | null>(initialMessage);
   const [pending, setPending] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -93,12 +111,19 @@ export function ForgotPasswordForm() {
     if (!supabase) return setMessage(missingConfig());
     const data = new FormData(form);
     setPending(true);
-    const { error } = await supabase.auth.resetPasswordForEmail(String(data.get("email") ?? ""), {
-      redirectTo: `${window.location.origin}/auth/update-password`,
-    });
-    setPending(false);
-    if (error) return setMessage(error.message);
-    setMessage("If this address belongs to an account, a password-reset link is on its way.");
+    const callbackUrl = new URL("/auth/confirm", window.location.origin);
+    callbackUrl.searchParams.set("next", "/auth/update-password");
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(String(data.get("email") ?? ""), {
+        redirectTo: callbackUrl.toString(),
+      });
+      if (error) return setMessage(error.message);
+      setMessage("If this address belongs to an account, a password-reset link is on its way.");
+    } catch {
+      setMessage("Password recovery is temporarily unavailable. Please try again.");
+    } finally {
+      setPending(false);
+    }
   }
 
   return <form className="auth-form" onSubmit={submit}>
@@ -124,11 +149,16 @@ export function UpdatePasswordForm() {
     if (password.length < 8) return setMessage("Use at least 8 characters for your password.");
     if (password !== String(data.get("password_confirmation") ?? "")) return setMessage("Passwords do not match.");
     setPending(true);
-    const { error } = await supabase.auth.updateUser({ password });
-    setPending(false);
-    if (error) return setMessage(error.message);
-    router.replace("/account");
-    router.refresh();
+    try {
+      const { error } = await supabase.auth.updateUser({ password });
+      if (error) return setMessage(error.message);
+      router.replace("/account");
+      router.refresh();
+    } catch {
+      setMessage("Password update is temporarily unavailable. Request a new recovery link.");
+    } finally {
+      setPending(false);
+    }
   }
 
   return <form className="auth-form" onSubmit={submit}>
@@ -141,16 +171,25 @@ export function UpdatePasswordForm() {
 
 export function LogoutButton() {
   const router = useRouter();
+  const [message, setMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
   async function signOut() {
     const supabase = getSupabaseBrowserClient();
-    if (!supabase) return;
+    if (!supabase) return setMessage(missingConfig());
+    setMessage(null);
     setPending(true);
-    await supabase.auth.signOut();
-    router.replace("/");
-    router.refresh();
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) return setMessage(error.message);
+      router.replace("/");
+      router.refresh();
+    } catch {
+      setMessage("Sign out is temporarily unavailable. Please try again.");
+    } finally {
+      setPending(false);
+    }
   }
 
-  return <button className="button button-quiet" onClick={signOut} disabled={pending}>{pending ? "Signing out…" : "Sign out"}</button>;
+  return <div className="logout-control"><FormMessage value={message} /><button className="button button-quiet" onClick={signOut} disabled={pending}>{pending ? "Signing out…" : "Sign out"}</button></div>;
 }

@@ -32,7 +32,8 @@ The current repository contains:
 - a cutoff-safe Analytics Engine and stable FastAPI read DTOs;
 - a tested live normalizer, central polling worker, Redis current-state store,
   and Redis-backed FastAPI live endpoint;
-- a responsive Next.js App Router frontend with a Supabase Auth SSR foundation;
+- a responsive Next.js App Router frontend with complete Supabase password-auth
+  flows and SSR session persistence;
 - reviewed database migrations.
 
 The live worker, Redis current-state path, and `/web/v1/live` endpoint are

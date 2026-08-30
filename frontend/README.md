@@ -19,3 +19,8 @@ API-Football key, access token, or JWT signing secret into this directory.
 
 For required Supabase Auth redirect URLs and the production checklist, see
 [`../docs/frontend-auth.md`](../docs/frontend-auth.md).
+
+The existing Auth UI covers registration, sign-in, sign-out, password recovery
+and reset, email confirmation, protected account access, and session persistence
+after refresh. Registration calls only Supabase `signUp`; an existing email is
+reported explicitly and is never treated as a login attempt.

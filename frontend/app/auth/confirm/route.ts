@@ -1,31 +1,32 @@
-import type { EmailOtpType } from "@supabase/supabase-js";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { safeNextPath } from "@/lib/routes";
+import { completeAuthCallback } from "@/lib/supabase/auth-callback";
 import { getSupabaseServerClient } from "@/lib/supabase/server";
 
-const allowedTypes = new Set<EmailOtpType>(["email", "signup", "invite", "magiclink", "recovery", "email_change"]);
+function redirectWithoutCaching(url: URL): NextResponse {
+  const response = NextResponse.redirect(url);
+  response.headers.set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0");
+  response.headers.set("Expires", "0");
+  response.headers.set("Pragma", "no-cache");
+  return response;
+}
 
 export async function GET(request: NextRequest) {
   const url = new URL(request.url);
-  const tokenHash = url.searchParams.get("token_hash");
-  const type = url.searchParams.get("type") as EmailOtpType | null;
   const nextPath = safeNextPath(url.searchParams.get("next"));
   const loginUrl = new URL("/login", url.origin);
-
-  if (!tokenHash || !type || !allowedTypes.has(type)) {
-    loginUrl.searchParams.set("error", "invalid_confirmation_link");
-    return NextResponse.redirect(loginUrl);
-  }
   const supabase = await getSupabaseServerClient();
   if (!supabase) {
     loginUrl.searchParams.set("error", "auth_not_configured");
-    return NextResponse.redirect(loginUrl);
+    loginUrl.searchParams.set("next", nextPath);
+    return redirectWithoutCaching(loginUrl);
   }
-  const { error } = await supabase.auth.verifyOtp({ type, token_hash: tokenHash });
-  if (error) {
-    loginUrl.searchParams.set("error", "confirmation_failed");
-    return NextResponse.redirect(loginUrl);
+  const result = await completeAuthCallback(supabase, url.searchParams);
+  if (!result.ok) {
+    loginUrl.searchParams.set("error", result.code);
+    loginUrl.searchParams.set("next", nextPath);
+    return redirectWithoutCaching(loginUrl);
   }
-  return NextResponse.redirect(new URL(nextPath, url.origin));
+  return redirectWithoutCaching(new URL(nextPath, url.origin));
 }
