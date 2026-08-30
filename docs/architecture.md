@@ -41,9 +41,8 @@ API-Football
     -> Next.js website
 ```
 
-This is a directional boundary, not a Stage 1 implementation specification.
-Concrete database tables and payload models must not be designed until real
-API-Football responses have been collected and analysed in a later stage.
+This boundary is backed by reviewed real API-Football samples, stable live
+domain models, canonical provider mappings, and the two-key Redis contract.
 
 ## Invariants
 
@@ -80,11 +79,18 @@ live:fixture:{fixture_id}
 live:active_fixtures
 ```
 
-Redis is not canonical storage or a live-event archive. When a fixture reaches
-`FT`, the worker removes it from the active set and final-result reconciliation
-belongs in Supabase. `GET /web/v1/live` reads Redis only and returns a stable
-`LiveFixtureDTO`; neither FastAPI's read endpoint nor Next.js calls
+Redis is not canonical storage or a live-event archive. When an active fixture
+disappears from the league live feed, the worker permits at most one
+fixture-bound provider check per cycle and a 300-second per-fixture cooldown.
+Confirmed `FT` first ensures the existing Supabase reconciliation state, whose
+schema guard keeps finalization at or after `kickoff + 3 hours`; only then is
+Redis state removed. `FT` already present in the league response needs no
+second provider request. `GET /web/v1/live` reads Redis only and returns a
+stable `LiveFixtureDTO`; neither FastAPI's read endpoint nor Next.js calls
 API-Football.
+
+The worker shares one secondary provider-request budget per cycle between a
+disappeared-fixture check and one due post-match reconciliation task.
 
 Live fixture statistics are a subsequent, separately scheduled layer. It will
 query `/fixtures/statistics?fixture={provider_fixture_id}` only for selected

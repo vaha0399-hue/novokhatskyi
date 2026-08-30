@@ -22,6 +22,7 @@ generic, configuration-driven league scope:
 ```dotenv
 REDIS_URL=redis://localhost:6379/0
 LIVE_POLL_INTERVAL_SECONDS=25
+LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS=300
 LIVE_LEAGUE_EXTERNAL_IDS=39
 LIVE_REDIS_MAX_CONNECTIONS=10
 ```
@@ -30,6 +31,29 @@ Multiple league IDs may be comma- or hyphen-separated. The worker converts
 them to API-Football's `live=39-2-140` form. Redis contains only current live
 state under `live:fixture:{fixture_id}` and `live:active_fixtures`; it is not a
 historical result store.
+
+Run exactly one worker process on the backend/VPS:
+
+```bash
+uv run python -m app.live.worker
+```
+
+Each normal cycle starts one scoped `GET /fixtures?live=39` request on the
+configured 25-second cadence. An `FT` already present in that response needs no
+additional provider call. If an active fixture disappears without `FT`, the
+worker permits at most one additional fixture-bound `GET /fixtures?id=...`
+request in that cycle and does not recheck the same fixture for 300 seconds.
+That single secondary-request budget is shared with one due post-match
+reconciliation task.
+
+Redis state is removed only after `FT` is confirmed and the worker has
+successfully ensured the fixture's existing `ops.fixture_reconciliation_state`
+handoff. The early live response does not write a final score or bypass the schema's
+`kickoff + 3 hours` reconciliation eligibility rule. Its post-match consumer
+later invokes the schema-controlled finalizer through an eligible fetch; the
+early live response itself is never treated as final provenance. Transient
+PostgreSQL or Redis connection failures recreate that infrastructure session;
+malformed provider/domain data remains fail-closed.
 
 ## API-Football sample collection
 

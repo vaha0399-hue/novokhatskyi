@@ -10,6 +10,7 @@ from app.live import (
     LiveFixtureStatus,
     LiveNormalizationError,
     LiveScore,
+    normalize_final_result,
     normalize_live_fixture,
     normalize_live_response,
 )
@@ -21,6 +22,13 @@ SAMPLE = (
     / "api-football"
     / "live-fixtures-2026-08-29T0646Z"
     / "fixtures-live-all.raw.json"
+)
+ACTIVE_SEASON_SAMPLE = (
+    Path(__file__).parents[2]
+    / "samples"
+    / "api-football"
+    / "pro-canary-2026-08-29"
+    / "03-fixtures-epl-2026.raw.json"
 )
 
 
@@ -61,6 +69,38 @@ def test_current_score_and_time_use_only_live_fields() -> None:
     assert (fixture.score.home, fixture.score.away) == (2, 1)
     assert fixture.elapsed_minute == 45
     assert fixture.added_time == 2
+
+
+def test_final_result_reads_period_scores_only_after_ft() -> None:
+    item = _entry("FT")
+    item["goals"] = {"home": 3, "away": 1}
+    item["score"] = {
+        "halftime": {"home": 1, "away": 1},
+        "fulltime": {"home": 3, "away": 1},
+        "extratime": {"home": None, "away": None},
+        "penalty": {"home": None, "away": None},
+    }
+
+    result = normalize_final_result(item)
+
+    assert result.home_halftime_goals == 1
+    assert result.home_fulltime_goals == 3
+
+
+def test_real_epl_ft_results_satisfy_terminal_reconciliation_contract() -> None:
+    payload = json.loads(ACTIVE_SEASON_SAMPLE.read_bytes())
+    finished = [
+        item for item in payload["response"] if item["fixture"]["status"]["short"] == "FT"
+    ]
+
+    results = [normalize_final_result(item) for item in finished]
+
+    assert len(results) == 11
+    assert all(
+        (result.fixture.score.home, result.fixture.score.away)
+        == (result.home_fulltime_goals, result.away_fulltime_goals)
+        for result in results
+    )
 
 
 @pytest.mark.parametrize("invalid", [-1, True, "1"])

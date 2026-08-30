@@ -2,10 +2,10 @@
 
 Football Analytics is a web-first football analytics platform. It provides
 historical match data, calculated statistical indicators, team comparisons,
-analytical views, and a planned backend-owned live match-state pipeline through
-a responsive Next.js website. Provider-derived predictions are a separate,
-post-live-slice T-60 workflow; they are not Redis live state and do not change
-after kickoff.
+analytical views, and an in-progress backend-owned live match-state pipeline
+through a responsive Next.js website. Provider-derived predictions are a
+separate, post-live-slice T-60 workflow; they are not Redis live state and do
+not change after kickoff.
 
 ## Product canon
 
@@ -30,12 +30,14 @@ The current repository contains:
 - real API-Football contract samples and analysis documentation;
 - canonical historical fixtures, statistics, and historical lineups;
 - a cutoff-safe Analytics Engine and stable FastAPI read DTOs;
+- a tested live normalizer, central polling worker, and Redis current-state store;
 - a responsive Next.js App Router frontend with a Supabase Auth SSR foundation;
 - reviewed database migrations.
 
-The live worker, Redis state, and `/web/v1/live` endpoint are planned work,
-not a claim that the current checkout already runs a live service. The ordered
-implementation scope and acceptance checklist are in
+The live worker and Redis current-state path are implemented and tested but not
+yet deployed. The Redis-backed `/web/v1/live` endpoint and minimal UI are the
+remaining parts of the first checkpoint. The ordered implementation scope and
+acceptance checklist are in
 [`docs/2026-08-29-live-pipeline-plan.md`](docs/2026-08-29-live-pipeline-plan.md).
 
 The current frontend implementation and controlled next iterations are in

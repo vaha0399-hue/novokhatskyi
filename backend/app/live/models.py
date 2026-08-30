@@ -47,6 +47,45 @@ class ProviderLiveFixture:
 
 
 @dataclass(frozen=True)
+class ProviderFinalResult:
+    """A confirmed provider ``FT`` result, separate from current live score."""
+
+    fixture: ProviderLiveFixture
+    home_halftime_goals: int | None
+    away_halftime_goals: int | None
+    home_fulltime_goals: int
+    away_fulltime_goals: int
+    home_extratime_goals: int | None
+    away_extratime_goals: int | None
+    home_penalty_goals: int | None
+    away_penalty_goals: int | None
+
+    def __post_init__(self) -> None:
+        if self.fixture.status is not LiveFixtureStatus.FINISHED:
+            raise ValueError("final result requires a finished provider fixture")
+        pairs = (
+            (self.home_halftime_goals, self.away_halftime_goals),
+            (self.home_fulltime_goals, self.away_fulltime_goals),
+            (self.home_extratime_goals, self.away_extratime_goals),
+            (self.home_penalty_goals, self.away_penalty_goals),
+        )
+        for home, away in pairs:
+            if (home is None) != (away is None):
+                raise ValueError("final result period scores must contain both teams or neither")
+            if any(
+                value is not None
+                and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+                for value in (home, away)
+            ):
+                raise ValueError("final result period scores must be non-negative integers")
+        if (self.home_fulltime_goals, self.away_fulltime_goals) != (
+            self.fixture.score.home,
+            self.fixture.score.away,
+        ):
+            raise ValueError("FT goals and score.fulltime disagree")
+
+
+@dataclass(frozen=True)
 class CanonicalFixtureReference:
     """Canonical identity and display data resolved from PostgreSQL."""
 

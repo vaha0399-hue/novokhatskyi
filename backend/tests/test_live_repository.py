@@ -38,7 +38,9 @@ class FakeConnection:
 
 def test_resolver_returns_canonical_internal_identity() -> None:
     kickoff = datetime(2026, 8, 16, 15, tzinfo=UTC)
-    connection = FakeConnection((101, 14, 7, kickoff, 10, "Liverpool", 20, "Forest"))
+    connection = FakeConnection(
+        (101, 14, 7, kickoff, 10, "Liverpool", 20, "Forest", "scheduled")
+    )
 
     resolved = PostgresLiveFixtureResolver(connection).resolve(_fixture())  # type: ignore[arg-type]
 
@@ -54,6 +56,16 @@ def test_resolver_returns_canonical_internal_identity() -> None:
     assert "season_ref.league_external_id=%s" in query
     assert "home_ref.external_id=%s" in query
     assert "away_ref.external_id=%s" in query
+
+
+def test_resolver_rejects_completed_fixture_as_current_live_state() -> None:
+    kickoff = datetime(2026, 8, 16, 15, tzinfo=UTC)
+    connection = FakeConnection(
+        (101, 14, 7, kickoff, 10, "Liverpool", 20, "Forest", "completed")
+    )
+
+    with pytest.raises(LiveResolutionError, match="not eligible"):
+        PostgresLiveFixtureResolver(connection).resolve(_fixture())  # type: ignore[arg-type]
 
 
 def test_resolver_fails_closed_for_unknown_or_mismatched_fixture() -> None:

@@ -12,6 +12,7 @@ from redis.asyncio import Redis
 
 
 DEFAULT_POLL_INTERVAL_SECONDS = 25
+DEFAULT_TERMINAL_RECHECK_INTERVAL_SECONDS = 300
 DEFAULT_LEAGUE_EXTERNAL_IDS = (39,)
 DEFAULT_REDIS_MAX_CONNECTIONS = 10
 
@@ -48,6 +49,7 @@ class LiveSettings:
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     league_external_ids: tuple[int, ...] = DEFAULT_LEAGUE_EXTERNAL_IDS
     redis_max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS
+    terminal_recheck_interval_seconds: int = DEFAULT_TERMINAL_RECHECK_INTERVAL_SECONDS
 
     @property
     def provider_live_parameter(self) -> str:
@@ -73,6 +75,13 @@ class LiveSettings:
                     "LIVE_POLL_INTERVAL_SECONDS", str(DEFAULT_POLL_INTERVAL_SECONDS)
                 ),
                 "LIVE_POLL_INTERVAL_SECONDS",
+            ),
+            terminal_recheck_interval_seconds=_positive_integer(
+                values.get(
+                    "LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS",
+                    str(DEFAULT_TERMINAL_RECHECK_INTERVAL_SECONDS),
+                ),
+                "LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS",
             ),
             league_external_ids=_league_ids(
                 values.get(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from .models import LiveFixtureStatus, LiveScore, ProviderLiveFixture
+from .models import LiveFixtureStatus, LiveScore, ProviderFinalResult, ProviderLiveFixture
 
 
 class LiveNormalizationError(ValueError):
@@ -110,3 +110,35 @@ def normalize_live_response(
         if not expected or any(fixture.league_external_id not in expected for fixture in fixtures):
             raise LiveNormalizationError("provider live response escaped the requested league scope")
     return fixtures
+
+
+def _period_score(
+    score: Mapping[str, Any], period: str, side: str, *, required: bool = False
+) -> int | None:
+    value = _mapping(score.get(period), f"score.{period}").get(side)
+    if value is None and not required:
+        return None
+    return _non_negative_int(value, f"score.{period}.{side}")
+
+
+def normalize_final_result(item: object) -> ProviderFinalResult:
+    """Normalize period scores only for a post-match, confirmed ``FT`` fetch."""
+    entry = _mapping(item, "fixture entry")
+    fixture = normalize_live_fixture(entry)
+    if fixture.status is not LiveFixtureStatus.FINISHED:
+        raise LiveNormalizationError("final reconciliation requires FT status")
+    score = _mapping(entry.get("score"), "score")
+    try:
+        return ProviderFinalResult(
+            fixture=fixture,
+            home_halftime_goals=_period_score(score, "halftime", "home"),
+            away_halftime_goals=_period_score(score, "halftime", "away"),
+            home_fulltime_goals=_period_score(score, "fulltime", "home", required=True),
+            away_fulltime_goals=_period_score(score, "fulltime", "away", required=True),
+            home_extratime_goals=_period_score(score, "extratime", "home"),
+            away_extratime_goals=_period_score(score, "extratime", "away"),
+            home_penalty_goals=_period_score(score, "penalty", "home"),
+            away_penalty_goals=_period_score(score, "penalty", "away"),
+        )
+    except ValueError as error:
+        raise LiveNormalizationError(str(error)) from error

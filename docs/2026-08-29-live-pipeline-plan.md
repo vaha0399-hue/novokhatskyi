@@ -57,8 +57,11 @@ web read layer intact unless a narrow integration change is required.
 5. **Terminal reconciliation.** Do not assume a provider live response always
    includes `FT`. A fixture which disappears from the live feed after being
    active must be reconciled against canonical/provider final status before it
-   is removed from Redis active state. No distributed locks or Pub/Sub are
-   needed for this single-worker slice.
+   is removed from Redis active state. Bound fixture-specific checks to one per
+   worker cycle and apply a per-fixture cooldown. A confirmed `FT` hands the
+   fixture to the existing schema-controlled post-match reconciliation queue;
+   the live worker does not bypass its eligibility window. No distributed
+   locks or Pub/Sub are needed for this single-worker slice.
 6. **REST contract.** Add a dedicated asynchronous live router and dependency;
    do not couple Redis to the historical PostgreSQL `WebReadService`.
    `GET /web/v1/live` reads Redis only and returns a stable `LiveFixtureDTO`.
@@ -75,9 +78,9 @@ Live statistics and T-60 predictions remain follow-on slices. SSE, WebSocket,
 Redis Pub/Sub/Streams, distributed coordination, and a large refactor are
 explicitly out of scope.
 
-## Execution checkpoint — paused before Redis state
+## Execution checkpoint — live worker complete
 
-Updated on 2026-08-29 because execution was paused for the night. Completed:
+Updated on 2026-08-30. Completed:
 
 - The retained API-Football Premier League 2026/27 canary was replayed into
   Supabase without a new provider request.
@@ -98,13 +101,33 @@ Updated on 2026-08-29 because execution was paused for the night. Completed:
   resolution tests pass.
 - The API-Football client owns one reusable asynchronous HTTP connection pool
   and exposes explicit async close/context-manager lifecycle.
+- Live configuration and Redis current state are committed in `f5e99cc`:
+  the default interval is 25 seconds, the initial league scope is provider ID
+  39, Redis clients have an owned async lifecycle, and reads/writes are atomic
+  across only the two approved key families.
+- The centralized worker has a deterministic `poll_once()` and one long-lived
+  process lifecycle. A normal cycle makes one `GET /fixtures?live=39` request.
+  `FT` in that response needs no additional call. A previously active fixture
+  which disappears can cause at most one fixture-bound
+  `GET /fixtures?id=...` check per cycle, with a 300-second per-fixture
+  cooldown; the same one-request budget is shared with one due post-match
+  reconciliation task.
+- After confirmed `FT`, the worker idempotently ensures the existing Supabase
+  reconciliation state with `eligible_at` no earlier than
+  `kickoff + 3 hours`, then removes current Redis state. It does not write a
+  parallel final result or persist the early live response as an eligible
+  post-match fetch.
+- PostgreSQL/Redis connection failures recreate their infrastructure session;
+  malformed provider/domain state remains fail-closed.
+- Worker, normalizer, resolver, and Redis tests pass. A disposable PostgreSQL
+  run with the real migrations proves idempotent handoff without early
+  canonical finalization; the full backend suite passes without any prediction
+  work.
 
-**Resume at implementation-order step 3: configuration and ephemeral Redis
-state.** Add `LIVE_POLL_INTERVAL_SECONDS=25`, generic league scope,
-`REDIS_URL`, the async Redis dependency/client lifecycle, and only the
-`live:fixture:{fixture_id}` plus `live:active_fixtures` key contract. Then
-continue with `poll_once()`, terminal reconciliation, REST, and the minimal
-frontend. Do not replay the completed season import or make a new
+**Resume at implementation-order step 6: the Redis-backed REST contract.** Add
+the dedicated async `GET /web/v1/live` router/dependency and stable
+`LiveFixtureDTO`, then continue with the minimal frontend. Do not replay the
+completed season import or make a new
 API-Football call merely to resume this work. The untracked prediction sample
 belongs to the later prediction slice and must remain separate.
 
@@ -147,6 +170,7 @@ configuration, rather than a code constant:
 
 ```dotenv
 LIVE_POLL_INTERVAL_SECONDS=25
+LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS=300
 ```
 
 Tests must cover the four status mappings, score-field selection, elapsed and
@@ -158,7 +182,9 @@ to internal `football.fixtures.id` resolution.
 Run one central backend/VPS Live Worker. Every 25 seconds it asks
 API-Football for active Premier League fixtures, resolves each provider fixture
 ID in the canonical database, normalises the response, and writes current
-state to Redis.
+state to Redis. The normal cost is one league-scoped provider request per
+cycle. An omitted active fixture is checked with at most one additional
+fixture-bound request per cycle and a 300-second per-fixture cooldown.
 
 ```text
 API-Football
@@ -178,8 +204,10 @@ live:active_fixtures
 ```
 
 On `FT`, remove the fixture from `live:active_fixtures` and delete or expire
-its current-state key according to the worker's atomic cleanup operation. The
-authoritative final result remains in Supabase and is reconciled there; Redis
+its current-state key only after the existing Supabase reconciliation state is
+ensured. The authoritative final result is later fetched and finalized through
+the schema-controlled post-match lane at or after `kickoff + 3 hours`; the live
+worker does not use its current-state response as a final-result write. Redis
 is not a historical-results store.
 
 ## 4. FastAPI contract
@@ -243,9 +271,9 @@ bypass the backend.
 - [x] Premier League `season=2026` has been verified in the canonical model:
       20 teams, mappings, full fixtures, standings, and fixture-ID resolution.
 - [x] `app/live` normalisation, ID resolution, and their tests exist.
-- [ ] The async API-Football client reuses connections and the live interval is
+- [x] The async API-Football client reuses connections and the live interval is
       read from `LIVE_POLL_INTERVAL_SECONDS`.
-- [ ] A single central worker writes only current live state to the two Redis
+- [x] A single central worker writes only current live state to the two Redis
       key families and removes finished fixtures from the active set.
 - [ ] `GET /web/v1/live` reads Redis and returns a stable `LiveFixtureDTO`.
 - [ ] A minimal Next.js client polls FastAPI only and displays live score/status.

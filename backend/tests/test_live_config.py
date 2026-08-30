@@ -16,6 +16,7 @@ def test_live_settings_use_canonical_initial_defaults() -> None:
     settings = LiveSettings.from_environment({"REDIS_URL": "redis://localhost:6379/0"})
 
     assert settings.poll_interval_seconds == 25
+    assert settings.terminal_recheck_interval_seconds == 300
     assert settings.league_external_ids == (39,)
     assert settings.provider_live_parameter == "39"
     assert settings.redis_max_connections == 10
@@ -26,12 +27,14 @@ def test_live_settings_support_generic_multi_league_scope() -> None:
         {
             "REDIS_URL": "rediss://redis.example.test:6380/1",
             "LIVE_POLL_INTERVAL_SECONDS": "30",
+            "LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS": "600",
             "LIVE_LEAGUE_EXTERNAL_IDS": "39,2-140",
             "LIVE_REDIS_MAX_CONNECTIONS": "6",
         }
     )
 
     assert settings.poll_interval_seconds == 30
+    assert settings.terminal_recheck_interval_seconds == 600
     assert settings.league_external_ids == (39, 2, 140)
     assert settings.provider_live_parameter == "39-2-140"
     assert settings.redis_max_connections == 6
@@ -45,6 +48,13 @@ def test_live_settings_support_generic_multi_league_scope() -> None:
         (
             {"REDIS_URL": "redis://localhost", "LIVE_POLL_INTERVAL_SECONDS": "0"},
             "LIVE_POLL_INTERVAL_SECONDS",
+        ),
+        (
+            {
+                "REDIS_URL": "redis://localhost",
+                "LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS": "0",
+            },
+            "LIVE_TERMINAL_RECHECK_INTERVAL_SECONDS",
         ),
         (
             {"REDIS_URL": "redis://localhost", "LIVE_LEAGUE_EXTERNAL_IDS": "39,39"},
