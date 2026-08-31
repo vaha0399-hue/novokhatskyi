@@ -235,6 +235,31 @@ def map_statistics_block(block: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def classify_statistics_blocks(blocks: object) -> tuple[str, list[dict[str, Any]]]:
+    """Classify one fixture's team blocks without assuming their transport.
+
+    Both the single-fixture `/fixtures/statistics` endpoint and the batch
+    `/fixtures?ids=...` payload contain the same two-team statistics shape.
+    Keeping this function transport-neutral prevents drift between the two
+    import paths while retaining the no-half-pair invariant.
+    """
+    if not isinstance(blocks, list):
+        raise StatisticsContractError("statistics response must be an array")
+    results = len(blocks)
+    if results == 0:
+        return "empty", []
+    if results > 2:
+        raise StatisticsContractError("more than two statistics team blocks")
+    mapped = [map_statistics_block(item) for item in blocks if isinstance(item, Mapping)]
+    if len(mapped) != results:
+        raise StatisticsContractError("statistics team block is malformed")
+    ids = [item["external_team_id"] for item in mapped]
+    if len(ids) != len(set(ids)):
+        raise StatisticsContractError("duplicate statistics team")
+    # Internal IDs are checked by the caller; response IDs alone have no home/away flag.
+    return ("complete" if results == 2 else "partial"), mapped
+
+
 def classify_response(payload: Mapping[str, Any], target: FixtureTarget) -> tuple[str, list[dict[str, Any]]]:
     """Return complete/empty/partial or raise; no half-pair may be written."""
     if payload.get("parameters") != {"fixture": str(target.external_id)}:
@@ -255,18 +280,7 @@ def classify_response(payload: Mapping[str, Any], target: FixtureTarget) -> tupl
     total = paging.get("total") if isinstance(paging, Mapping) else None
     if type(current) is not int or type(total) is not int or current != 1 or total != 1:
         raise StatisticsContractError("statistics paging must be one page")
-    if results == 0:
-        return "empty", []
-    if results > 2:
-        raise StatisticsContractError("more than two statistics team blocks")
-    mapped = [map_statistics_block(item) for item in response if isinstance(item, Mapping)]
-    if len(mapped) != results:
-        raise StatisticsContractError("statistics team block is malformed")
-    ids = [item["external_team_id"] for item in mapped]
-    if len(ids) != len(set(ids)):
-        raise StatisticsContractError("duplicate statistics team")
-    # Internal IDs are checked by the caller; response IDs alone have no home/away flag.
-    return ("complete" if results == 2 else "partial"), mapped
+    return classify_statistics_blocks(response)
 
 
 def acquire_context_and_lock(
