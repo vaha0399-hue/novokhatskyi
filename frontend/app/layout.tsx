@@ -3,10 +3,11 @@ import type { Metadata } from "next";
 import { AppHeader } from "@/components/app-header";
 
 import "./globals.css";
+import "./auth.css";
 
 export const metadata: Metadata = {
-  title: "Football Analytics — Historical intelligence",
-  description: "Factual football analytics, match history and team comparisons.",
+  title: "FA — Sports Intelligence",
+  description: "Model-backed sports analytics, match insights and predictions.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

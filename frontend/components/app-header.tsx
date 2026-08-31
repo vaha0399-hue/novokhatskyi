@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { Brand } from "@/components/brand";
@@ -8,8 +9,23 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type Identity = { email: string | null } | null;
 
+const primaryNavigation = [
+  { href: "/matches", label: "Матчи", activePrefixes: ["/matches", "/fixtures"] },
+  { href: "/leagues", label: "Лиги", activePrefixes: ["/leagues"] },
+  { href: "/analytics", label: "Аналитика", activePrefixes: ["/analytics", "/teams"] },
+  { href: "/predictions", label: "Прогнозы", activePrefixes: ["/predictions"] },
+  { href: "/favorites", label: "Избранное", activePrefixes: ["/favorites"] },
+] as const;
+
+function isActiveSection(pathname: string, prefixes: readonly string[]): boolean {
+  return prefixes.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+}
+
 export function AppHeader() {
   const [identity, setIdentity] = useState<Identity>(null);
+  const pathname = usePathname();
 
   useEffect(() => {
     const supabase = getSupabaseBrowserClient();
@@ -34,9 +50,20 @@ export function AppHeader() {
     <header className="site-header">
       <div className="shell nav-shell">
         <Brand />
-        <nav className="main-nav" aria-label="Primary navigation">
-          <Link href="/">Discover</Link>
-          <a href="#methodology">Methodology</a>
+        <nav className="main-nav" aria-label="Основная навигация" lang="ru">
+          {primaryNavigation.map((item) => {
+            const active = isActiveSection(pathname, item.activePrefixes);
+            return (
+              <Link
+                aria-current={active ? "page" : undefined}
+                className={`main-nav-link${active ? " main-nav-link-active" : ""}`}
+                href={item.href}
+                key={item.href}
+              >
+                {item.label}
+              </Link>
+            );
+          })}
         </nav>
         <div className="nav-account">
           {identity ? (
