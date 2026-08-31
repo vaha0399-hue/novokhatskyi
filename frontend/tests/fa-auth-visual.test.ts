@@ -70,3 +70,13 @@ test("all auth entry routes use the shared FA visual experience", async () => {
   assert.match(forgot, /FAAuthExperience initialView="forgot"/);
   assert.match(update, /FAAuthFrame view="update"/);
 });
+
+test("successful default authentication enters the main Matches section", async () => {
+  const experience = await source("../components/fa-auth-experience.tsx");
+  const forms = await source("../components/auth-forms.tsx");
+  const routes = await source("../lib/routes.ts");
+
+  assert.match(experience, /nextPath = "\/matches"/);
+  assert.equal((forms.match(/nextPath = "\/matches"/g) ?? []).length, 2);
+  assert.match(routes, /fallback = "\/matches"/);
+});

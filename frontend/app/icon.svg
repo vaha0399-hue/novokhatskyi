@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="ring" x1="9" y1="7" x2="55" y2="57" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#438bff"/>
+      <stop offset="0.58" stop-color="#f6f8ff"/>
+      <stop offset="1" stop-color="#ff526e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#030813"/>
+  <circle cx="32" cy="32" r="23" fill="none" stroke="url(#ring)" stroke-width="2"/>
+  <circle cx="32" cy="32" r="18" fill="#07101f" stroke="#2d7dff" stroke-opacity=".45"/>
+  <text x="32" y="37" fill="#f5f7fc" font-family="Arial, sans-serif" font-size="15" font-weight="900" text-anchor="middle">FA</text>
+</svg>

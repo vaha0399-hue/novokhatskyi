@@ -18,7 +18,7 @@ type InteractiveView = "signin" | "signup" | "forgot" | "success";
 
 export function FAAuthExperience({
   initialView,
-  nextPath = "/account",
+  nextPath = "/matches",
   initialMessage = null,
 }: {
   initialView: Exclude<InteractiveView, "success">;

@@ -9,7 +9,7 @@ test("safeNextPath accepts local destinations only", () => {
 });
 
 test("safeNextPath rejects external and control-character redirect attempts", () => {
-  assert.equal(safeNextPath("//evil.example"), "/account");
-  assert.equal(safeNextPath("/\\evil.example"), "/account");
-  assert.equal(safeNextPath("/account\r\nLocation: https://evil.example"), "/account");
+  assert.equal(safeNextPath("//evil.example"), "/matches");
+  assert.equal(safeNextPath("/\\evil.example"), "/matches");
+  assert.equal(safeNextPath("/account\r\nLocation: https://evil.example"), "/matches");
 });

@@ -10,16 +10,17 @@ test("global navigation exposes the approved product sections", async () => {
   const header = await source("../components/app-header.tsx");
 
   for (const [href, label] of [
-    ["/matches", "Матчи"],
-    ["/leagues", "Лиги"],
-    ["/analytics", "Аналитика"],
-    ["/predictions", "Прогнозы"],
-    ["/favorites", "Избранное"],
+    ["/matches", "Matches"],
+    ["/leagues", "Leagues"],
+    ["/analytics", "Signals"],
+    ["/predictions", "Predictions"],
+    ["/account", "Profile"],
   ]) {
     assert.match(header, new RegExp(`href: "${href}".*label: "${label}"`));
   }
-  assert.match(header, /aria-label="Основная навигация"/);
-  assert.match(header, /lang="ru"/);
+  assert.match(header, /aria-label="Primary navigation"/);
+  assert.match(header, /aria-label="Mobile navigation"/);
+  assert.doesNotMatch(header, /badge:\s*12/);
 });
 
 test("navigation reports the current product section accessibly", async () => {
@@ -30,14 +31,37 @@ test("navigation reports the current product section accessibly", async () => {
   assert.match(header, /pathname\.startsWith\(`\$\{prefix\}\/`\)/);
 });
 
-test("mobile navigation remains visible and horizontally scrollable", async () => {
+test("desktop and fixed mobile navigation follow the approved breakpoint", async () => {
   const styles = await source("../app/globals.css");
 
-  assert.match(styles, /@media \(max-width: 760px\)/);
-  assert.match(styles, /\.main-nav \{[^}]*overflow-x: auto;/s);
-  assert.match(styles, /scroll-snap-type: x proximity/);
-  assert.match(styles, /\.main-nav-link \{[^}]*min-height: 45px;/s);
-  assert.doesNotMatch(styles, /\.main-nav \{ display: none; \}/);
+  assert.match(styles, /--fa-header-height: 76px/);
+  assert.match(styles, /--fa-desktop-nav-height: 59px/);
+  assert.match(styles, /--fa-content-max: 1320px/);
+  assert.match(styles, /@media \(max-width: 650px\)/);
+  assert.match(styles, /\.fa-desktop-nav \{ display: none; \}/);
+  assert.match(styles, /\.fa-mobile-nav \{[^}]*position: fixed;/s);
+  assert.match(styles, /env\(safe-area-inset-bottom\)/);
+  assert.match(styles, /grid-template-columns: repeat\(5, 1fr\)/);
+  assert.match(styles, /\.fa-mobile-nav-link \{[^}]*min-height: 62px;/s);
+  assert.match(styles, /@media \(max-width: 365px\)/);
+});
+
+test("header includes accessible search, notifications and routed profile controls", async () => {
+  const header = await source("../components/app-header.tsx");
+
+  assert.match(header, /placeholder="Find a match, league or team"/);
+  assert.match(header, /label="Open search"/);
+  assert.match(header, /event\.key === "Escape"/);
+  assert.match(header, /label="Notifications"/);
+  assert.match(header, /const profileHref = identity \? "\/account" : "\/login\?next=\/account"/);
+  assert.match(header, /aria-current=\{active \? "page" : undefined\}/);
+});
+
+test("auth pages hide the permanent application navigation shell", async () => {
+  const authStyles = await source("../app/auth.css");
+
+  assert.match(authStyles, /> \.fa-desktop-nav/);
+  assert.match(authStyles, /> \.fa-mobile-nav/);
 });
 
 test("candidate palette values are not promoted during menu preview", async () => {

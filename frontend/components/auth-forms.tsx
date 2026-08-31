@@ -26,7 +26,7 @@ function missingConfig(): string {
 }
 
 export function SignInForm({
-  nextPath = "/account",
+  nextPath = "/matches",
   initialMessage = null,
   email = "",
   setEmail,
@@ -97,7 +97,7 @@ export function SignInForm({
 }
 
 export function SignUpForm({
-  nextPath = "/account",
+  nextPath = "/matches",
   email = "",
   setEmail,
   onSuccess,
@@ -283,7 +283,7 @@ export function LogoutButton() {
     try {
       const { error } = await supabase.auth.signOut();
       if (error) return setMessage(error.message);
-      router.replace("/");
+      router.replace("/login");
       router.refresh();
     } catch {
       setMessage("Sign out is temporarily unavailable. Please try again.");

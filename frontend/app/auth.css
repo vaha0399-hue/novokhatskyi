@@ -5,6 +5,9 @@
 }
 
 .site-frame:has(.fa-auth-experience) > .site-header,
+.site-frame:has(.fa-auth-experience) > .fa-desktop-nav,
+.site-frame:has(.fa-auth-experience) > .fa-mobile-nav,
+.site-frame:has(.fa-auth-experience) > .fa-shell-grid,
 .site-frame:has(.fa-auth-experience) > .site-footer {
   display: none;
 }

@@ -61,7 +61,7 @@ test("sign out redirects only after Supabase accepts the request", async () => {
   const logout = exportedSection(source, "LogoutButton");
   const signOutCall = logout.indexOf("await supabase.auth.signOut()");
   const errorGuard = logout.indexOf("if (error) return setMessage(error.message)");
-  const redirect = logout.indexOf('router.replace("/")');
+  const redirect = logout.indexOf('router.replace("/login")');
 
   assert.ok(signOutCall >= 0);
   assert.ok(errorGuard > signOutCall);

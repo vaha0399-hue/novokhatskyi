@@ -18,9 +18,9 @@ export default async function LeaguesPage() {
   return (
     <section className="shell section page-intro">
       <p className="eyebrow"><span /> Competitions</p>
-      <h1>Лиги</h1>
+      <h1>Leagues</h1>
       {unavailable ? (
-        <p>Источник данных временно недоступен.</p>
+        <p>The data source is temporarily unavailable.</p>
       ) : (
         <div className="league-grid">
           {leagues.map((league) => (

@@ -14,9 +14,10 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html lang="en">
       <body>
-        <div className="site-frame">
+        <div className="site-frame fa-shell">
+          <div className="fa-shell-grid" aria-hidden="true" />
           <AppHeader />
-          <main>{children}</main>
+          <main className="fa-content-slot">{children}</main>
           <footer className="site-footer">
             <div className="shell footer-inner">
               <span>Football Analytics</span>
