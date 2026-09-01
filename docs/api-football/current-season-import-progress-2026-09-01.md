@@ -22,8 +22,11 @@ the human-readable checkpoint, not a replacement for database provenance.
 | 40 | Championship | 2026 | Imported | 24 | 552 | 44 / 508 | 88 | Explicit England/Wales team-country policy for Cardiff, Swansea and Wrexham. |
 | 41 | League One | 2026 | Not ready | — | — | — | — | One fixture is `PST` (Oxford United—Reading); no canonical data written pending explicit postponed/reschedule lifecycle support. |
 | 88 | Eredivisie | 2026 | Imported | 18 | 306 | 33 / 273 | 66 | Complete regular-season calendar. |
+| 89 | Eerste Divisie | 2026 | Not ready | — | — | — | — | Provider standings contain multiple groups; no canonical data written pending an explicit multi-group policy. |
 | 106 | Ekstraklasa | 2026 | Imported | 18 | 306 | 47 / 259 | 94 | Complete regular-season calendar. |
 | 203 | Süper Lig | 2026 | Imported | 18 | 306 | 27 / 279 | 54 | Complete regular-season calendar. |
+| 204 | 1. Lig | 2026 | Imported | 20 | 380 | 44 / 336 | 88 | Complete regular-season calendar. |
+| 235 | Russian Premier League | 2026 | Not ready | — | — | — | — | Provider schedule has a duplicate directed pairing; no canonical data written without a reviewed correction. |
 | 307 | Saudi Pro League | 2026 | Not ready | — | — | — | — | Provider labels Al Khaleej Saihat as United-Arab-Emirates while the league is Saudi-Arabia; no canonical data written. |
 | 94 | Primeira Liga | 2026 | Not ready | — | — | — | — | One fixture is `PST` (Braga—Gil Vicente); no canonical data written pending explicit postponed/reschedule lifecycle support. |
 
