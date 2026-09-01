@@ -90,3 +90,19 @@ It remains eligible for a later retry because no synthetic zero pair is stored.
 - fewer than 5/10 matches;
 - bulk UPSERT/rerun idempotency and raw provenance bindings;
 - incremental recomputation limited to affected teams.
+
+## Verified checkpoint — 2026-09-01
+
+- Remote migration history is aligned through `20260831224435`; the
+  historical-lineups schema was already present and was history-repaired
+  without DDL.
+- A real API-Football canary returned 19/19 requested EPL fixtures, all `FT`,
+  with two statistics blocks per fixture.
+- The bounded EPL 2026/27 write smoke used two provider requests (discovery +
+  one batch), normalized 20 fixtures, wrote 40 team-statistics rows, and
+  recalculated 120 rolling rows for 20 teams.
+- A rerun used one discovery request, zero batch requests, and wrote zero new
+  statistics rows; duplicate statistics and rolling-metric keys were zero.
+- The first pre-fix smoke fetch remains as retained raw evidence and is marked
+  `provider_error`; no canonical or raw payload rows were deleted.
+- No multi-league or 100--500 league backfill was started.
