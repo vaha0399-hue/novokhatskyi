@@ -123,6 +123,7 @@ class ActiveSeasonScope:
     season_start_year: int
     expected_fixture_count: int
     fixture_overrides: tuple[ActiveFixtureOverride, ...] = ()
+    additional_team_country_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         SeasonBackfillScope(
@@ -134,6 +135,8 @@ class ActiveSeasonScope:
             self.fixture_overrides
         ):
             raise ValueError("active season fixture overrides must have unique fixture IDs")
+        if any(not isinstance(country, str) or not country.strip() for country in self.additional_team_country_names):
+            raise ValueError("active season additional team countries must be non-empty strings")
 
     @property
     def season_scope(self) -> SeasonBackfillScope:
@@ -193,6 +196,12 @@ LIGUE_1_2026_FIXTURE_OVERRIDES: tuple[ActiveFixtureOverride, ...] = (
         reason="provider duplicates Rennes--PSG; reviewed source confirms PSG--Rennes",
     ),
 )
+
+
+# The 2026/27 English Championship catalog includes Cardiff, Swansea and
+# Wrexham. The provider identifies those three clubs as Wales; that is a
+# reviewed competition policy, not a relaxation for every English league.
+ENGLISH_CHAMPIONSHIP_2026_ADDITIONAL_TEAM_COUNTRIES = frozenset({"Wales"})
 
 
 @dataclass(frozen=True)
@@ -452,7 +461,12 @@ def validate_base_responses(collected: Sequence[CollectedBaseResponse], *, scope
         _validate_envelope(by_endpoint[endpoint])
     league = _league_record(by_endpoint["/leagues"].response.data, scope)  # type: ignore[arg-type]
     coverage = validate_season_coverage_response(by_endpoint["/leagues"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/leagues"].response.raw_body).digest(), external_league_id=scope.league_external_id, external_season=scope.season_start_year)
-    catalog = _team_records(by_endpoint["/teams"].response.data, scope, league.country_name)  # type: ignore[arg-type]
+    catalog = _team_records(
+        by_endpoint["/teams"].response.data,
+        scope,
+        league.country_name,
+        additional_team_country_names=scope.additional_team_country_names,
+    )  # type: ignore[arg-type]
     standings, standing_ids = _validate_standings(by_endpoint["/standings"].response.data, scope, {team.external_id for team in catalog})  # type: ignore[arg-type]
     if len(catalog) != scope.expected_team_count or {team.external_id for team in catalog} != standing_ids:
         raise ActiveSeasonImportError("active season team catalog and standings membership differ")

@@ -308,10 +308,18 @@ def _league_record(payload: Mapping[str, Any], scope: BootstrapScope) -> LeagueR
     )
 
 
-def _team_records(payload: Mapping[str, Any], scope: BootstrapScope, country_name: str) -> tuple[TeamRecord, ...]:
+def _team_records(
+    payload: Mapping[str, Any],
+    scope: BootstrapScope,
+    country_name: str,
+    *,
+    additional_team_country_names: frozenset[str] = frozenset(),
+) -> tuple[TeamRecord, ...]:
     response = payload["response"]
     records: list[TeamRecord] = []
     seen: set[int] = set()
+    allowed_country_names = {country_name.casefold()}
+    allowed_country_names.update(item.casefold() for item in additional_team_country_names)
     for item in response:
         if not isinstance(item, Mapping) or not isinstance(item.get("team"), Mapping):
             raise SeasonBootstrapError("/teams item must contain a team object")
@@ -324,7 +332,7 @@ def _team_records(payload: Mapping[str, Any], scope: BootstrapScope, country_nam
             raise SeasonBootstrapError("/teams contains a duplicate provider team ID")
         seen.add(external_id)
         team_country = _require_string(team.get("country"), "team.country")
-        if team_country.casefold() != country_name.casefold():
+        if team_country.casefold() not in allowed_country_names:
             raise SeasonBootstrapError("team country does not match league country")
         founded = _optional_nonnegative_int(team.get("founded"), "team.founded")
         if founded is not None and founded < 1800:

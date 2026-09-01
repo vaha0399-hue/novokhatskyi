@@ -190,6 +190,28 @@ def test_active_season_rejects_an_override_when_its_source_contract_changes() ->
         validate_base_responses(collected, scope=scope)
 
 
+def test_active_season_allows_an_explicit_additional_team_country() -> None:
+    collected = list(_collected())
+    teams = copy.deepcopy(collected[1].response.data)
+    teams["response"][0]["team"]["country"] = "Wales"
+    scope = ActiveSeasonScope(
+        league_external_id=39,
+        season_start_year=2026,
+        expected_fixture_count=380,
+        additional_team_country_names=frozenset({"Wales"}),
+    )
+    collected[1] = CollectedBaseResponse(
+        request=collected[1].request,
+        response=_response(teams),
+        request_started_at=collected[1].request_started_at,
+        response_received_at=collected[1].response_received_at,
+    )
+
+    validated = validate_base_responses(collected, scope=scope)
+
+    assert len(validated.teams) == 20
+
+
 def test_saved_canary_replay_artifacts_match_the_requested_scope() -> None:
     scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
 
