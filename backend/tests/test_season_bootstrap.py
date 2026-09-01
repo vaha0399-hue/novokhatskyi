@@ -126,6 +126,25 @@ def test_retained_epl_2025_contract_validates_as_a_completed_season_bootstrap() 
     assert {status.status_code for status in validated.statuses} == {"FT"}
 
 
+def test_team_founded_zero_is_normalized_as_unknown() -> None:
+    scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
+    collected = list(_collected())
+    teams = copy.deepcopy(collected[1].response.data)
+    target = teams["response"][0]["team"]
+    target["founded"] = 0
+    collected[1] = CollectedBaseResponse(
+        request=collected[1].request,
+        response=_response(teams),
+        request_started_at=collected[1].request_started_at,
+        response_received_at=collected[1].response_received_at,
+    )
+
+    validated = validate_base_responses(collected, scope=scope)
+
+    record = next(item for item in validated.teams if item.external_id == target["id"])
+    assert record.founded_year is None
+
+
 def test_reviewed_raw_only_playoff_projection_preserves_regular_season_contract() -> None:
     scope = _projected_scope()
 

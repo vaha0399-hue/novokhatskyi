@@ -335,7 +335,11 @@ def _team_records(
         if team_country.casefold() not in allowed_country_names:
             raise SeasonBootstrapError("team country does not match league country")
         founded = _optional_nonnegative_int(team.get("founded"), "team.founded")
-        if founded is not None and founded < 1800:
+        # API-Football uses 0 as an unknown founding year for some otherwise
+        # valid clubs (for example Estrela in Primeira Liga 2026/27).
+        if founded == 0:
+            founded = None
+        elif founded is not None and founded < 1800:
             raise SeasonBootstrapError("team.founded is below the canonical minimum")
         national = team.get("national")
         if not isinstance(national, bool):
