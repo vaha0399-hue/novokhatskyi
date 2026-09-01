@@ -97,6 +97,26 @@ def test_active_season_rejects_ns_with_a_result_before_dml() -> None:
         validate_base_responses(collected, scope=scope)
 
 
+def test_active_season_treats_provider_zero_venue_id_as_unmapped() -> None:
+    scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
+    collected = list(_collected())
+    fixtures = copy.deepcopy(collected[3].response.data)
+    fixture = fixtures["response"][0]
+    fixture["fixture"]["venue"]["id"] = 0
+    external_fixture_id = fixture["fixture"]["id"]
+    collected[3] = CollectedBaseResponse(
+        request=collected[3].request,
+        response=_response(fixtures),
+        request_started_at=collected[3].request_started_at,
+        response_received_at=collected[3].response_received_at,
+    )
+
+    validated = validate_base_responses(collected, scope=scope)
+
+    record = next(item for item in validated.fixtures if item.external_id == external_fixture_id)
+    assert record.venue_external_id is None
+
+
 def test_saved_canary_replay_artifacts_match_the_requested_scope() -> None:
     scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
 

@@ -283,6 +283,11 @@ def _active_fixture_records(
         if not isinstance(venue, Mapping):
             raise ActiveSeasonImportError("fixture venue must be an object or null")
         venue_id = venue.get("id")
+        # API-Football uses the numeric sentinel 0 for a fixture venue with no
+        # resolvable provider ID (Bundesliga 2026 is one observed example).
+        # It must not become a fictitious source.venue_provider_refs mapping.
+        if venue_id == 0:
+            venue_id = None
         record = ActiveFixtureRecord(
             external_id=external_id, home_external_id=home_id, away_external_id=away_id,
             venue_external_id=None if venue_id is None else _required_positive(venue_id, "fixture.venue.id"),
