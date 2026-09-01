@@ -1,0 +1,19 @@
+[Unit]
+Description=Football Analytics completed-fixture statistics worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=football-analytics
+Group=football-analytics
+WorkingDirectory=/opt/football-analytics
+EnvironmentFile=/opt/football-analytics/.env
+Environment=INCREMENTAL_STATISTICS_SCOPES=39:2026
+Environment=INCREMENTAL_STATISTICS_INTERVAL_SECONDS=900
+Environment=UV_CACHE_DIR=/var/cache/football-analytics
+CacheDirectory=football-analytics
+ExecStart=/usr/local/bin/uv run --directory backend python -m app.importer.incremental_statistics
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict

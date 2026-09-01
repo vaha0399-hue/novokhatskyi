@@ -119,6 +119,17 @@ def test_real_completed_fixture_discovery_is_strict_and_keeps_final_scores() -> 
     assert (records[0].home_goals, records[0].away_goals) == (4, 2)
 
 
+def test_non_terminal_discovery_entry_is_rejected_before_canonical_projection() -> None:
+    payload = json.loads(DISCOVERY_SAMPLE.read_text())
+    payload["response"][0]["fixture"]["status"]["short"] = "PST"
+
+    with pytest.raises(StatisticsContractError, match="non-terminal status"):
+        _completed_discovery_entries(
+            payload,
+            scope=CurrentSeasonStatisticsScope(league_external_id=39, season_start_year=2025),
+        )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

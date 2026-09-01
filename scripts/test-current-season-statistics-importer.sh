@@ -49,7 +49,8 @@ for migration in \
   "$ROOT_DIR/supabase/migrations/20260822210000_multi_competition_foundation.sql" \
   "$ROOT_DIR/supabase/migrations/20260823010000_historical_lineups_foundation.sql" \
   "$ROOT_DIR/supabase/migrations/20260829010000_sync_control_plane_foundation.sql" \
-  "$ROOT_DIR/supabase/migrations/20260831224435_batch_fixture_statistics_and_rolling_metrics.sql"; do
+  "$ROOT_DIR/supabase/migrations/20260831224435_batch_fixture_statistics_and_rolling_metrics.sql" \
+  "$ROOT_DIR/supabase/migrations/20260901085117_finalize_completed_season_fixture.sql"; do
   psql_db -f "$migration" >/dev/null
 done
 

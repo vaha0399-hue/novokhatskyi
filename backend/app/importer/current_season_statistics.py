@@ -63,6 +63,8 @@ class CurrentSeasonStatisticsScope:
     season_start_year: int
     max_requests: int = DEFAULT_MAX_REQUESTS
     daily_request_cap: int = DEFAULT_DAILY_REQUEST_CAP
+    require_finalized_results: bool = False
+    project_discovery: bool = True
 
     def __post_init__(self) -> None:
         if self.league_external_id <= 0:
@@ -281,7 +283,10 @@ def _context(conn: Connection[Any], scope: CurrentSeasonStatisticsScope) -> tupl
     return int(row[0]), int(row[1])
 
 
-def load_completed_targets(conn: Connection[Any], *, provider_id: int, season_id: int) -> tuple[FixtureTarget, ...]:
+def load_completed_targets(
+    conn: Connection[Any], *, provider_id: int, season_id: int,
+    require_finalized_results: bool = False,
+) -> tuple[FixtureTarget, ...]:
     """Load canonical completed fixtures; malformed partial statistics stop safely."""
     rows = conn.execute(
         """SELECT fixture.id, fixture_ref.external_id, fixture.home_team_id, fixture.away_team_id,
@@ -299,9 +304,10 @@ def load_completed_targets(conn: Connection[Any], *, provider_id: int, season_id
            WHERE fixture.season_id=%s
              AND fixture.lifecycle_state='completed'
              AND fixture.result_available_at IS NOT NULL
+             AND (%s = FALSE OR fixture.result_finalized_at IS NOT NULL)
            GROUP BY fixture.id, fixture_ref.external_id, home_ref.external_id, away_ref.external_id
            ORDER BY fixture.kickoff_at DESC, fixture.id DESC""",
-        (provider_id, provider_id, provider_id, season_id),
+        (provider_id, provider_id, provider_id, season_id, require_finalized_results),
     ).fetchall()
     targets: list[FixtureTarget] = []
     for row in rows:
@@ -478,9 +484,9 @@ def _completed_discovery_entries(
 
 
 def _normalize_completed_discovery(
-    conn: Connection[Any], *, provider_id: int, season_id: int, records: Sequence[DiscoveryFixture], fetch: BatchFetch
+    conn: Connection[Any], *, provider_id: int, season_id: int, records: Sequence[DiscoveryFixture], fetch: BatchFetch,
 ) -> None:
-    """Update only existing canonical fixtures after a strict completed-season discovery.
+    """Finalize only eligible canonical fixtures after terminal discovery.
 
     The active-season importer remains responsible for creating schedules and
     participant mappings.  An unknown provider fixture is intentionally a
@@ -505,6 +511,8 @@ def _normalize_completed_discovery(
     canonical_completed = {int(external_id) for external_id, row in canonical.items() if row[4] == "completed"}
     if not canonical_completed.issubset(remote_ids):
         raise CurrentSeasonStatisticsError("provider completed discovery regressed a canonical completed fixture")
+    bindings: list[tuple[int, int]] = []
+    eligible_records: list[DiscoveryFixture] = []
     for record in records:
         existing = canonical.get(record.external_fixture_id)
         if existing is None:
@@ -518,6 +526,7 @@ def _normalize_completed_discovery(
         identity = (int(home_external), int(away_external), kickoff_at)
         if identity != (record.home_external_team_id, record.away_external_team_id, record.kickoff_at):
             raise CurrentSeasonStatisticsError("provider completed fixture identity conflicts with canonical schedule")
+        bindings.append((fetch.fetch_id, int(fixture_id)))
         result = (
             record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals,
             record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals,
@@ -527,24 +536,38 @@ def _normalize_completed_discovery(
         if finalized_at is not None:
             if lifecycle_state != "completed" or existing_result != result:
                 raise CurrentSeasonStatisticsError("provider completed fixture conflicts with an immutable result")
+            eligible_records.append(record)
             continue
-        conn.execute(
-            """UPDATE football.fixtures SET
-                    lifecycle_state='completed',home_goals=%s,away_goals=%s,
-                    home_halftime_goals=%s,away_halftime_goals=%s,home_fulltime_goals=%s,away_fulltime_goals=%s,
-                    home_extratime_goals=%s,away_extratime_goals=%s,home_penalty_goals=%s,away_penalty_goals=%s,
-                    terminal_status_observed_at=%s,result_available_at=%s,availability_basis='observed',
-                    last_seen_at=greatest(last_seen_at,%s),last_source_fetch_id=%s
-                WHERE id=%s""",
-            (*result, fetch.response_received_at, fetch.response_received_at, fetch.response_received_at, fetch.fetch_id, fixture_id),
+        if fetch.response_received_at < kickoff_at + timedelta(hours=3):
+            continue
+        eligible_records.append(record)
+    with conn.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO source.provider_fetch_fixture_subjects(fetch_id,fixture_id) VALUES(%s,%s)",
+            bindings,
         )
-    _upsert_completed_provider_statuses(
-        conn,
-        provider_id=provider_id,
-        season_id=season_id,
-        records=records,
-        fetch=fetch,
-    )
+    for record in eligible_records:
+        fixture_id = int(canonical[record.external_fixture_id][0])
+        conn.execute(
+            """SELECT ops.finalize_season_discovery_fixture_result(
+                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+               )""",
+            (
+                fixture_id, fetch.fetch_id, record.home_goals, record.away_goals,
+                record.home_halftime_goals, record.away_halftime_goals,
+                record.home_fulltime_goals, record.away_fulltime_goals,
+                record.home_extratime_goals, record.away_extratime_goals,
+                record.home_penalty_goals, record.away_penalty_goals,
+            ),
+        )
+    if eligible_records:
+        _upsert_completed_provider_statuses(
+            conn,
+            provider_id=provider_id,
+            season_id=season_id,
+            records=eligible_records,
+            fetch=fetch,
+        )
 
 
 def _upsert_completed_provider_statuses(
@@ -901,24 +924,28 @@ async def run_current_season_statistics_backfill_async(
                         stopped = "provider_api_error"; errors.append(type(error).__name__); return None
                 return None
 
-            discovery = await request(params=_discovery_params(scope), kind="discovery")
-            if discovery is not None:
-                try:
-                    discovery_records = _completed_discovery_entries(discovery.response.data, scope=scope)
-                    # Raw evidence was committed before parsing.  Canonical
-                    # fixture changes and the normalized marker, however, are
-                    # one all-or-nothing transition for this discovery body.
-                    with conn.transaction():
-                        _normalize_completed_discovery(
-                            conn, provider_id=provider_id, season_id=season_id, records=discovery_records, fetch=discovery
-                        )
-                        conn.execute("UPDATE source.provider_fetches SET normalized_at=clock_timestamp() WHERE id=%s", (discovery.fetch_id,))
-                except (StatisticsContractError, CurrentSeasonStatisticsError) as error:
-                    _mark_contract_error(conn, discovery.fetch_id)
-                    errors.append(str(error)); stopped = "completed_fixture_discovery_error"
+            if scope.project_discovery:
+                discovery = await request(params=_discovery_params(scope), kind="discovery")
+                if discovery is not None:
+                    try:
+                        discovery_records = _completed_discovery_entries(discovery.response.data, scope=scope)
+                        # Raw evidence was committed before parsing.  Canonical
+                        # fixture changes and the normalized marker, however,
+                        # are one all-or-nothing transition for this discovery body.
+                        with conn.transaction():
+                            _normalize_completed_discovery(
+                                conn, provider_id=provider_id, season_id=season_id, records=discovery_records, fetch=discovery,
+                            )
+                            conn.execute("UPDATE source.provider_fetches SET normalized_at=clock_timestamp() WHERE id=%s", (discovery.fetch_id,))
+                    except (StatisticsContractError, CurrentSeasonStatisticsError) as error:
+                        _mark_contract_error(conn, discovery.fetch_id)
+                        errors.append(str(error)); stopped = "completed_fixture_discovery_error"
 
             if stopped is None:
-                discovered_targets = load_completed_targets(conn, provider_id=provider_id, season_id=season_id)
+                discovered_targets = load_completed_targets(
+                    conn, provider_id=provider_id, season_id=season_id,
+                    require_finalized_results=scope.require_finalized_results,
+                )
                 selected_history = select_recent_history(discovered_targets)
                 selected = tuple(target for target in selected_history if not target.statistics_complete)
                 for batch in chunk_fixture_targets(selected):
@@ -931,24 +958,30 @@ async def run_current_season_statistics_backfill_async(
                         parsed = _batch_entries(
                             fetched.response.data, targets=batch, league_external_id=scope.league_external_id
                         )
-                        _bind_returned_fixture_subjects(
-                            conn, fetch_id=fetched.fetch_id, returned_fixture_ids=parsed.returned_fixture_ids, targets=batch
-                        )
-                        rows, teams, skipped_in_batch = _statistics_rows(
-                            parsed=parsed.statistics_by_fixture, targets=batch, fetch=fetched
-                        )
-                        written += bulk_upsert_statistics(conn, rows=rows)
+                        # Provenance, statistics, rolling materialization, and
+                        # the normalized marker form one retry-safe batch
+                        # boundary.  A metrics failure must not leave a
+                        # statistics pair that a later run will incorrectly
+                        # treat as complete.
+                        with conn.transaction():
+                            _bind_returned_fixture_subjects(
+                                conn, fetch_id=fetched.fetch_id, returned_fixture_ids=parsed.returned_fixture_ids, targets=batch
+                            )
+                            rows, teams, skipped_in_batch = _statistics_rows(
+                                parsed=parsed.statistics_by_fixture, targets=batch, fetch=fetched
+                            )
+                            written += bulk_upsert_statistics(conn, rows=rows)
+                            if teams:
+                                bulk_upsert_rolling_metrics(conn, season_id=season_id, team_ids=teams, now=clock())
+                            conn.execute("UPDATE source.provider_fetches SET normalized_at=clock_timestamp() WHERE id=%s", (fetched.fetch_id,))
                         normalized += sum(blocks is not None for blocks in parsed.statistics_by_fixture.values())
                         skipped += skipped_in_batch
                         aggregate_teams.update(teams)
-                        conn.execute("UPDATE source.provider_fetches SET normalized_at=clock_timestamp() WHERE id=%s", (fetched.fetch_id,))
                     except StatisticsContractError as error:
                         _mark_contract_error(conn, fetched.fetch_id)
                         errors.append(str(error)); stopped = "statistics_contract_error"; break
             # Season-to-date rows are intentionally withheld: this slice fetches
             # a last-ten union, not a full season statistics history.
-            if aggregate_teams:
-                bulk_upsert_rolling_metrics(conn, season_id=season_id, team_ids=aggregate_teams, now=clock())
             return CurrentSeasonStatisticsReport(
                 league_external_id=scope.league_external_id, season_start_year=scope.season_start_year,
                 fixtures_discovered=len(discovered_targets), unique_fixtures_selected=len(selected),

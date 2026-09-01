@@ -1,7 +1,7 @@
 import json
 import os
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -170,7 +170,7 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
                    (SELECT count(*) FROM football.team_rolling_metrics WHERE season_id=(SELECT season_id FROM source.season_provider_refs WHERE external_season=2024))"""
         ).fetchone()
         assert fetch_id is not None
-        assert (raw_count, memberships, rows, metric_rows) == (6, 100, 200, 120)
+        assert (raw_count, memberships, rows, metric_rows) == (6, 480, 200, 120)
         assert conn.execute(
             """SELECT count(*) FROM football.fixture_team_statistics statistics
                JOIN source.provider_fetches provider_fetch ON provider_fetch.id=statistics.last_source_fetch_id
@@ -254,8 +254,8 @@ def test_discovery_advances_scheduled_ns_status_with_fixture_lifecycle(
     assert (report.fixture_discovery_requests, report.batch_requests, report.statistics_rows_written) == (1, 1, 2)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         assert conn.execute(
-            "SELECT lifecycle_state::text,home_goals,away_goals FROM football.fixtures WHERE id=%s", (fixture_id,)
-        ).fetchone() == ("completed", 1, 0)
+            "SELECT lifecycle_state::text,home_goals,away_goals,result_finalized_at IS NOT NULL FROM football.fixtures WHERE id=%s", (fixture_id,)
+        ).fetchone() == ("completed", 1, 0, True)
         assert conn.execute(
             """SELECT status.status_code,provider_fetch.endpoint,provider_fetch.purpose::text
                FROM source.fixture_provider_status status
@@ -263,6 +263,87 @@ def test_discovery_advances_scheduled_ns_status_with_fixture_lifecycle(
                WHERE status.provider_id=%s AND status.fixture_id=%s""",
             (provider_id, fixture_id),
         ).fetchone() == ("FT", "/fixtures", "scheduled_refresh")
+
+
+def test_terminal_discovery_before_three_hour_window_keeps_fixture_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    monkeypatch.setenv("SUPABASE_DB_URL", TEST_DB_URL)
+    kickoff = datetime(2027, 8, 7, 15, tzinfo=UTC)
+    observed_at = kickoff + timedelta(hours=2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
+        provider_id, league_id = conn.execute(
+            """SELECT provider.id,league_ref.league_id FROM source.providers provider
+               JOIN source.league_provider_refs league_ref ON league_ref.provider_id=provider.id
+               WHERE provider.code='api-football' AND league_ref.external_id='39'"""
+        ).fetchone()
+        season_id = conn.execute(
+            "INSERT INTO football.seasons(league_id,start_year,label) VALUES(%s,2027,'2027/28') RETURNING id",
+            (league_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO source.season_provider_refs(provider_id,league_external_id,external_season,season_id) VALUES(%s,'39',2027,%s)",
+            (provider_id, season_id),
+        )
+        (home_team_id, home_external_id), (away_team_id, away_external_id) = conn.execute(
+            "SELECT team_id,external_id FROM source.team_provider_refs WHERE provider_id=%s ORDER BY team_id LIMIT 2",
+            (provider_id,),
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO football.season_teams(season_id,team_id) VALUES(%s,%s),(%s,%s)",
+            (season_id, home_team_id, season_id, away_team_id),
+        )
+        seed_time = kickoff - timedelta(days=7)
+        seed_fetch_id = conn.execute(
+            """INSERT INTO source.provider_fetches(
+                   provider_id,endpoint,request_params,purpose,request_started_at,response_received_at,http_status,outcome,
+                   provider_results,paging_current,paging_total,subject_season_id
+                 ) VALUES(%s,'/fixtures',%s,'bootstrap',%s,%s,200,'success',1,1,1,%s) RETURNING id""",
+                (provider_id, Jsonb({"league": 39, "season": 2027}), seed_time, seed_time, season_id),
+        ).fetchone()[0]
+        fixture_id = conn.execute(
+            """INSERT INTO football.fixtures(
+                   season_id,home_team_id,away_team_id,kickoff_at,lifecycle_state,first_seen_at,last_seen_at,last_source_fetch_id
+                 ) VALUES(%s,%s,%s,%s,'scheduled',%s,%s,%s) RETURNING id""",
+            (season_id, home_team_id, away_team_id, kickoff, seed_time, seed_time, seed_fetch_id),
+        ).fetchone()[0]
+        external_fixture_id = 9_100_002
+        conn.execute(
+            "INSERT INTO source.fixture_provider_refs(provider_id,external_id,fixture_id) VALUES(%s,%s,%s)",
+            (provider_id, str(external_fixture_id), fixture_id),
+        )
+        conn.execute(
+            """INSERT INTO source.fixture_provider_status(provider_id,fixture_id,status_code,observed_at,source_fetch_id)
+               VALUES(%s,%s,'NS',%s,%s)""",
+            (provider_id, fixture_id, seed_time, seed_fetch_id),
+        )
+
+    client = BatchClient({
+        external_fixture_id: {
+            "home_id": int(home_external_id), "away_id": int(away_external_id),
+            "kickoff": kickoff, "home_goals": 1, "away_goals": 0,
+        },
+    }, season=2027)
+    report = run_current_season_statistics_backfill(
+        scope=CurrentSeasonStatisticsScope(league_external_id=39, season_start_year=2027, max_requests=2),
+        client=client, sleep=_no_sleep, clock=lambda: observed_at,
+    )
+
+    assert (report.fixture_discovery_requests, report.batch_requests, report.statistics_rows_written) == (1, 0, 0)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
+        assert conn.execute(
+            """SELECT lifecycle_state::text,home_goals,away_goals,result_finalized_at
+               FROM football.fixtures WHERE id=%s""",
+            (fixture_id,),
+        ).fetchone() == ("scheduled", None, None, None)
+        assert conn.execute(
+            "SELECT status_code FROM source.fixture_provider_status WHERE provider_id=%s AND fixture_id=%s",
+            (provider_id, fixture_id),
+        ).fetchone() == ("NS",)
+        assert conn.execute(
+            "SELECT count(*) FROM football.fixture_team_statistics WHERE fixture_id=%s", (fixture_id,)
+        ).fetchone() == (0,)
 
 
 def test_retry_does_not_exceed_the_last_available_request(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Football Analytics completed-fixture statistics worker every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+Unit=football-analytics-statistics.service
+
+[Install]
+WantedBy=timers.target

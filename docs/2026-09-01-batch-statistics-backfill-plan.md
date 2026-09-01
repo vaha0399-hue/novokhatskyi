@@ -106,3 +106,46 @@ It remains eligible for a later retry because no synthetic zero pair is stored.
 - The first pre-fix smoke fetch remains as retained raw evidence and is marked
   `provider_error`; no canonical or raw payload rows were deleted.
 - No multi-league or 100--500 league backfill was started.
+
+## Incremental worker checkpoint — 2026-09-01
+
+The next slice keeps exactly two long-lived backend workers:
+
+1. **Live Worker** polls the configured live competition every 25 seconds and
+   owns Redis current state.
+2. **Completed/Statistics Worker** runs on its own cadence with one reusable
+   API-Football connection pool. It performs terminal discovery, finalizes
+   only provider-terminal fixtures after the canonical `kickoff + 3 hours`
+   window, fetches missing statistics in chunks of at most 20 fixture IDs, and
+   recalculates rolling metrics only for affected teams.
+
+The completed worker never writes live Redis state. Final result and exact
+provider status are written through the schema-owned
+`ops.finalize_season_discovery_fixture_result` function. Postponed or
+rescheduled provider responses are not inferred as completed. Statistics,
+rolling metrics, provenance bindings, and the normalized fetch marker are
+committed atomically per batch so a failed aggregation is recoverable on the
+next run.
+
+Implementation files:
+
+- `backend/app/importer/incremental_statistics.py`
+- `backend/app/importer/current_season_statistics.py`
+- `supabase/migrations/20260901085117_finalize_completed_season_fixture.sql`
+- `backend/tests/test_incremental_statistics.py`
+
+Validation completed:
+
+- disposable PostgreSQL integration with the new migration: `6 passed`;
+- backend suite (excluding the unrelated untracked `season_sync` test):
+  `241 passed, 46 skipped`;
+- worker/live targeted tests: `23 passed`.
+
+Migration `20260901085117_finalize_completed_season_fixture` was applied to
+remote Supabase and verified in migration history. Two bounded real EPL
+2026/27 worker runs then completed successfully: each used one terminal
+discovery request, selected zero incomplete statistics targets, made zero
+batch statistics requests, wrote zero rows, and reported no errors. The
+second run proves the current state is idempotent. The statistics worker is
+not enabled as a continuous process yet. Scanner REST remains after the worker
+deployment checkpoint.
