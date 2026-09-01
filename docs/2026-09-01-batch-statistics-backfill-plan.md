@@ -154,11 +154,10 @@ batch statistics requests, wrote zero rows, and reported no errors. The
 second run proves the current state is idempotent. The statistics worker is
 deployed and verified as a single hardened VPS systemd timer: EPL provider
 scope `39:2026:20`, one run every 15 minutes, a 10-minute execution timeout,
-an isolated worker-owned virtual environment, and root-only credentials. Its
-first scheduled run completed successfully with one discovery request and no
-errors. The timer is temporarily paused while the additive scanner schema
-migration remains unapplied, preventing a new code/schema mismatch; it resumes
-only after that migration is physically verified.
+an isolated worker-owned virtual environment, and root-only credentials. The
+timer was resumed after the scanner schema migration was physically verified;
+its controlled post-migration run completed successfully with one discovery
+request and no errors.
 
 ## Scanner data-contract and REST checkpoint — 2026-09-01
 
@@ -181,6 +180,25 @@ averages retain the number of known source values.
   historical leakage. NULL values never satisfy numeric filters.
 
 The migration and endpoint are verified locally with 248 backend tests and an
-eight-test disposable PostgreSQL importer/scanner gate. The new migration has
-not been applied to remote Supabase and no scanner backend deployment has been
-performed yet.
+eight-test disposable PostgreSQL importer/scanner gate. Migration
+`20260901193000_scanner_metric_sample_counts` was then applied to remote
+Supabase: all 120 existing rolling rows passed the sample-count integrity
+check. The FastAPI endpoint was smoke-tested against real future EPL fixtures;
+a five-filter AND query returned one matching fixture and the database plan
+used the scheduled-fixture and scanner-metrics indexes.
+
+### Early-season scanner availability policy
+
+`last 5` and `last 10` are maximum window sizes, not a requirement that a
+team has already played five or ten matches. Rolling metrics use the actual
+completed-match count when it is smaller than the selected window.
+
+The scanner nevertheless defaults to `min_matches=3` for each relevant venue
+history: the home team needs three home completed fixtures and the away team
+needs three away completed fixtures. At the beginning of a season this can
+correctly yield zero scanner results even when future fixtures exist. The
+future UI must distinguish **no fixtures on the selected date** from
+**fixtures exist but do not yet have sufficient venue history**. Do not lower
+the backend default to one or two automatically; that is a later product
+decision, while an explicit API caller may choose its own valid
+`min_matches` value.
