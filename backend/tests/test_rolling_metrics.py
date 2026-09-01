@@ -50,6 +50,8 @@ def test_uses_precomputed_opponent_xg_as_xga_and_handles_missing_xg() -> None:
     overall = _row(rows, AnalyticsScope.OVERALL, 0)
     assert overall.avg_xg == Decimal("1.2000")
     assert overall.avg_xga == Decimal("2.4000")
+    assert overall.xg_sample_count == 1
+    assert overall.xga_sample_count == 1
 
 
 def test_scopes_filter_home_and_away_before_selecting_windows() -> None:
@@ -89,6 +91,12 @@ def test_empty_scope_is_persistable_with_zero_rates_and_no_source_kickoff() -> N
     away = _row(rows, AnalyticsScope.AWAY, 5)
     assert away.matches_count == 0
     assert away.avg_xg is None
+    assert away.xg_sample_count == 0
+    assert away.xga_sample_count == 0
+    assert away.shots_sample_count == 0
+    assert away.shots_on_goal_sample_count == 0
+    assert away.corners_sample_count == 0
+    assert away.possession_sample_count == 0
     assert away.avg_goals_for == Decimal("0.0000")
     assert away.scored_rate == Decimal("0.00000")
     assert away.source_last_kickoff_at is None

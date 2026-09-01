@@ -183,25 +183,34 @@ def chunk_fixture_targets(targets: Sequence[FixtureTarget]) -> tuple[tuple[Fixtu
 
 
 def select_recent_history(targets: Iterable[FixtureTarget], *, window_size: int = HISTORY_WINDOW) -> tuple[FixtureTarget, ...]:
-    """Union the latest ``window_size`` completed fixtures of every team locally."""
+    """Union every team's latest overall, home, and away history locally.
+
+    The home and away counters are intentionally independent.  A scanner may
+    compare a future home side with its last ten home fixtures and an away side
+    with its last ten away fixtures, so selecting only ten total fixtures per
+    team would leave those venue windows incomplete.
+    """
     if window_size <= 0:
         raise ValueError("window_size must be positive")
     ordered = sorted(targets, key=lambda target: (target.kickoff_at, target.fixture_id), reverse=True)
-    per_team: dict[int, int] = {}
+    home_per_team: dict[int, int] = {}
+    away_per_team: dict[int, int] = {}
     selected: list[FixtureTarget] = []
     selected_ids: set[int] = set()
     for target in ordered:
-        home_count = per_team.get(target.home_team_id, 0)
-        away_count = per_team.get(target.away_team_id, 0)
-        if home_count >= window_size and away_count >= window_size:
+        home_count = home_per_team.get(target.home_team_id, 0)
+        away_count = away_per_team.get(target.away_team_id, 0)
+        needs_home_history = home_count < window_size
+        needs_away_history = away_count < window_size
+        if not needs_home_history and not needs_away_history:
             continue
         if target.fixture_id not in selected_ids:
             selected.append(target)
             selected_ids.add(target.fixture_id)
-        if home_count < window_size:
-            per_team[target.home_team_id] = home_count + 1
-        if away_count < window_size:
-            per_team[target.away_team_id] = away_count + 1
+        if needs_home_history:
+            home_per_team[target.home_team_id] = home_count + 1
+        if needs_away_history:
+            away_per_team[target.away_team_id] = away_count + 1
     return tuple(selected)
 
 
@@ -746,7 +755,8 @@ def _team_history(conn: Connection[Any], *, team_id: int, season_id: int) -> lis
            JOIN football.fixture_team_statistics opponent ON opponent.fixture_id=fixture.id
              AND opponent.team_id=CASE WHEN fixture.home_team_id=%s THEN fixture.away_team_id ELSE fixture.home_team_id END
            WHERE fixture.season_id=%s AND fixture.lifecycle_state='completed'
-             AND fixture.result_available_at IS NOT NULL AND %s IN (fixture.home_team_id,fixture.away_team_id)
+             AND fixture.result_finalized_at IS NOT NULL
+             AND %s IN (fixture.home_team_id,fixture.away_team_id)
            ORDER BY fixture.kickoff_at DESC,fixture.id DESC""",
         (team_id, team_id, team_id, team_id, team_id, season_id, team_id),
     ).fetchall()
@@ -778,27 +788,38 @@ def bulk_upsert_rolling_metrics(
         """WITH incoming AS (
               SELECT * FROM jsonb_to_recordset(%s::jsonb) AS row(
                 team_id bigint,season_id bigint,scope text,window_size smallint,matches_count smallint,
-                avg_xg numeric,avg_xga numeric,avg_goals_for numeric,avg_goals_against numeric,
+                avg_xg numeric,xg_sample_count smallint,avg_xga numeric,xga_sample_count smallint,
+                avg_goals_for numeric,avg_goals_against numeric,
                 scored_rate numeric,conceded_rate numeric,btts_rate numeric,over_1_5_rate numeric,
                 over_2_5_rate numeric,over_3_5_rate numeric,avg_shots numeric,avg_shots_on_goal numeric,
-                avg_corners numeric,avg_possession numeric,source_last_kickoff_at timestamptz,updated_at timestamptz
+                shots_sample_count smallint,shots_on_goal_sample_count smallint,avg_corners numeric,
+                corners_sample_count smallint,avg_possession numeric,possession_sample_count smallint,
+                source_last_kickoff_at timestamptz,updated_at timestamptz
               )
             )
             INSERT INTO football.team_rolling_metrics(
-              team_id,season_id,scope,window_size,matches_count,avg_xg,avg_xga,avg_goals_for,avg_goals_against,
+              team_id,season_id,scope,window_size,matches_count,avg_xg,xg_sample_count,avg_xga,xga_sample_count,
+              avg_goals_for,avg_goals_against,
               scored_rate,conceded_rate,btts_rate,over_1_5_rate,over_2_5_rate,over_3_5_rate,avg_shots,
-              avg_shots_on_goal,avg_corners,avg_possession,source_last_kickoff_at,updated_at
-            ) SELECT team_id,season_id,scope,window_size,matches_count,avg_xg,avg_xga,avg_goals_for,avg_goals_against,
+              shots_sample_count,avg_shots_on_goal,shots_on_goal_sample_count,avg_corners,corners_sample_count,
+              avg_possession,possession_sample_count,source_last_kickoff_at,updated_at
+            ) SELECT team_id,season_id,scope,window_size,matches_count,avg_xg,xg_sample_count,avg_xga,xga_sample_count,
+                     avg_goals_for,avg_goals_against,
                      scored_rate,conceded_rate,btts_rate,over_1_5_rate,over_2_5_rate,over_3_5_rate,avg_shots,
-                     avg_shots_on_goal,avg_corners,avg_possession,source_last_kickoff_at,updated_at FROM incoming
+                     shots_sample_count,avg_shots_on_goal,shots_on_goal_sample_count,avg_corners,corners_sample_count,
+                     avg_possession,possession_sample_count,source_last_kickoff_at,updated_at FROM incoming
             ON CONFLICT(team_id,season_id,scope,window_size) DO UPDATE SET
-              matches_count=excluded.matches_count,avg_xg=excluded.avg_xg,avg_xga=excluded.avg_xga,
+              matches_count=excluded.matches_count,avg_xg=excluded.avg_xg,xg_sample_count=excluded.xg_sample_count,
+              avg_xga=excluded.avg_xga,xga_sample_count=excluded.xga_sample_count,
               avg_goals_for=excluded.avg_goals_for,avg_goals_against=excluded.avg_goals_against,
               scored_rate=excluded.scored_rate,conceded_rate=excluded.conceded_rate,btts_rate=excluded.btts_rate,
               over_1_5_rate=excluded.over_1_5_rate,over_2_5_rate=excluded.over_2_5_rate,
               over_3_5_rate=excluded.over_3_5_rate,avg_shots=excluded.avg_shots,
-              avg_shots_on_goal=excluded.avg_shots_on_goal,avg_corners=excluded.avg_corners,
-              avg_possession=excluded.avg_possession,source_last_kickoff_at=excluded.source_last_kickoff_at,
+              shots_sample_count=excluded.shots_sample_count,avg_shots_on_goal=excluded.avg_shots_on_goal,
+              shots_on_goal_sample_count=excluded.shots_on_goal_sample_count,avg_corners=excluded.avg_corners,
+              corners_sample_count=excluded.corners_sample_count,avg_possession=excluded.avg_possession,
+              possession_sample_count=excluded.possession_sample_count,
+              source_last_kickoff_at=excluded.source_last_kickoff_at,
               updated_at=excluded.updated_at
             RETURNING team_id""",
         (payload,),

@@ -9,17 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.analytics.models import AnalyticsScope
 
-from .dependencies import get_web_read_service
+from .dependencies import get_scanner_web_service, get_web_read_service
 from .dtos import (
     FixtureAnalyticsResponse, FixtureStatisticsResponse, LeagueListResponse,
     LeagueMatchesResponse, LeagueSeasonsResponse, MatchDateLeaguesResponse,
-    SeasonFixturesResponse, SeasonStandingsResponse, TeamAnalyticsResponse,
+    ScannerMatchesRequest, ScannerMatchesResponse, SeasonFixturesResponse,
+    SeasonStandingsResponse, TeamAnalyticsResponse,
 )
+from .scanner import ScannerWebService
 from .service import WebNotFoundError, WebReadService, WebValidationError
+from app.scanner import ScannerNotFoundError, ScannerValidationError
 
 
 router = APIRouter(prefix="/web/v1", tags=["web-read"])
 Service = Annotated[WebReadService, Depends(get_web_read_service)]
+Scanner = Annotated[ScannerWebService, Depends(get_scanner_web_service)]
 
 
 def _validated_window(window: int) -> int:
@@ -28,8 +32,11 @@ def _validated_window(window: int) -> int:
     return window
 
 
-def _error(error: WebNotFoundError | WebValidationError) -> HTTPException:
-    return HTTPException(status_code=404 if isinstance(error, WebNotFoundError) else 422, detail={"code": error.code})
+def _error(error: WebNotFoundError | WebValidationError | ScannerNotFoundError | ScannerValidationError) -> HTTPException:
+    return HTTPException(
+        status_code=404 if isinstance(error, (WebNotFoundError, ScannerNotFoundError)) else 422,
+        detail={"code": error.code},
+    )
 
 
 @router.get("/leagues", response_model=LeagueListResponse)
@@ -126,4 +133,12 @@ def fixture_statistics(fixture_id: int, service: Service) -> FixtureStatisticsRe
     try:
         return service.fixture_statistics(fixture_id=fixture_id)
     except (WebNotFoundError, WebValidationError) as error:
+        raise _error(error) from error
+
+
+@router.post("/scanner/matches", response_model=ScannerMatchesResponse)
+def scanner_matches(request: ScannerMatchesRequest, service: Scanner) -> ScannerMatchesResponse:
+    try:
+        return service.matches(request=request)
+    except (ScannerNotFoundError, ScannerValidationError) as error:
         raise _error(error) from error

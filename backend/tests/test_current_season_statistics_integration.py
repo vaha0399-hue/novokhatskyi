@@ -138,17 +138,17 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
             ).fetchall()
         }
     client = BatchClient(fixtures)
-    scope = CurrentSeasonStatisticsScope(league_external_id=39, season_start_year=2024, max_requests=6)
+    scope = CurrentSeasonStatisticsScope(league_external_id=39, season_start_year=2024, max_requests=11)
 
     report = run_current_season_statistics_backfill(scope=scope, client=client, sleep=_no_sleep)
 
     assert report.fixtures_discovered == 380
-    assert report.unique_fixtures_selected == 100
+    assert report.unique_fixtures_selected == 200
     assert report.fixture_discovery_requests == 1
-    assert report.batch_requests == 5
-    assert report.api_requests == 6
-    assert report.fixtures_normalized == 100
-    assert report.statistics_rows_written == 200
+    assert report.batch_requests == 10
+    assert report.api_requests == 11
+    assert report.fixtures_normalized == 200
+    assert report.statistics_rows_written == 400
     assert report.teams_aggregated == 20
     assert report.errors == ()
     assert client.calls[0] == ("/fixtures", {"league": 39, "season": 2024, "status": "FT-AET-PEN"})
@@ -170,7 +170,7 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
                    (SELECT count(*) FROM football.team_rolling_metrics WHERE season_id=(SELECT season_id FROM source.season_provider_refs WHERE external_season=2024))"""
         ).fetchone()
         assert fetch_id is not None
-        assert (raw_count, memberships, rows, metric_rows) == (6, 480, 200, 120)
+        assert (raw_count, memberships, rows, metric_rows) == (11, 580, 400, 120)
         assert conn.execute(
             """SELECT count(*) FROM football.fixture_team_statistics statistics
                JOIN source.provider_fetches provider_fetch ON provider_fetch.id=statistics.last_source_fetch_id

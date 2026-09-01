@@ -7,13 +7,15 @@ import httpx
 import pytest
 
 from app.main import app
-from app.web.dependencies import get_web_read_service
+from app.scanner import ScannerNotFoundError, ScannerValidationError
+from app.web.dependencies import get_scanner_web_service, get_web_read_service
 from app.web.dtos import (
     AverageMetricSummary, FixtureAnalyticsResponse, FixtureAnalyticsSide, FixtureScore,
     FixtureStatisticsResponse, FixtureStatisticsSide, FixtureSummary, FixtureTeamStatistics,
     GoalTotalsRateSummary, LeagueListResponse, LeagueMatchesResponse, LeagueReference,
     LeagueSeasonsResponse, MatchDateLeagueSummary, MatchDateLeaguesResponse, MetricSummary,
-    PaginationMetadata, RateMetricSummary, SeasonFixturesResponse,
+    PaginationMetadata, RateMetricSummary, ScannerFixture, ScannerFixtureSide,
+    ScannerMatchesResponse, ScannerMetricSnapshot, SeasonFixturesResponse,
     SeasonReference, SeasonStandingRow, SeasonStandingsResponse, StandingsGroup,
     StreakSummary, TeamAnalyticsResponse, TeamReference,
 )
@@ -147,6 +149,42 @@ class FakeService:
         )
 
 
+def _scanner_metrics() -> ScannerMetricSnapshot:
+    return ScannerMetricSnapshot(
+        matches_count=5, avg_xg=1.75, xg_sample_count=4, avg_xga=0.95, xga_sample_count=4,
+        avg_goals_for=1.8, avg_goals_against=0.8, scored_rate=0.8, conceded_rate=0.6,
+        btts_rate=0.4, over_1_5_rate=0.8, over_2_5_rate=0.6, over_3_5_rate=0.2,
+        avg_shots=12.0, shots_sample_count=5, avg_shots_on_goal=5.0,
+        shots_on_goal_sample_count=5, avg_corners=4.0, corners_sample_count=5,
+        avg_possession=54.0, possession_sample_count=5, source_last_kickoff_at=NOW,
+        updated_at=NOW,
+    )
+
+
+class FakeScannerService:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def matches(self, *, request):
+        if request.timezone == "Not/A_Timezone":
+            raise ScannerValidationError("invalid_timezone")
+        if request.league_ids == [404]:
+            raise ScannerNotFoundError("league_not_found")
+        self.requests.append(request)
+        fixture = _fixture(9, kickoff_at=NOW.replace(year=2026, month=9, day=5), completed=False)
+        metrics = _scanner_metrics()
+        return ScannerMatchesResponse(
+            date=request.match_date, timezone=request.timezone, window=request.window,
+            min_matches=request.min_matches,
+            fixtures=[ScannerFixture(
+                fixture=fixture, league=LEAGUE,
+                home=ScannerFixtureSide(team=HOME, overall=metrics, venue=metrics),
+                away=ScannerFixtureSide(team=AWAY, overall=metrics, venue=metrics),
+            )],
+            pagination=PaginationMetadata(total=1, limit=request.limit, offset=request.offset, next_offset=None),
+        )
+
+
 class ASGIClient:
     """Small synchronous adapter that avoids TestClient version coupling."""
 
@@ -158,19 +196,29 @@ class ASGIClient:
 
         return asyncio.run(request())
 
+    def post(self, path: str, *, json: dict) -> httpx.Response:
+        async def request() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                return await client.post(path, json=json)
+
+        return asyncio.run(request())
+
 
 @pytest.fixture
 def client_and_service():
     service = FakeService()
+    scanner = FakeScannerService()
     app.dependency_overrides[get_web_read_service] = lambda: service
+    app.dependency_overrides[get_scanner_web_service] = lambda: scanner
     try:
-        yield ASGIClient(), service
+        yield ASGIClient(), service, scanner
     finally:
         app.dependency_overrides.clear()
 
 
 def test_season_fixtures_contract_includes_deterministic_order_and_no_scheduled_score(client_and_service) -> None:
-    client, service = client_and_service
+    client, service, _ = client_and_service
     response = client.get("/web/v1/seasons/3/fixtures?limit=2&offset=0")
 
     assert response.status_code == 200
@@ -182,7 +230,7 @@ def test_season_fixtures_contract_includes_deterministic_order_and_no_scheduled_
 
 
 def test_discovery_and_standings_contracts(client_and_service) -> None:
-    client, _ = client_and_service
+    client, _, _ = client_and_service
 
     leagues = client.get("/web/v1/leagues")
     seasons = client.get("/web/v1/leagues/3/seasons")
@@ -196,7 +244,7 @@ def test_discovery_and_standings_contracts(client_and_service) -> None:
 
 
 def test_match_date_league_discovery_is_lightweight_and_timezone_explicit(client_and_service) -> None:
-    client, service = client_and_service
+    client, service, _ = client_and_service
 
     response = client.get(
         "/web/v1/matches/leagues?date=2026-08-30&timezone=Asia%2FTokyo"
@@ -212,7 +260,7 @@ def test_match_date_league_discovery_is_lightweight_and_timezone_explicit(client
 
 
 def test_selected_league_matches_contract_reuses_fixture_summary(client_and_service) -> None:
-    client, service = client_and_service
+    client, service, _ = client_and_service
 
     response = client.get(
         "/web/v1/matches?date=2026-08-30&league_id=3&timezone=UTC"
@@ -227,7 +275,7 @@ def test_selected_league_matches_contract_reuses_fixture_summary(client_and_serv
 
 
 def test_fixture_statistics_contract_keeps_missing_metric_as_null(client_and_service) -> None:
-    client, _ = client_and_service
+    client, _, _ = client_and_service
     response = client.get("/web/v1/fixtures/1/statistics")
 
     assert response.status_code == 200
@@ -247,7 +295,7 @@ def test_fixture_statistics_contract_keeps_missing_metric_as_null(client_and_ser
     "/web/v1/matches?date=2026-08-30&league_id=0&timezone=UTC",
 ])
 def test_invalid_query_contract_is_422(client_and_service, path: str) -> None:
-    client, _ = client_and_service
+    client, _, _ = client_and_service
     assert client.get(path).status_code == 422
 
 
@@ -262,14 +310,14 @@ def test_invalid_query_contract_is_422(client_and_service, path: str) -> None:
     ("/web/v1/matches?date=2026-08-30&league_id=404&timezone=UTC", "league_not_found"),
 ])
 def test_not_found_contract_is_stable(client_and_service, path: str, code: str) -> None:
-    client, _ = client_and_service
+    client, _, _ = client_and_service
     response = client.get(path)
     assert response.status_code == 404
     assert response.json() == {"detail": {"code": code}}
 
 
 def test_unknown_timezone_contract_is_stable(client_and_service) -> None:
-    client, _ = client_and_service
+    client, _, _ = client_and_service
     response = client.get(
         "/web/v1/matches/leagues?date=2026-08-30&timezone=Not%2FA_Timezone"
     )
@@ -278,7 +326,7 @@ def test_unknown_timezone_contract_is_stable(client_and_service) -> None:
 
 
 def test_team_analytics_and_fixture_comparison_contract(client_and_service) -> None:
-    client, service = client_and_service
+    client, service, _ = client_and_service
     team_response = client.get("/web/v1/teams/10/analytics?season_id=3&scope=home&window=15")
     fixture_response = client.get("/web/v1/fixtures/1/analytics?window=5")
 
@@ -291,3 +339,42 @@ def test_team_analytics_and_fixture_comparison_contract(client_and_service) -> N
     assert fixture_response.json()["away"]["team"]["id"] == AWAY.id
     assert service.team_calls[0][1:] == (3, service.team_calls[0][2], 15)
     assert service.fixture_calls == [(1, 5)]
+
+
+def test_scanner_contract_uses_symbolic_filters_and_returns_metric_samples(client_and_service) -> None:
+    client, _, scanner = client_and_service
+    response = client.post("/web/v1/scanner/matches", json={
+        "date": "2026-09-05", "timezone": "Asia/Tokyo", "league_ids": [3],
+        "window": 10, "min_matches": 3,
+        "filters": [
+            {"side": "home", "field": "avg_xg", "operator": ">=", "value": 1.7, "min_samples": 3},
+            {"side": "away", "field": "conceded_rate", "operator": ">=", "value": 0.7},
+        ],
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fixtures"][0]["home"]["venue"]["xg_sample_count"] == 4
+    assert scanner.requests[0].match_date == date(2026, 9, 5)
+    assert scanner.requests[0].filters[0].operator.value == ">="
+
+
+@pytest.mark.parametrize("payload", [
+    {"date": "2026-09-05", "timezone": "UTC", "filters": [{"side": "home", "field": "scored_rate", "operator": ">", "value": 1.1}]},
+    {"date": "2026-09-05", "timezone": "UTC", "filters": [{"side": "home", "field": "conceded_rate", "operator": ">=", "value": 0.7, "min_samples": 2}]},
+    {"date": "2026-09-05", "timezone": "UTC", "window": 5, "min_matches": 6},
+])
+def test_scanner_invalid_filter_contract_is_422(client_and_service, payload: dict) -> None:
+    client, _, _ = client_and_service
+    assert client.post("/web/v1/scanner/matches", json=payload).status_code == 422
+
+
+def test_scanner_not_found_and_timezone_errors_are_stable(client_and_service) -> None:
+    client, _, _ = client_and_service
+    missing = client.post("/web/v1/scanner/matches", json={
+        "date": "2026-09-05", "timezone": "UTC", "league_ids": [404],
+    })
+    timezone = client.post("/web/v1/scanner/matches", json={
+        "date": "2026-09-05", "timezone": "Not/A_Timezone",
+    })
+    assert missing.status_code == 404 and missing.json() == {"detail": {"code": "league_not_found"}}
+    assert timezone.status_code == 422 and timezone.json() == {"detail": {"code": "invalid_timezone"}}

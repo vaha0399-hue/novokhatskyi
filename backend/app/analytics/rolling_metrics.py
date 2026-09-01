@@ -35,7 +35,9 @@ class RollingMetricRow:
     window_size: int
     matches_count: int
     avg_xg: Decimal | None
+    xg_sample_count: int
     avg_xga: Decimal | None
+    xga_sample_count: int
     avg_goals_for: Decimal
     avg_goals_against: Decimal
     scored_rate: Decimal
@@ -45,9 +47,13 @@ class RollingMetricRow:
     over_2_5_rate: Decimal
     over_3_5_rate: Decimal
     avg_shots: Decimal | None
+    shots_sample_count: int
     avg_shots_on_goal: Decimal | None
+    shots_on_goal_sample_count: int
     avg_corners: Decimal | None
+    corners_sample_count: int
     avg_possession: Decimal | None
+    possession_sample_count: int
     source_last_kickoff_at: datetime | None
 
 
@@ -57,11 +63,11 @@ def _divide(value: int | Decimal, denominator: int, *, scale: Decimal) -> Decima
     return (Decimal(value) / Decimal(denominator)).quantize(scale, rounding=ROUND_HALF_UP)
 
 
-def _nullable_average(values: Iterable[int | Decimal | None]) -> Decimal | None:
+def _nullable_average(values: Iterable[int | Decimal | None]) -> tuple[Decimal | None, int]:
     present = [Decimal(value) for value in values if value is not None]
     if not present:
-        return None
-    return _divide(sum(present), len(present), scale=_AVERAGE_SCALE)
+        return None, 0
+    return _divide(sum(present), len(present), scale=_AVERAGE_SCALE), len(present)
 
 
 def _records_for_scope(records: list[TeamMatchRecord], scope: AnalyticsScope) -> list[TeamMatchRecord]:
@@ -82,13 +88,21 @@ def _build_row(records: list[TeamMatchRecord], *, scope: AnalyticsScope, window_
     goals_against = sum(record.goals_against for record in records)
     rate = lambda count: _divide(count, matches, scale=_RATE_SCALE)
     total_goals = lambda record: record.goals_for + record.goals_against
+    avg_xg, xg_sample_count = _nullable_average(record.expected_goals for record in records)
+    avg_xga, xga_sample_count = _nullable_average(record.expected_goals_against for record in records)
+    avg_shots, shots_sample_count = _nullable_average(record.total_shots for record in records)
+    avg_shots_on_goal, shots_on_goal_sample_count = _nullable_average(record.shots_on_goal for record in records)
+    avg_corners, corners_sample_count = _nullable_average(record.corner_kicks for record in records)
+    avg_possession, possession_sample_count = _nullable_average(record.possession_pct for record in records)
 
     return RollingMetricRow(
         scope=scope,
         window_size=window_size,
         matches_count=matches,
-        avg_xg=_nullable_average(record.expected_goals for record in records),
-        avg_xga=_nullable_average(record.expected_goals_against for record in records),
+        avg_xg=avg_xg,
+        xg_sample_count=xg_sample_count,
+        avg_xga=avg_xga,
+        xga_sample_count=xga_sample_count,
         avg_goals_for=_divide(goals_for, matches, scale=_AVERAGE_SCALE),
         avg_goals_against=_divide(goals_against, matches, scale=_AVERAGE_SCALE),
         scored_rate=rate(sum(record.goals_for > 0 for record in records)),
@@ -97,10 +111,14 @@ def _build_row(records: list[TeamMatchRecord], *, scope: AnalyticsScope, window_
         over_1_5_rate=rate(sum(total_goals(record) > Decimal("1.5") for record in records)),
         over_2_5_rate=rate(sum(total_goals(record) > Decimal("2.5") for record in records)),
         over_3_5_rate=rate(sum(total_goals(record) > Decimal("3.5") for record in records)),
-        avg_shots=_nullable_average(record.total_shots for record in records),
-        avg_shots_on_goal=_nullable_average(record.shots_on_goal for record in records),
-        avg_corners=_nullable_average(record.corner_kicks for record in records),
-        avg_possession=_nullable_average(record.possession_pct for record in records),
+        avg_shots=avg_shots,
+        shots_sample_count=shots_sample_count,
+        avg_shots_on_goal=avg_shots_on_goal,
+        shots_on_goal_sample_count=shots_on_goal_sample_count,
+        avg_corners=avg_corners,
+        corners_sample_count=corners_sample_count,
+        avg_possession=avg_possession,
+        possession_sample_count=possession_sample_count,
         source_last_kickoff_at=records[0].kickoff_at if records else None,
     )
 

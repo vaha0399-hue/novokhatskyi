@@ -75,6 +75,25 @@ def test_select_history_unions_each_teams_latest_ten_without_per_team_calls() ->
     assert {target.fixture_id for target in selected} == set(range(3, 13))
 
 
+def test_select_history_independently_covers_home_and_away_windows() -> None:
+    # The latest ten are team 1 at home.  Selecting only a team's latest ten
+    # overall would omit its ten most recent away fixtures, which a venue-aware
+    # scanner needs.
+    targets = tuple(
+        _target(index, home_team_id=2, away_team_id=1)
+        for index in range(10)
+    ) + tuple(
+        _target(index, home_team_id=1, away_team_id=2)
+        for index in range(10, 20)
+    )
+
+    selected = select_recent_history(targets)
+
+    assert {target.fixture_id for target in selected} == set(range(1, 21))
+    assert sum(target.home_team_id == 1 for target in selected) == 10
+    assert sum(target.away_team_id == 1 for target in selected) == 10
+
+
 def test_real_batch_sample_normalizes_each_complete_fixture_individually() -> None:
     payload = json.loads(SAMPLE.read_text())
 

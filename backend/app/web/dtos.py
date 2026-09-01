@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.scanner.models import NULLABLE_AVERAGE_SAMPLE_COLUMNS, ScannerMetric, ScannerOperator, ScannerSide
 
 
 class WebDTO(BaseModel):
@@ -127,6 +130,108 @@ class PaginationMetadata(WebDTO):
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
     next_offset: int | None = Field(default=None, ge=0)
+
+
+_SCANNER_RATE_FIELDS = {
+    ScannerMetric.SCORED_RATE, ScannerMetric.CONCEDED_RATE, ScannerMetric.BTTS_RATE,
+    ScannerMetric.OVER_1_5_RATE, ScannerMetric.OVER_2_5_RATE, ScannerMetric.OVER_3_5_RATE,
+}
+
+
+class ScannerFilterInput(WebDTO):
+    side: ScannerSide
+    field: ScannerMetric
+    operator: ScannerOperator
+    value: Decimal
+    min_samples: int | None = Field(default=None, ge=1, le=10)
+
+    @field_validator("value")
+    @classmethod
+    def value_must_be_finite(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("value must be finite")
+        return value
+
+
+class ScannerMatchesRequest(WebDTO):
+    match_date: date = Field(alias="date")
+    timezone: str = Field(min_length=1, max_length=128)
+    league_ids: list[int] = Field(default_factory=list, max_length=100)
+    window: Literal[5, 10] = 10
+    min_matches: int = Field(default=3, ge=1)
+    filters: list[ScannerFilterInput] = Field(default_factory=list, max_length=32)
+    limit: int = Field(default=50, ge=1, le=100)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_scanner_contract(self) -> "ScannerMatchesRequest":
+        if len(set(self.league_ids)) != len(self.league_ids) or any(value <= 0 for value in self.league_ids):
+            raise ValueError("league_ids must contain unique positive IDs")
+        if self.min_matches > self.window:
+            raise ValueError("min_matches must not exceed window")
+        for filter_ in self.filters:
+            if filter_.min_samples is not None:
+                if filter_.field not in NULLABLE_AVERAGE_SAMPLE_COLUMNS:
+                    raise ValueError("min_samples is supported only for nullable averages")
+                if filter_.min_samples > self.window:
+                    raise ValueError("min_samples must not exceed window")
+            if filter_.field in _SCANNER_RATE_FIELDS:
+                if not Decimal("0") <= filter_.value <= Decimal("1"):
+                    raise ValueError("rate filter value must be between 0 and 1")
+            elif filter_.field is ScannerMetric.AVG_POSSESSION:
+                if not Decimal("0") <= filter_.value <= Decimal("100"):
+                    raise ValueError("possession filter value must be between 0 and 100")
+            elif filter_.value < 0:
+                raise ValueError("scanner filter value must not be negative")
+        return self
+
+
+class ScannerMetricSnapshot(WebDTO):
+    matches_count: int = Field(ge=0)
+    avg_xg: float | None
+    xg_sample_count: int = Field(ge=0)
+    avg_xga: float | None
+    xga_sample_count: int = Field(ge=0)
+    avg_goals_for: float
+    avg_goals_against: float
+    scored_rate: float
+    conceded_rate: float
+    btts_rate: float
+    over_1_5_rate: float
+    over_2_5_rate: float
+    over_3_5_rate: float
+    avg_shots: float | None
+    shots_sample_count: int = Field(ge=0)
+    avg_shots_on_goal: float | None
+    shots_on_goal_sample_count: int = Field(ge=0)
+    avg_corners: float | None
+    corners_sample_count: int = Field(ge=0)
+    avg_possession: float | None
+    possession_sample_count: int = Field(ge=0)
+    source_last_kickoff_at: datetime | None
+    updated_at: datetime
+
+
+class ScannerFixtureSide(WebDTO):
+    team: TeamReference
+    overall: ScannerMetricSnapshot | None
+    venue: ScannerMetricSnapshot | None
+
+
+class ScannerFixture(WebDTO):
+    fixture: FixtureSummary
+    league: LeagueReference
+    home: ScannerFixtureSide
+    away: ScannerFixtureSide
+
+
+class ScannerMatchesResponse(WebDTO):
+    date: date
+    timezone: str
+    window: Literal[5, 10]
+    min_matches: int = Field(ge=1)
+    fixtures: list[ScannerFixture]
+    pagination: PaginationMetadata
 
 
 class SeasonFixturesResponse(WebDTO):

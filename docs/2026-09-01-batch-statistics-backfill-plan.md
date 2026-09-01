@@ -56,7 +56,10 @@ It remains eligible for a later retry because no synthetic zero pair is stored.
    fixture, identity mismatch, or conflict with an immutable final result stops
    safely; schedule creation remains the active-season importer's responsibility.
 2. Locally order each participating team’s completed 2026/27 fixtures by
-   kickoff descending; choose last 10, union, and deduplicate provider IDs.
+   kickoff descending; independently choose its last 10 overall, home, and
+   away fixtures, then union and deduplicate provider IDs. This makes
+   `home last 10` and `away last 10` scanner windows complete rather than
+   merely deriving them from an overall ten-match slice.
 3. Exclude already complete, valid statistics pairs; split remaining IDs into
    chunks of at most 20.
 4. Fetch one raw `/fixtures?ids` payload per chunk; persist raw provenance and
@@ -64,7 +67,9 @@ It remains eligible for a later retry because no synthetic zero pair is stored.
 5. Reuse the statistics mapper for each fixture; bulk UPSERT up to two team
    rows per valid fixture. xGA is read from the opponent’s xG during metric
    aggregation.
-6. Recalculate only affected teams for overall/home/away windows 5 and 10.
+6. Recalculate only affected teams for overall/home/away windows 5 and 10,
+   including a per-metric known-value sample count for nullable averages
+   (xG, xGA, shots, shots on goal, corners, possession).
    `window_size=0` is reserved in the schema but is not published until a full
    season statistics history has been loaded.
 7. Repeat the same run to prove idempotency: no duplicate statistics rows, no
@@ -147,5 +152,35 @@ remote Supabase and verified in migration history. Two bounded real EPL
 discovery request, selected zero incomplete statistics targets, made zero
 batch statistics requests, wrote zero rows, and reported no errors. The
 second run proves the current state is idempotent. The statistics worker is
-not enabled as a continuous process yet. Scanner REST remains after the worker
-deployment checkpoint.
+deployed and verified as a single hardened VPS systemd timer: EPL provider
+scope `39:2026:20`, one run every 15 minutes, a 10-minute execution timeout,
+an isolated worker-owned virtual environment, and root-only credentials. Its
+first scheduled run completed successfully with one discovery request and no
+errors. The timer is temporarily paused while the additive scanner schema
+migration remains unapplied, preventing a new code/schema mismatch; it resumes
+only after that migration is physically verified.
+
+## Scanner data-contract and REST checkpoint — 2026-09-01
+
+The scanner is a read-only layer over materialized `team_rolling_metrics`; it
+does not call API-Football, Redis, or the live worker. Before exposing it, the
+data contract was tightened so that venue windows are complete and nullable
+averages retain the number of known source values.
+
+- Additive migration `20260901193000_scanner_metric_sample_counts` adds
+  `xg`, `xga`, `shots`, `shots_on_goal`, `corners`, and `possession` sample
+  counts and derives them for existing rows from finalized canonical history.
+- `POST /web/v1/scanner/matches` accepts an IANA user timezone, calendar date,
+  internal `league_ids`, window `5` or `10`, a minimum venue sample of matches,
+  and `AND`-combined allowlisted `home`/`away` numerical filters using
+  `>`, `>=`, `<`, or `<=`.
+- It returns only future canonical `scheduled` fixtures. Home filters use the
+  home venue row; away filters use the away venue row. Both overall and venue
+  snapshots are returned with their metric-specific sample counts.
+- A metric source cutoff must precede the target fixture kickoff, preventing
+  historical leakage. NULL values never satisfy numeric filters.
+
+The migration and endpoint are verified locally with 248 backend tests and an
+eight-test disposable PostgreSQL importer/scanner gate. The new migration has
+not been applied to remote Supabase and no scanner backend deployment has been
+performed yet.

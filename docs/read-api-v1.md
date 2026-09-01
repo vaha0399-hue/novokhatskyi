@@ -179,6 +179,42 @@ IDs remain internal provenance rather than browser DTO fields.
 GET /web/v1/fixtures/103/analytics?window=5
 ```
 
+## Scheduled scanner
+
+```text
+POST /web/v1/scanner/matches
+```
+
+The scanner reads materialized rolling metrics for future canonical
+`scheduled` fixtures only. It never invokes API-Football or Redis. The body
+uses internal league IDs and an IANA browser timezone:
+
+```json
+{
+  "date": "2026-09-05",
+  "timezone": "Europe/London",
+  "league_ids": [3],
+  "window": 10,
+  "min_matches": 3,
+  "filters": [
+    {"side": "home", "field": "avg_xg", "operator": ">=", "value": 1.7, "min_samples": 3},
+    {"side": "away", "field": "conceded_rate", "operator": ">=", "value": 0.7}
+  ],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`window` is `5` or `10`; all filters are combined with `AND`. `home` filters
+use the home venue row and `away` filters the away venue row. Supported fields
+are `matches_count`, xG/xGA, goals for/against, scored/conceded/BTTS/over rates,
+shots, shots on goal, corners, and possession. Operators are `>`, `>=`, `<`,
+and `<=`. Rate values are constrained to `0..1`; possession to `0..100`.
+
+The response includes the fixture, its league, and both overall and venue
+metric snapshots. Nullable average metrics include their own known-value sample
+count; a missing value remains `null` and never passes a numeric filter.
+
 ## Error semantics
 
 | Condition | Status | `detail.code` |
@@ -191,6 +227,8 @@ GET /web/v1/fixtures/103/analytics?window=5
 | Calendar date has no representable next day | 422 | `invalid_match_date` |
 | Team has no completed fixture in selected season | 422 | `team_has_no_completed_fixture_in_season` |
 | Known season without a standings snapshot | 422 | `season_standings_not_available` |
+| Scanner unknown league | 404 | `league_not_found` |
+| Scanner invalid IANA timezone | 422 | `invalid_timezone` |
 | Missing timezone, unsupported `scope`/`window`, or invalid query type | 422 | FastAPI validation detail, `invalid_timezone`, or `invalid_window` |
 
 The selected URLs intentionally contain no `fixture_id + season_id` pair, so a
@@ -202,7 +240,6 @@ not enrolled in the requested season.
 
 All identifiers are internal IDs. The contract is season-scoped and has no EPL
 or year-specific constant, so additional leagues and seasons are data additions.
-Future scanner endpoints can reuse the same DTO families and read-only service
-boundary. The Next.js UI is a thin server-side consumer of this contract;
+The scanner reuses the same read-only service boundary. The Next.js UI is a thin server-side consumer of this contract;
 players, lineups, odds, backend JWT gating, premium access, and caching-policy
 expansion remain separate stages.

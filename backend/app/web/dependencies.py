@@ -12,8 +12,10 @@ from fastapi import Depends, Request
 
 from app.analytics import AnalyticsEngine, PostgresAnalyticsRepository
 from app.live import RedisLiveStore
+from app.scanner import ScannerRepository, ScannerService
 
 from .repository import WebReadRepository
+from .scanner import ScannerWebService
 from .service import WebReadService
 
 
@@ -38,6 +40,13 @@ def get_web_read_service(
         WebReadRepository(connection),
         AnalyticsEngine(PostgresAnalyticsRepository(connection)),
     )
+
+
+def get_scanner_web_service(
+    connection: Connection[Any] = Depends(get_read_connection),
+) -> ScannerWebService:
+    """Compose the scanner over the same read-only request transaction."""
+    return ScannerWebService(ScannerService(ScannerRepository(connection)))
 
 
 def get_live_store(request: Request) -> RedisLiveStore:
