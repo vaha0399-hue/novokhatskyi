@@ -9,6 +9,7 @@ import pytest
 
 from app.api_football import APIFootballResponse
 from app.importer.active_season import (
+    ActiveFixtureOverride,
     ActiveSeasonImportError,
     ActiveSeasonScope,
     base_requests,
@@ -115,6 +116,78 @@ def test_active_season_treats_provider_zero_venue_id_as_unmapped() -> None:
 
     record = next(item for item in validated.fixtures if item.external_id == external_fixture_id)
     assert record.venue_external_id is None
+
+
+def test_active_season_applies_a_reviewed_fixture_override_before_schedule_validation() -> None:
+    collected = list(_collected())
+    fixtures = copy.deepcopy(collected[3].response.data)
+    target = fixtures["response"][0]
+    duplicate = fixtures["response"][1]
+    original_home_id = target["teams"]["home"]["id"]
+    original_away_id = target["teams"]["away"]["id"]
+    original_venue_id = target["fixture"]["venue"]["id"]
+    target["teams"]["home"]["id"] = duplicate["teams"]["home"]["id"]
+    target["teams"]["away"]["id"] = duplicate["teams"]["away"]["id"]
+    target["fixture"]["venue"]["id"] = 999_999
+    override = ActiveFixtureOverride(
+        external_fixture_id=target["fixture"]["id"],
+        expected_home_external_id=duplicate["teams"]["home"]["id"],
+        expected_away_external_id=duplicate["teams"]["away"]["id"],
+        expected_venue_external_id=999_999,
+        expected_round_label=target["league"]["round"],
+        expected_status_code=target["fixture"]["status"]["short"],
+        canonical_home_external_id=original_home_id,
+        canonical_away_external_id=original_away_id,
+        canonical_venue_external_id=original_venue_id,
+        reason="test fixture contract",
+    )
+    scope = ActiveSeasonScope(
+        league_external_id=39,
+        season_start_year=2026,
+        expected_fixture_count=380,
+        fixture_overrides=(override,),
+    )
+    collected[3] = CollectedBaseResponse(
+        request=collected[3].request,
+        response=_response(fixtures),
+        request_started_at=collected[3].request_started_at,
+        response_received_at=collected[3].response_received_at,
+    )
+
+    validated = validate_base_responses(collected, scope=scope)
+
+    record = next(item for item in validated.fixtures if item.external_id == override.external_fixture_id)
+    assert (record.home_external_id, record.away_external_id, record.venue_external_id) == (
+        original_home_id,
+        original_away_id,
+        original_venue_id,
+    )
+
+
+def test_active_season_rejects_an_override_when_its_source_contract_changes() -> None:
+    collected = _collected()
+    fixture = collected[3].response.data["response"][0]
+    override = ActiveFixtureOverride(
+        external_fixture_id=fixture["fixture"]["id"],
+        expected_home_external_id=999_999,
+        expected_away_external_id=fixture["teams"]["away"]["id"],
+        expected_venue_external_id=fixture["fixture"]["venue"]["id"],
+        expected_round_label=fixture["league"]["round"],
+        expected_status_code=fixture["fixture"]["status"]["short"],
+        canonical_home_external_id=fixture["teams"]["home"]["id"],
+        canonical_away_external_id=fixture["teams"]["away"]["id"],
+        canonical_venue_external_id=fixture["fixture"]["venue"]["id"],
+        reason="test stale contract",
+    )
+    scope = ActiveSeasonScope(
+        league_external_id=39,
+        season_start_year=2026,
+        expected_fixture_count=380,
+        fixture_overrides=(override,),
+    )
+
+    with pytest.raises(ActiveSeasonImportError, match="source contract changed"):
+        validate_base_responses(collected, scope=scope)
 
 
 def test_saved_canary_replay_artifacts_match_the_requested_scope() -> None:

@@ -50,12 +50,79 @@ class ActiveSeasonImportError(SeasonBootstrapError):
 
 
 @dataclass(frozen=True)
+class ActiveFixtureOverride:
+    """A reviewed canonical correction for one immutable provider fixture ID.
+
+    The raw provider body remains unmodified and is retained as provenance.
+    Every source-side value is checked before the override can take effect, so
+    a provider correction or a changed fixture contract stops the import for
+    fresh review instead of silently applying stale local policy.
+    """
+
+    external_fixture_id: int
+    expected_home_external_id: int
+    expected_away_external_id: int
+    expected_venue_external_id: int | None
+    expected_round_label: str | None
+    expected_status_code: str
+    canonical_home_external_id: int
+    canonical_away_external_id: int
+    canonical_venue_external_id: int | None
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason or not self.expected_status_code:
+            raise ValueError("fixture override requires a reason and status")
+        for value in (
+            self.external_fixture_id,
+            self.expected_home_external_id,
+            self.expected_away_external_id,
+            self.canonical_home_external_id,
+            self.canonical_away_external_id,
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError("fixture override IDs must be positive integers")
+        for value in (self.expected_venue_external_id, self.canonical_venue_external_id):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ValueError("fixture override venue IDs must be positive integers or null")
+
+    def validate_source(
+        self,
+        *,
+        home_external_id: int,
+        away_external_id: int,
+        venue_external_id: int | None,
+        round_label: str | None,
+        status_code: str,
+    ) -> None:
+        if (
+            home_external_id,
+            away_external_id,
+            venue_external_id,
+            round_label,
+            status_code,
+        ) != (
+            self.expected_home_external_id,
+            self.expected_away_external_id,
+            self.expected_venue_external_id,
+            self.expected_round_label,
+            self.expected_status_code,
+        ):
+            raise ActiveSeasonImportError(
+                f"fixture override source contract changed for {self.external_fixture_id}"
+            )
+
+
+@dataclass(frozen=True)
 class ActiveSeasonScope:
     """Generic complete-schedule identity for one currently active league."""
 
     league_external_id: int
     season_start_year: int
     expected_fixture_count: int
+    fixture_overrides: tuple[ActiveFixtureOverride, ...] = ()
 
     def __post_init__(self) -> None:
         SeasonBackfillScope(
@@ -63,6 +130,10 @@ class ActiveSeasonScope:
             season_start_year=self.season_start_year,
             expected_fixture_count=self.expected_fixture_count,
         )
+        if len({override.external_fixture_id for override in self.fixture_overrides}) != len(
+            self.fixture_overrides
+        ):
+            raise ValueError("active season fixture overrides must have unique fixture IDs")
 
     @property
     def season_scope(self) -> SeasonBackfillScope:
@@ -84,6 +155,44 @@ class ActiveSeasonScope:
     @property
     def lock_key(self) -> str:
         return f"{PROVIDER_CODE}:active-season:{self.league_external_id}:{self.season_start_year}:v1"
+
+    @property
+    def fixture_override_by_external_id(self) -> dict[int, ActiveFixtureOverride]:
+        return {override.external_fixture_id: override for override in self.fixture_overrides}
+
+
+# API-Football's 2026/27 Ligue 1 calendar has two reviewed source defects:
+# fixture 1552735 is Rennes--PSG but carries PSG's venue ID, while fixture
+# 1552933 duplicates Rennes--PSG instead of the confirmed PSG--Rennes return
+# fixture and carries Rennes's venue ID. Flashscore was manually checked on
+# 2026-09-01. The exact source contracts intentionally make this policy expire
+# as soon as API-Football corrects either record.
+LIGUE_1_2026_FIXTURE_OVERRIDES: tuple[ActiveFixtureOverride, ...] = (
+    ActiveFixtureOverride(
+        external_fixture_id=1552735,
+        expected_home_external_id=94,
+        expected_away_external_id=85,
+        expected_venue_external_id=671,
+        expected_round_label="Regular Season - 1",
+        expected_status_code="FT",
+        canonical_home_external_id=94,
+        canonical_away_external_id=85,
+        canonical_venue_external_id=680,
+        reason="provider venue ID conflicts with the Rennes team catalog",
+    ),
+    ActiveFixtureOverride(
+        external_fixture_id=1552933,
+        expected_home_external_id=94,
+        expected_away_external_id=85,
+        expected_venue_external_id=680,
+        expected_round_label="Regular Season - 23",
+        expected_status_code="NS",
+        canonical_home_external_id=85,
+        canonical_away_external_id=94,
+        canonical_venue_external_id=671,
+        reason="provider duplicates Rennes--PSG; reviewed source confirms PSG--Rennes",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -247,6 +356,7 @@ def _active_fixture_records(
     pairs: set[tuple[int, int]] = set()
     home_counts = {team_id: 0 for team_id in allowed}
     away_counts = {team_id: 0 for team_id in allowed}
+    overrides = scope.fixture_override_by_external_id
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise ActiveSeasonImportError("fixture entry must be an object")
@@ -264,18 +374,12 @@ def _active_fixture_records(
         home, away = teams.get("home"), teams.get("away")
         if not isinstance(home, Mapping) or not isinstance(away, Mapping):
             raise ActiveSeasonImportError("fixture teams are invalid")
-        home_id, away_id = _required_positive(home.get("id"), "teams.home.id"), _required_positive(away.get("id"), "teams.away.id")
-        if home_id == away_id or home_id not in allowed or away_id not in allowed:
-            raise ActiveSeasonImportError("fixture participant is not a distinct mapped season team")
-        pair = (home_id, away_id)
-        if pair in pairs:
-            raise ActiveSeasonImportError("active season schedule has a duplicate directed pairing")
-        pairs.add(pair)
-        home_counts[home_id] += 1
-        away_counts[away_id] += 1
+        home_id = _required_positive(home.get("id"), "teams.home.id")
+        away_id = _required_positive(away.get("id"), "teams.away.id")
         status = fixture.get("status")
         if not isinstance(status, Mapping) or status.get("short") not in {"NS", "FT"}:
             raise ActiveSeasonImportError("active season accepts only NS or FT fixtures")
+        status_code = str(status["short"])
         kickoff_raw, timezone = fixture.get("date"), fixture.get("timezone")
         if not isinstance(kickoff_raw, str) or not isinstance(timezone, str) or not timezone:
             raise ActiveSeasonImportError("fixture kickoff/date timezone is invalid")
@@ -288,12 +392,34 @@ def _active_fixture_records(
         # It must not become a fictitious source.venue_provider_refs mapping.
         if venue_id == 0:
             venue_id = None
+        venue_external_id = None if venue_id is None else _required_positive(venue_id, "fixture.venue.id")
+        round_label = _optional_text(league.get("round"), "league.round")
+        override = overrides.get(external_id)
+        if override is not None:
+            override.validate_source(
+                home_external_id=home_id,
+                away_external_id=away_id,
+                venue_external_id=venue_external_id,
+                round_label=round_label,
+                status_code=status_code,
+            )
+            home_id = override.canonical_home_external_id
+            away_id = override.canonical_away_external_id
+            venue_external_id = override.canonical_venue_external_id
+        if home_id == away_id or home_id not in allowed or away_id not in allowed:
+            raise ActiveSeasonImportError("fixture participant is not a distinct mapped season team")
+        pair = (home_id, away_id)
+        if pair in pairs:
+            raise ActiveSeasonImportError("active season schedule has a duplicate directed pairing")
+        pairs.add(pair)
+        home_counts[home_id] += 1
+        away_counts[away_id] += 1
         record = ActiveFixtureRecord(
             external_id=external_id, home_external_id=home_id, away_external_id=away_id,
-            venue_external_id=None if venue_id is None else _required_positive(venue_id, "fixture.venue.id"),
+            venue_external_id=venue_external_id,
             venue_name=_optional_text(venue.get("name"), "fixture.venue.name"), venue_city=_optional_text(venue.get("city"), "fixture.venue.city"),
-            round_label=_optional_text(league.get("round"), "league.round"), kickoff_at=parse_datetime(kickoff_raw), source_timezone=timezone,
-            referee_name=_optional_text(fixture.get("referee"), "fixture.referee"), status_code=str(status["short"]),
+            round_label=round_label, kickoff_at=parse_datetime(kickoff_raw), source_timezone=timezone,
+            referee_name=_optional_text(fixture.get("referee"), "fixture.referee"), status_code=status_code,
             home_goals=_optional_score(goals.get("home"), "goals.home"), away_goals=_optional_score(goals.get("away"), "goals.away"),
             home_halftime_goals=_score(score, "halftime", "home"), away_halftime_goals=_score(score, "halftime", "away"),
             home_fulltime_goals=_score(score, "fulltime", "home"), away_fulltime_goals=_score(score, "fulltime", "away"),
