@@ -115,6 +115,7 @@ def test_real_completed_fixture_discovery_is_strict_and_keeps_final_scores() -> 
 
     assert len(records) == 380
     assert records[0].external_fixture_id == 1378969
+    assert records[0].status_code == "FT"
     assert (records[0].home_goals, records[0].away_goals) == (4, 2)
 
 

@@ -104,6 +104,7 @@ class BatchParseResult:
 @dataclass(frozen=True)
 class DiscoveryFixture:
     external_fixture_id: int
+    status_code: str
     home_external_team_id: int
     away_external_team_id: int
     kickoff_at: datetime
@@ -447,6 +448,8 @@ def _completed_discovery_entries(
         away = teams.get("away")
         if not isinstance(status, Mapping) or status.get("short") not in {"FT", "AET", "PEN"}:
             raise StatisticsContractError("completed fixture discovery contains a non-terminal status")
+        status_code = status["short"]
+        assert isinstance(status_code, str)
         if not isinstance(home, Mapping) or not isinstance(away, Mapping):
             raise StatisticsContractError("completed fixture discovery teams are invalid")
         kickoff = fixture.get("date")
@@ -455,6 +458,7 @@ def _completed_discovery_entries(
         records.append(
             DiscoveryFixture(
                 external_fixture_id=external_id,
+                status_code=status_code,
                 home_external_team_id=_require_int(home.get("id"), "teams.home.id"),
                 away_external_team_id=_require_int(away.get("id"), "teams.away.id"),
                 kickoff_at=parse_datetime(kickoff),
@@ -534,6 +538,61 @@ def _normalize_completed_discovery(
                 WHERE id=%s""",
             (*result, fetch.response_received_at, fetch.response_received_at, fetch.response_received_at, fetch.fetch_id, fixture_id),
         )
+    _upsert_completed_provider_statuses(
+        conn,
+        provider_id=provider_id,
+        season_id=season_id,
+        records=records,
+        fetch=fetch,
+    )
+
+
+def _upsert_completed_provider_statuses(
+    conn: Connection[Any], *, provider_id: int, season_id: int,
+    records: Sequence[DiscoveryFixture], fetch: BatchFetch,
+) -> None:
+    """Advance exact provider statuses with the fixture lifecycle in one transaction."""
+    observations = [
+        {"external_id": str(record.external_fixture_id), "status_code": record.status_code}
+        for record in records
+    ]
+    status_codes = sorted({record.status_code for record in records})
+    mappings = {
+        str(code): str(state)
+        for code, state in conn.execute(
+            """SELECT external_code,canonical_state::text
+               FROM source.fixture_status_code_mappings
+               WHERE provider_id=%s AND external_code=ANY(%s)""",
+            (provider_id, status_codes),
+        ).fetchall()
+    }
+    if set(mappings) != set(status_codes) or any(state != "completed" for state in mappings.values()):
+        raise CurrentSeasonStatisticsError("terminal provider status lacks a completed canonical mapping")
+
+    rows = conn.execute(
+        """WITH input AS (
+                 SELECT * FROM jsonb_to_recordset(%s::jsonb) AS item(external_id text,status_code text)
+               ), resolved AS (
+                 SELECT ref.fixture_id,input.status_code
+                 FROM input
+                 JOIN source.fixture_provider_refs ref
+                   ON ref.provider_id=%s AND ref.external_id=input.external_id
+                 JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                 WHERE fixture.season_id=%s
+               )
+               INSERT INTO source.fixture_provider_status(
+                 provider_id,fixture_id,status_code,observed_at,source_fetch_id
+               )
+               SELECT %s,fixture_id,status_code,%s,%s FROM resolved
+               ON CONFLICT(provider_id,fixture_id) DO UPDATE
+                 SET status_code=excluded.status_code,observed_at=excluded.observed_at,
+                     source_fetch_id=excluded.source_fetch_id
+                 WHERE source.fixture_provider_status.observed_at < excluded.observed_at
+               RETURNING fixture_id""",
+        (Jsonb(observations), provider_id, season_id, provider_id, fetch.response_received_at, fetch.fetch_id),
+    ).fetchall()
+    if len(rows) != len(observations):
+        raise CurrentSeasonStatisticsError("completed discovery could not atomically advance every provider status")
 
 
 def _record_request_failure(
