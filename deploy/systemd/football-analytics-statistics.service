@@ -7,13 +7,16 @@ Wants=network-online.target
 Type=oneshot
 User=football-analytics
 Group=football-analytics
-WorkingDirectory=/opt/football-analytics
+WorkingDirectory=/opt/football-analytics/backend
 EnvironmentFile=/opt/football-analytics/.env
-Environment=INCREMENTAL_STATISTICS_SCOPES=39:2026
+Environment=INCREMENTAL_STATISTICS_SCOPES=39:2026:20
 Environment=INCREMENTAL_STATISTICS_INTERVAL_SECONDS=900
 Environment=UV_CACHE_DIR=/var/cache/football-analytics
+Environment=UV_PROJECT_ENVIRONMENT=/var/lib/football-analytics/venv
 CacheDirectory=football-analytics
-ExecStart=/usr/local/bin/uv run --directory backend python -m app.importer.incremental_statistics
+StateDirectory=football-analytics
+TimeoutStartSec=10m
+ExecStart=/var/lib/football-analytics/venv/bin/python -m app.importer.incremental_statistics
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
