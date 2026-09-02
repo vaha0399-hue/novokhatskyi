@@ -33,6 +33,7 @@ the human-readable checkpoint, not a replacement for database provenance.
 | 301 | UAE Pro League | 2026 | Not ready | — | — | — | — | Provider published only 35 of the expected 182 regular-season fixtures; no canonical data written. |
 | 94 | Primeira Liga | 2026 | Not ready | — | — | — | — | One fixture is `PST` (Braga—Gil Vicente); no canonical data written pending explicit postponed/reschedule lifecycle support. |
 | 95 | Segunda Liga | 2026 | Imported | 18 | 306 | 36 / 270 | 72 | Complete regular-season calendar. |
+| 103 | Eliteserien | 2026 | Imported | 16 | 240 | 144 / 96 | 288 | Complete regular-season calendar. |
 
 ## Rules
 
