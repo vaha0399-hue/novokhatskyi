@@ -36,6 +36,7 @@ the human-readable checkpoint, not a replacement for database provenance.
 | 95 | Segunda Liga | 2026 | Imported | 18 | 306 | 36 / 270 | 72 | Complete regular-season calendar. |
 | 103 | Eliteserien | 2026 | Imported | 16 | 240 | 144 / 96 | 288 | Complete regular-season calendar. |
 | 113 | Allsvenskan | 2026 | Imported | 16 | 240 | 150 / 90 | 300 | Complete regular-season calendar. |
+| 116 | Belarus Premier League | 2026 | Not ready | — | — | — | — | Five fixtures are `PST`; no canonical data written pending explicit postponed/reschedule lifecycle support. |
 
 ## Rules
 
