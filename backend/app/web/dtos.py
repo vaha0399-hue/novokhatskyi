@@ -99,7 +99,7 @@ class LiveFixturesResponse(WebDTO):
 class FixtureSummary(WebDTO):
     id: int
     season_id: int
-    kickoff_at: datetime
+    kickoff_at: datetime | None
     round_label: str | None
     lifecycle_state: str
     home_team: TeamReference

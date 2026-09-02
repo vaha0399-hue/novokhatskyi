@@ -98,6 +98,8 @@ class PostgresAnalyticsRepository:
         row = self._connection.execute(FIXTURE_CONTEXT_SQL, {"fixture_id": fixture_id}).fetchone()
         if row is None:
             raise LookupError("fixture does not exist")
+        if row[2] is None:
+            raise ValueError("fixture kickoff is not scheduled")
         return FixtureContext(
             fixture_id=int(row[0]), season_id=int(row[1]), kickoff_at=row[2],
             home_team_id=int(row[3]), away_team_id=int(row[4]),

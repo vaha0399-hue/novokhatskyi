@@ -122,6 +122,8 @@ class AnalyticsEngine:
 
     def fixture_analytics(self, *, fixture_id: int) -> FixtureAnalytics:
         fixture = self._repository.load_fixture_context(fixture_id=fixture_id)
+        if fixture.kickoff_at is None:
+            raise ValueError("fixture kickoff is not scheduled")
         return FixtureAnalytics(
             fixture=fixture,
             home_overall=self.team_analytics(team_id=fixture.home_team_id, season_id=fixture.season_id, as_of_kickoff=fixture.kickoff_at, scope=AnalyticsScope.OVERALL),

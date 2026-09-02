@@ -235,6 +235,8 @@ class WebReadService:
         fixture = self._repository.fixture(fixture_id=fixture_id)
         if fixture is None:
             raise WebNotFoundError("fixture_not_found")
+        if fixture.context.kickoff_at is None:
+            raise WebValidationError("fixture_kickoff_not_scheduled")
         analytics = self._analytics.fixture_analytics(fixture_id=fixture_id)
         return FixtureAnalyticsResponse(
             fixture=_fixture(fixture), window=window, historical_cutoff_at=fixture.context.kickoff_at,

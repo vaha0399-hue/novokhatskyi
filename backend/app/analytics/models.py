@@ -113,7 +113,7 @@ class TeamAnalyticsBundle:
 class FixtureContext:
     fixture_id: int
     season_id: int
-    kickoff_at: datetime
+    kickoff_at: datetime | None
     home_team_id: int
     away_team_id: int
 

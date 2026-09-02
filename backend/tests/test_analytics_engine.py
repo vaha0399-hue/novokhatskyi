@@ -125,3 +125,13 @@ def test_fixture_comparison_is_season_scoped_and_uses_home_away_splits() -> None
         AnalyticsScope.OVERALL,
         AnalyticsScope.AWAY,
     ]
+
+
+def test_fixture_comparison_rejects_a_fixture_without_a_scheduled_kickoff() -> None:
+    repository = FakeRepository()
+    repository.fixture = FixtureContext(77, 55, None, 10, 20)
+
+    with pytest.raises(ValueError, match="kickoff is not scheduled"):
+        AnalyticsEngine(repository).fixture_analytics(fixture_id=77)
+
+    assert repository.calls == []

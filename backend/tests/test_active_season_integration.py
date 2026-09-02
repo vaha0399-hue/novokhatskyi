@@ -190,8 +190,7 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
             if item["fixture"]["status"]["short"] == "NS"
         )
         postponed_external_id = postponed_fixture["fixture"]["id"]
-        original_kickoff = parse_datetime(postponed_fixture["fixture"]["date"])
-        postponed_fixture["fixture"]["status"]["short"] = "PST"
+        postponed_fixture["fixture"].update({"status": {"short": "PST"}, "date": None, "timezone": None})
         postponed_collected[3] = CollectedBaseResponse(
             request=postponed_collected[3].request,
             response=_response(postponed_payload),
@@ -213,7 +212,7 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
         ).fetchone()
         assert postponed is not None
         postponed_fixture_id, lifecycle, kickoff_at, status_code = postponed
-        assert (lifecycle, kickoff_at, status_code) == ("postponed", original_kickoff, "PST")
+        assert (lifecycle, kickoff_at, status_code) == ("postponed", None, "PST")
 
         rescheduled_collected = list(_collected(first_received_at + timedelta(minutes=3)))
         rescheduled_payload = copy.deepcopy(rescheduled_collected[3].response.data)

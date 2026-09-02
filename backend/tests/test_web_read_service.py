@@ -19,9 +19,9 @@ HOME = TeamRecord(10, "Home")
 AWAY = TeamRecord(20, "Away")
 
 
-def _record(*, finalized_at: datetime | None) -> FixtureRecord:
+def _record(*, finalized_at: datetime | None, kickoff_at: datetime | None = NOW) -> FixtureRecord:
     return FixtureRecord(
-        context=FixtureContext(1, 3, NOW, HOME.id, AWAY.id),
+        context=FixtureContext(1, 3, kickoff_at, HOME.id, AWAY.id),
         round_label="Regular Season - 1", lifecycle_state="completed",
         home_team=HOME, away_team=AWAY, home_goals=2, away_goals=1,
         result_finalized_at=finalized_at,
@@ -31,6 +31,21 @@ def _record(*, finalized_at: datetime | None) -> FixtureRecord:
 def test_completed_but_unfinalized_fixture_never_exposes_final_score() -> None:
     assert _fixture(_record(finalized_at=None)).final_score is None
     assert _fixture(_record(finalized_at=NOW)).final_score is not None
+
+
+class PostponedFixtureRepository:
+    def fixture(self, *, fixture_id: int) -> FixtureRecord | None:
+        assert fixture_id == 1
+        return _record(finalized_at=None, kickoff_at=None)
+
+
+def test_fixture_analytics_rejects_a_postponed_fixture_without_a_kickoff() -> None:
+    service = WebReadService(PostponedFixtureRepository(), analytics=None)  # type: ignore[arg-type]
+
+    with pytest.raises(WebValidationError) as error:
+        service.fixture_analytics(fixture_id=1, window=10)
+
+    assert error.value.code == "fixture_kickoff_not_scheduled"
 
 
 class MissingSeasonRepository:

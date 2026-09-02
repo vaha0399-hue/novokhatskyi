@@ -121,6 +121,26 @@ def test_active_season_accepts_a_postponed_fixture_without_results() -> None:
     assert (record.home_goals, record.away_goals) == (None, None)
 
 
+def test_active_season_accepts_a_postponed_fixture_without_a_kickoff() -> None:
+    scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
+    collected = list(_collected())
+    fixtures = copy.deepcopy(collected[3].response.data)
+    fixture = next(item for item in fixtures["response"] if item["fixture"]["status"]["short"] == "NS")
+    fixture["fixture"].update({"status": {"short": "PST"}, "date": None, "timezone": None})
+    fixture_id = fixture["fixture"]["id"]
+    collected[3] = CollectedBaseResponse(
+        request=collected[3].request,
+        response=_response(fixtures),
+        request_started_at=collected[3].request_started_at,
+        response_received_at=collected[3].response_received_at,
+    )
+
+    validated = validate_base_responses(collected, scope=scope)
+
+    record = next(item for item in validated.fixtures if item.external_id == fixture_id)
+    assert (record.status_code, record.kickoff_at, record.source_timezone) == ("PST", None, None)
+
+
 def test_active_season_treats_provider_zero_venue_id_as_unmapped() -> None:
     scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
     collected = list(_collected())

@@ -219,8 +219,8 @@ class ActiveFixtureRecord:
     venue_name: str | None
     venue_city: str | None
     round_label: str | None
-    kickoff_at: datetime
-    source_timezone: str
+    kickoff_at: datetime | None
+    source_timezone: str | None
     referee_name: str | None
     status_code: str
     home_goals: int | None
@@ -396,8 +396,14 @@ def _active_fixture_records(
             raise ActiveSeasonImportError("active season accepts only NS, PST, or FT fixtures")
         status_code = str(status["short"])
         kickoff_raw, timezone = fixture.get("date"), fixture.get("timezone")
-        if not isinstance(kickoff_raw, str) or not isinstance(timezone, str) or not timezone:
-            raise ActiveSeasonImportError("fixture kickoff/date timezone is invalid")
+        if status_code == "PST" and kickoff_raw is None:
+            kickoff_at = None
+            source_timezone = _optional_text(timezone, "fixture.timezone")
+        else:
+            if not isinstance(kickoff_raw, str) or not isinstance(timezone, str) or not timezone:
+                raise ActiveSeasonImportError("fixture kickoff/date timezone is invalid")
+            kickoff_at = parse_datetime(kickoff_raw)
+            source_timezone = timezone
         venue = fixture.get("venue") or {}
         if not isinstance(venue, Mapping):
             raise ActiveSeasonImportError("fixture venue must be an object or null")
@@ -433,7 +439,7 @@ def _active_fixture_records(
             external_id=external_id, home_external_id=home_id, away_external_id=away_id,
             venue_external_id=venue_external_id,
             venue_name=_optional_text(venue.get("name"), "fixture.venue.name"), venue_city=_optional_text(venue.get("city"), "fixture.venue.city"),
-            round_label=round_label, kickoff_at=parse_datetime(kickoff_raw), source_timezone=timezone,
+            round_label=round_label, kickoff_at=kickoff_at, source_timezone=source_timezone,
             referee_name=_optional_text(fixture.get("referee"), "fixture.referee"), status_code=status_code,
             home_goals=_optional_score(goals.get("home"), "goals.home"), away_goals=_optional_score(goals.get("away"), "goals.away"),
             home_halftime_goals=_score(score, "halftime", "home"), away_halftime_goals=_score(score, "halftime", "away"),
@@ -567,7 +573,7 @@ def _bulk_insert_initial_fixtures(
             "away_team_id": context.team_ids[record.away_external_id],
             "venue_id": venue_ids[record.external_id],
             "round_label": record.round_label,
-            "kickoff_at": record.kickoff_at.isoformat(),
+            "kickoff_at": None if record.kickoff_at is None else record.kickoff_at.isoformat(),
             "source_timezone": record.source_timezone,
             "referee_name": record.referee_name,
             "lifecycle_state": {"NS": "scheduled", "PST": "postponed", "FT": "completed"}[record.status_code],
@@ -617,7 +623,10 @@ def _bulk_insert_initial_fixtures(
                 provider_id,external_id,fixture_id,first_seen_at,last_seen_at
             )
             SELECT %s,input.external_id,inserted.id,%s,%s
-            FROM input JOIN inserted USING(home_team_id,away_team_id,kickoff_at)""",
+            FROM input JOIN inserted
+              ON inserted.home_team_id=input.home_team_id
+             AND inserted.away_team_id=input.away_team_id
+             AND inserted.kickoff_at IS NOT DISTINCT FROM input.kickoff_at""",
         (
             Jsonb(rows), context.season_id, fetch.response_received_at, fetch.response_received_at,
             fetch.fetch_id, context.provider_id, fetch.response_received_at, fetch.response_received_at,
