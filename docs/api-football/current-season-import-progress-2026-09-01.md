@@ -19,6 +19,7 @@ the human-readable checkpoint, not a replacement for database provenance.
 | 79 | 2. Bundesliga | 2026 | Imported | 18 | 306 | 27 / 279 | 54 | Complete regular-season calendar. |
 | 61 | Ligue 1 | 2026 | Imported with reviewed overrides | 18 | 306 | 18 / 288 | 36 | Two immutable fixture policies correct provider home/away and venue defects while preserving raw payloads. |
 | 62 | Ligue 2 | 2026 | Imported | 18 | 306 | 36 / 270 | 72 | Complete regular-season calendar. |
+| 71 | Brazil Serie A | 2026 | Not ready | — | — | — | — | Four fixtures are `PST`; no canonical data written pending explicit postponed/reschedule lifecycle support. |
 | 40 | Championship | 2026 | Imported | 24 | 552 | 44 / 508 | 88 | Explicit England/Wales team-country policy for Cardiff, Swansea and Wrexham. |
 | 41 | League One | 2026 | Not ready | — | — | — | — | One fixture is `PST` (Oxford United—Reading); no canonical data written pending explicit postponed/reschedule lifecycle support. |
 | 42 | League Two | 2026 | Imported | 24 | 552 | 48 / 504 | 96 | Explicit England/Wales team-country policy for Newport County. |
