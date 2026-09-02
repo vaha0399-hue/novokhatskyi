@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import hashlib
@@ -17,6 +18,7 @@ from app.importer.active_season import (
     import_active_base,
     verify_active_season,
 )
+from app.importer.canary import parse_datetime
 from app.importer.season_bootstrap import CollectedBaseResponse
 
 
@@ -79,6 +81,10 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
         assert (report.team_count, report.fixture_count, report.fixture_mapping_count) == (20, 380, 380)
         assert report.standing_row_count == 20
         assert report.is_complete is True
+        expected_known_fixture_venues = sum(
+            item["fixture"].get("venue", {}).get("id") not in (None, 0)
+            for item in _collected(first_received_at)[3].response.data["response"]
+        )
         assert conn.execute(
             "SELECT lifecycle_state::text, count(*) FROM football.fixtures WHERE season_id=%s GROUP BY lifecycle_state ORDER BY lifecycle_state",
             (first.season_id,),
@@ -116,7 +122,8 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
                WHERE fixture.season_id=%s
                  AND venue_ref.last_seen_at >= %s""",
             (first.season_id, first_received_at),
-        ).fetchone()[0] == 380
+        ).fetchone()[0] == expected_known_fixture_venues
+        conn.commit()
 
         second = import_active_base(
             conn,
@@ -163,10 +170,10 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
             }.items()
         }
         persisted = conn.execute(
-            """SELECT fetch.endpoint,fetch.content_sha256,raw.inline_body
-               FROM source.provider_fetches fetch
-               JOIN source.provider_raw_payloads raw ON raw.fetch_id=fetch.id
-               WHERE fetch.subject_season_id=%s ORDER BY fetch.id""",
+            """SELECT provider_fetch.endpoint,provider_fetch.content_sha256,raw.inline_body
+               FROM source.provider_fetches provider_fetch
+               JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
+               WHERE provider_fetch.subject_season_id=%s ORDER BY provider_fetch.id""",
             (first.season_id,),
         ).fetchall()
         assert len(persisted) == 12
@@ -174,3 +181,70 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
             expected_raw = raw_by_endpoint[endpoint]
             assert bytes(body) == expected_raw
             assert bytes(digest) == hashlib.sha256(expected_raw).digest()
+        conn.commit()
+
+        postponed_collected = list(_collected(first_received_at + timedelta(minutes=2)))
+        postponed_payload = copy.deepcopy(postponed_collected[3].response.data)
+        postponed_fixture = next(
+            item for item in postponed_payload["response"]
+            if item["fixture"]["status"]["short"] == "NS"
+        )
+        postponed_external_id = postponed_fixture["fixture"]["id"]
+        original_kickoff = parse_datetime(postponed_fixture["fixture"]["date"])
+        postponed_fixture["fixture"]["status"]["short"] = "PST"
+        postponed_collected[3] = CollectedBaseResponse(
+            request=postponed_collected[3].request,
+            response=_response(postponed_payload),
+            request_started_at=first_received_at + timedelta(minutes=2, seconds=-1),
+            response_received_at=first_received_at + timedelta(minutes=2),
+        )
+        import_active_base(conn, collected=tuple(postponed_collected), scope=SCOPE)
+        conn.commit()
+
+        postponed = conn.execute(
+            """SELECT fixture.id,fixture.lifecycle_state::text,fixture.kickoff_at,status.status_code
+               FROM football.fixtures fixture
+               JOIN source.fixture_provider_refs ref ON ref.fixture_id=fixture.id
+               JOIN source.fixture_provider_status status
+                 ON status.fixture_id=fixture.id AND status.provider_id=ref.provider_id
+               WHERE ref.provider_id=(SELECT id FROM source.providers WHERE code='api-football')
+                 AND ref.external_id=%s""",
+            (str(postponed_external_id),),
+        ).fetchone()
+        assert postponed is not None
+        postponed_fixture_id, lifecycle, kickoff_at, status_code = postponed
+        assert (lifecycle, kickoff_at, status_code) == ("postponed", original_kickoff, "PST")
+
+        rescheduled_collected = list(_collected(first_received_at + timedelta(minutes=3)))
+        rescheduled_payload = copy.deepcopy(rescheduled_collected[3].response.data)
+        rescheduled_fixture = next(
+            item for item in rescheduled_payload["response"]
+            if item["fixture"]["id"] == postponed_external_id
+        )
+        rescheduled_kickoff_raw = "2027-05-31T19:45:00+00:00"
+        rescheduled_fixture["fixture"]["date"] = rescheduled_kickoff_raw
+        rescheduled_collected[3] = CollectedBaseResponse(
+            request=rescheduled_collected[3].request,
+            response=_response(rescheduled_payload),
+            request_started_at=first_received_at + timedelta(minutes=3, seconds=-1),
+            response_received_at=first_received_at + timedelta(minutes=3),
+        )
+        import_active_base(conn, collected=tuple(rescheduled_collected), scope=SCOPE)
+        conn.commit()
+
+        rescheduled = conn.execute(
+            """SELECT fixture.id,fixture.lifecycle_state::text,fixture.kickoff_at,status.status_code
+               FROM football.fixtures fixture
+               JOIN source.fixture_provider_refs ref ON ref.fixture_id=fixture.id
+               JOIN source.fixture_provider_status status
+                 ON status.fixture_id=fixture.id AND status.provider_id=ref.provider_id
+               WHERE ref.provider_id=(SELECT id FROM source.providers WHERE code='api-football')
+                 AND ref.external_id=%s""",
+            (str(postponed_external_id),),
+        ).fetchone()
+        assert rescheduled == (
+            postponed_fixture_id,
+            "scheduled",
+            parse_datetime(rescheduled_kickoff_raw),
+            "NS",
+        )

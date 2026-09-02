@@ -1,9 +1,9 @@
 """Fail-closed canonical base import for an active provider season.
 
 Unlike :mod:`season_bootstrap`, this narrow path accepts a complete schedule
-whose fixtures are either not started (``NS``) or finished (``FT``).  It is
-provider-call free: callers must collect and retain the four base responses
-before asking this module to validate and normalize them.
+whose fixtures are not started (``NS``), postponed (``PST``), or finished
+(``FT``).  It is provider-call free: callers must collect and retain the four
+base responses before asking this module to validate and normalize them.
 """
 
 from __future__ import annotations
@@ -392,8 +392,8 @@ def _active_fixture_records(
         home_id = _required_positive(home.get("id"), "teams.home.id")
         away_id = _required_positive(away.get("id"), "teams.away.id")
         status = fixture.get("status")
-        if not isinstance(status, Mapping) or status.get("short") not in {"NS", "FT"}:
-            raise ActiveSeasonImportError("active season accepts only NS or FT fixtures")
+        if not isinstance(status, Mapping) or status.get("short") not in {"NS", "PST", "FT"}:
+            raise ActiveSeasonImportError("active season accepts only NS, PST, or FT fixtures")
         status_code = str(status["short"])
         kickoff_raw, timezone = fixture.get("date"), fixture.get("timezone")
         if not isinstance(kickoff_raw, str) or not isinstance(timezone, str) or not timezone:
@@ -441,12 +441,12 @@ def _active_fixture_records(
             home_extratime_goals=_score(score, "extratime", "home"), away_extratime_goals=_score(score, "extratime", "away"),
             home_penalty_goals=_score(score, "penalty", "home"), away_penalty_goals=_score(score, "penalty", "away"),
         )
-        if record.status_code == "NS" and any(value is not None for value in (
+        if record.status_code in {"NS", "PST"} and any(value is not None for value in (
             record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals,
             record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals,
             record.home_penalty_goals, record.away_penalty_goals,
         )):
-            raise ActiveSeasonImportError("NS fixture must not contain results")
+            raise ActiveSeasonImportError("non-terminal fixture must not contain results")
         if record.status_code == "FT" and (record.home_goals is None or record.away_goals is None):
             raise ActiveSeasonImportError("FT fixture must contain final goals")
         records.append(record)
@@ -477,12 +477,12 @@ def validate_base_responses(collected: Sequence[CollectedBaseResponse], *, scope
     if len(catalog) != scope.expected_team_count or {team.external_id for team in catalog} != standing_ids:
         raise ActiveSeasonImportError("active season team catalog and standings membership differ")
     fixtures = _active_fixture_records(by_endpoint["/fixtures"].response.data, scope=scope, allowed_team_ids=standing_ids)
-    statuses = validate_fixture_status_response(by_endpoint["/fixtures"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(), expected_fixture_ids={item.external_id for item in fixtures}, allowed_status_codes={"NS", "FT"})
+    statuses = validate_fixture_status_response(by_endpoint["/fixtures"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(), expected_fixture_ids={item.external_id for item in fixtures}, allowed_status_codes={"NS", "PST", "FT"})
     return ValidatedActiveBase(scope, league, coverage, tuple(catalog), fixtures, statuses, standings)
 
 
 def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: StoredFetch, record: ActiveFixtureRecord) -> int:
-    state = "completed" if record.status_code == "FT" else "scheduled"
+    state = {"NS": "scheduled", "PST": "postponed", "FT": "completed"}[record.status_code]
     terminal = fetch.response_received_at if state == "completed" else None
     row = conn.execute("SELECT fixture_id FROM source.fixture_provider_refs WHERE provider_id=%s AND external_id=%s FOR UPDATE", (context.provider_id, str(record.external_id))).fetchone()
     if row is None:
@@ -498,8 +498,8 @@ def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: 
                home_fulltime_goals,away_fulltime_goals,home_extratime_goals,away_extratime_goals,
                home_penalty_goals,away_penalty_goals,result_finalized_at
         FROM football.fixtures WHERE id=%s FOR UPDATE""", (fixture_id,)).fetchone()
-    expected = (context.season_id, context.team_ids[record.home_external_id], context.team_ids[record.away_external_id], record.kickoff_at)
-    if existing is None or tuple(existing[:4]) != expected:
+    expected_identity = (context.season_id, context.team_ids[record.home_external_id], context.team_ids[record.away_external_id])
+    if existing is None or tuple(existing[:3]) != expected_identity:
         raise ActiveSeasonImportError(f"existing fixture identity conflict for {record.external_id}")
     existing_result = tuple(existing[5:15])
     expected_result = (
@@ -508,13 +508,13 @@ def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: 
         record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals,
     )
     if existing[15] is not None:
-        if existing[4] != state or existing_result != expected_result:
+        if existing[3] != record.kickoff_at or existing[4] != state or existing_result != expected_result:
             raise ActiveSeasonImportError(f"finalized fixture result conflict for {record.external_id}")
         return fixture_id
     if existing[4] == "completed" and state != "completed":
         raise ActiveSeasonImportError(f"completed fixture regressed to NS for {record.external_id}")
     venue_id = _resolve_venue(conn, context=context, record=record, seen_at=fetch.response_received_at)
-    conn.execute("""UPDATE football.fixtures SET venue_id=%s,round_label=%s,source_timezone=%s,referee_name=%s,lifecycle_state=%s,home_goals=%s,away_goals=%s,home_halftime_goals=%s,away_halftime_goals=%s,home_fulltime_goals=%s,away_fulltime_goals=%s,home_extratime_goals=%s,away_extratime_goals=%s,home_penalty_goals=%s,away_penalty_goals=%s,terminal_status_observed_at=%s,result_available_at=%s,last_seen_at=greatest(last_seen_at,%s),last_source_fetch_id=%s WHERE id=%s""", (venue_id, record.round_label, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, terminal, fetch.response_received_at, fetch.fetch_id, fixture_id))
+    conn.execute("""UPDATE football.fixtures SET venue_id=%s,round_label=%s,kickoff_at=%s,source_timezone=%s,referee_name=%s,lifecycle_state=%s,home_goals=%s,away_goals=%s,home_halftime_goals=%s,away_halftime_goals=%s,home_fulltime_goals=%s,away_fulltime_goals=%s,home_extratime_goals=%s,away_extratime_goals=%s,home_penalty_goals=%s,away_penalty_goals=%s,terminal_status_observed_at=%s,result_available_at=%s,last_seen_at=greatest(last_seen_at,%s),last_source_fetch_id=%s WHERE id=%s""", (venue_id, record.round_label, record.kickoff_at, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, terminal, fetch.response_received_at, fetch.fetch_id, fixture_id))
     return fixture_id
 
 
@@ -570,7 +570,7 @@ def _bulk_insert_initial_fixtures(
             "kickoff_at": record.kickoff_at.isoformat(),
             "source_timezone": record.source_timezone,
             "referee_name": record.referee_name,
-            "lifecycle_state": "completed" if record.status_code == "FT" else "scheduled",
+            "lifecycle_state": {"NS": "scheduled", "PST": "postponed", "FT": "completed"}[record.status_code],
             "home_goals": record.home_goals,
             "away_goals": record.away_goals,
             "home_halftime_goals": record.home_halftime_goals,
