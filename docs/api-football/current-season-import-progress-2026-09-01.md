@@ -21,6 +21,7 @@ the human-readable checkpoint, not a replacement for database provenance.
 | 62 | Ligue 2 | 2026 | Imported | 18 | 306 | 36 / 270 | 72 | Complete regular-season calendar. |
 | 40 | Championship | 2026 | Imported | 24 | 552 | 44 / 508 | 88 | Explicit England/Wales team-country policy for Cardiff, Swansea and Wrexham. |
 | 41 | League One | 2026 | Not ready | — | — | — | — | One fixture is `PST` (Oxford United—Reading); no canonical data written pending explicit postponed/reschedule lifecycle support. |
+| 42 | League Two | 2026 | Imported | 24 | 552 | 48 / 504 | 96 | Explicit England/Wales team-country policy for Newport County. |
 | 88 | Eredivisie | 2026 | Imported | 18 | 306 | 33 / 273 | 66 | Complete regular-season calendar. |
 | 89 | Eerste Divisie | 2026 | Not ready | — | — | — | — | Provider standings contain multiple groups; no canonical data written pending an explicit multi-group policy. |
 | 106 | Ekstraklasa | 2026 | Imported | 18 | 306 | 47 / 259 | 94 | Complete regular-season calendar. |

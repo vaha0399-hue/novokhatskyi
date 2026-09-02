@@ -12,6 +12,8 @@ from app.importer.active_season import (
     ActiveFixtureOverride,
     ActiveSeasonImportError,
     ActiveSeasonScope,
+    ENGLISH_CHAMPIONSHIP_2026_ADDITIONAL_TEAM_COUNTRIES,
+    ENGLISH_LEAGUE_TWO_2026_ADDITIONAL_TEAM_COUNTRIES,
     base_requests,
     load_replay_collected,
     validate_base_responses,
@@ -210,6 +212,11 @@ def test_active_season_allows_an_explicit_additional_team_country() -> None:
     validated = validate_base_responses(collected, scope=scope)
 
     assert len(validated.teams) == 20
+
+
+def test_english_wales_policies_are_explicit_per_competition() -> None:
+    assert ENGLISH_CHAMPIONSHIP_2026_ADDITIONAL_TEAM_COUNTRIES == frozenset({"Wales"})
+    assert ENGLISH_LEAGUE_TWO_2026_ADDITIONAL_TEAM_COUNTRIES == frozenset({"Wales"})
 
 
 def test_saved_canary_replay_artifacts_match_the_requested_scope() -> None:

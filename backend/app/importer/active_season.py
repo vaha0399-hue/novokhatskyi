@@ -204,6 +204,12 @@ LIGUE_1_2026_FIXTURE_OVERRIDES: tuple[ActiveFixtureOverride, ...] = (
 ENGLISH_CHAMPIONSHIP_2026_ADDITIONAL_TEAM_COUNTRIES = frozenset({"Wales"})
 
 
+# The 2026/27 English League Two catalog includes Newport County.  API-Football
+# identifies the club as Wales, so this is a separate, deliberately narrow
+# competition policy rather than a blanket exception for English competitions.
+ENGLISH_LEAGUE_TWO_2026_ADDITIONAL_TEAM_COUNTRIES = frozenset({"Wales"})
+
+
 @dataclass(frozen=True)
 class ActiveFixtureRecord:
     external_id: int
