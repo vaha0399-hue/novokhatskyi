@@ -24,6 +24,7 @@ from app.api_football.client import safe_rate_limit_headers
 from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.active_season import ActiveSeasonImportError, ActiveSeasonScope, base_requests, import_active_base, validate_base_responses, verify_active_season
 from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolError
+from app.importer.current_season_statistics import CurrentSeasonStatisticsError, CurrentSeasonStatisticsScope, run_current_season_statistics_backfill_async
 from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse
 
 
@@ -332,10 +333,26 @@ def _incomplete_calendar(collected: Sequence[CollectedBaseResponse], scope: Acti
 
 
 class Worker:
-    def __init__(self, *, provider: Provider, repository: Repository, spool: RawSpool, settings: Settings, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+    def __init__(self, *, provider: Provider, repository: Repository, spool: RawSpool, settings: Settings, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, statistics_backfill: Callable[[int, int], Awaitable[Any]] | None = None) -> None:
         self._provider, self._repository, self._spool, self._settings, self._sleep = provider, repository, spool, settings, sleep
         self._requests = 0
         self._last_request_at: float | None = None
+        self._statistics_backfill = statistics_backfill or self._default_statistics_backfill
+
+    async def _default_statistics_backfill(self, league_external_id: int, season_start_year: int) -> Any:
+        return await run_current_season_statistics_backfill_async(
+            scope=CurrentSeasonStatisticsScope(league_external_id, season_start_year), client=self._provider
+        )
+
+    async def _backfill_statistics(self, item: WorkItem) -> dict[str, Any]:
+        competition = item.competition
+        assert competition.season_start_year is not None
+        report = await self._statistics_backfill(competition.league_external_id, competition.season_start_year)
+        stopped_reason = getattr(report, "stopped_reason", None)
+        errors = getattr(report, "errors", ())
+        if stopped_reason is not None or errors:
+            raise CurrentSeasonStatisticsError("statistics backfill did not complete cleanly")
+        return {"fixtures_normalized": getattr(report, "fixtures_normalized", None), "statistics_rows_written": getattr(report, "statistics_rows_written", None), "api_requests": getattr(report, "api_requests", None)}
 
     async def _fetch(self, request: BaseRequest) -> RawSpoolArtifact:
         for attempt in range(self._settings.fetch_retries):
@@ -393,7 +410,8 @@ class Worker:
             if isinstance(generation, int) and generation > 0 and competition.season_start_year is not None:
                 directory = self._spool.capture_directory(run_id=run_id, league_external_id=competition.league_external_id, season_start_year=competition.season_start_year, generation=generation)
                 if directory.is_dir(): self._spool.purge_generation(directory)
-            self._repository.complete(item, {"outcome": "already_complete"}); return self._report(item, "already_complete")
+            statistics = await self._backfill_statistics(item)
+            self._repository.complete(item, {"outcome": "already_complete", "statistics": statistics}); return self._report(item, "already_complete")
         assert competition.season_start_year is not None
         generation = item.checkpoint.get("capture_generation", 1)
         if not isinstance(generation, int) or generation < 1: raise CatalogueBootstrapError("invalid capture generation")
@@ -421,7 +439,8 @@ class Worker:
         # Canonical DB now owns the same raw provenance; the VPS inbox is no
         # longer needed and is removed before this item becomes terminal.
         self._spool.purge_generation(directory)
-        self._repository.complete(item, {"outcome": "imported", "capture_generation": generation}); return self._report(item, "imported")
+        statistics = await self._backfill_statistics(item)
+        self._repository.complete(item, {"outcome": "imported", "capture_generation": generation, "statistics": statistics}); return self._report(item, "imported")
 
     async def run_once(self) -> Report:
         reports: list[LeagueReport] = []
@@ -453,7 +472,7 @@ class Worker:
             except ProviderQuotaExhausted as error:
                 self._repository.requeue(item, checkpoint={**item.checkpoint, "outcome": "retry_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=0)
                 self._repository.checkpoint_run(run_id, self._checkpoint(reports, type(error).__name__)); return Report(run_id, "paused_quota", tuple(reports), self._requests)
-            except (APIFootballHTTPError, APIFootballAPIError, CatalogueBootstrapError, RawSpoolError) as error:
+            except (APIFootballHTTPError, APIFootballAPIError, CatalogueBootstrapError, CurrentSeasonStatisticsError, RawSpoolError) as error:
                 if item.attempts >= self._settings.item_attempt_limit:
                     self._repository.complete(item, {"outcome": "failed_provider", "reason": type(error).__name__}); reports.append(self._report(item, "failed_provider", type(error).__name__))
                 else:

@@ -182,7 +182,11 @@ def test_worker_captures_real_epl_raw_then_calls_canonical_import(tmp_path: Path
         def finish_run(self, *args, **kwargs): pass
 
     repository = Repository(); settings = Settings("postgresql://unused", tmp_path / "spool", pacing_seconds=0)
-    report = asyncio.run(Worker(provider=Provider(), repository=repository, spool=RawSpool(settings.spool_dir), settings=settings).run_once())
+    async def statistics_backfill(league_id: int, season_year: int) -> Any:
+        assert (league_id, season_year) == (39, 2026)
+        return type("StatisticsReport", (), {"stopped_reason": None, "errors": (), "fixtures_normalized": 1, "statistics_rows_written": 2, "api_requests": 1})()
+
+    report = asyncio.run(Worker(provider=Provider(), repository=repository, spool=RawSpool(settings.spool_dir), settings=settings, statistics_backfill=statistics_backfill).run_once())
 
     assert report.status == "succeeded"
     assert repository.imported == 4
