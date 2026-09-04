@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from app.api_football import APIFootballResponse
 from app.importer.catalogue_bootstrap import DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS, CatalogueCompetition, Report, Settings, Worker, parse_catalogue
 from app.importer.raw_spool import RawSpool, RawSpoolArtifact
-from app.importer.season_bootstrap import BaseRequest
+from app.importer.season_bootstrap import BaseRequest, SeasonBootstrapError
 
 
 def _response(payload: dict[str, Any]) -> APIFootballResponse:
@@ -207,3 +207,51 @@ def test_worker_captures_real_epl_raw_then_calls_canonical_import(tmp_path: Path
     assert report.status == "succeeded"
     assert repository.imported == 4
     assert not (settings.spool_dir / "run-9/league-39-season-2026/generation-1").exists()
+
+
+def test_worker_defers_a_regular_format_validation_failure(tmp_path: Path, monkeypatch) -> None:
+    sample = Path(__file__).parents[2] / "samples/api-football/epl-2026-refresh-2026-08-31T1225Z"
+    scope_payloads = [json.loads((sample / name).read_text()) for name in (
+        "01-leagues-epl-2026.raw.json", "02-teams-epl-2026.raw.json",
+        "03-standings-epl-2026.raw.json", "04-fixtures-epl-2026.raw.json",
+    )]
+    catalogue = {"get": "leagues", "parameters": {}, "errors": {}, "results": 1, "paging": {"current": 1, "total": 1}, "response": [scope_payloads[0]["response"][0]]}
+
+    @dataclass
+    class Provider:
+        responses: list[APIFootballResponse] = field(default_factory=lambda: [_response(catalogue), *[_response(value) for value in scope_payloads]])
+        async def get(self, endpoint, *, params=None): return self.responses.pop(0)
+        def response_contains_api_key(self, body): return False
+
+    @dataclass
+    class Repository:
+        created: list[CatalogueCompetition] = field(default_factory=list); completed: list[dict[str, Any]] = field(default_factory=list); claimed: bool = False
+        def active_run(self): return None
+        def create_run(self, items, **kwargs): self.created = list(items); return 9
+        def claim_next(self, run_id):
+            if self.claimed: return None
+            self.claimed = True
+            from app.importer.catalogue_bootstrap import WorkItem
+            return WorkItem(3, self.created[0], 1, {})
+        def unfinished_delay_seconds(self, run_id): return None
+        def reserve_request(self, daily_limit): return True
+        def renew(self, item): pass
+        def observe_rate_limit(self, **kwargs): pass
+        def canonical_scope_is_complete(self, competition): return False
+        def import_and_verify(self, **kwargs): raise AssertionError("invalid format must not import")
+        def complete(self, item, checkpoint): self.completed.append(dict(checkpoint))
+        def requeue(self, *args, **kwargs): raise AssertionError("unsupported format must not requeue")
+        def checkpoint_run(self, *args, **kwargs): raise AssertionError("unsupported format must not pause")
+        def finish_run(self, *args, **kwargs): pass
+
+    def reject_regular_format(*_args, **_kwargs):
+        raise SeasonBootstrapError("multiple standings groups")
+
+    monkeypatch.setattr("app.importer.catalogue_bootstrap.validate_base_responses", reject_regular_format)
+    repository = Repository()
+    settings = Settings("postgresql://unused", tmp_path / "spool", pacing_seconds=0)
+    report = asyncio.run(Worker(provider=Provider(), repository=repository, spool=RawSpool(settings.spool_dir), settings=settings).run_once())
+
+    assert report.status == "succeeded"
+    assert report.leagues[0].outcome == "deferred_unsupported_format"
+    assert repository.completed == [{"outcome": "deferred_unsupported_format", "reason": "SeasonBootstrapError", "capture_generation": 1}]

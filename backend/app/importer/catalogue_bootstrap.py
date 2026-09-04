@@ -25,7 +25,7 @@ from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.active_season import ActiveSeasonImportError, ActiveSeasonScope, base_requests, import_active_base, validate_base_responses, verify_active_season
 from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolError
 from app.importer.current_season_statistics import CurrentSeasonStatisticsError, CurrentSeasonStatisticsScope, run_current_season_statistics_backfill_async
-from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse
+from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse, SeasonBootstrapError
 
 
 PROVIDER_CODE = "api-football"
@@ -449,7 +449,7 @@ class Worker:
         try:
             self._repository.renew(item)
             validate_base_responses(collected, scope=scope); self._repository.import_and_verify(scope=scope, collected=collected)
-        except ActiveSeasonImportError as error:
+        except SeasonBootstrapError as error:
             self._repository.complete(item, {"outcome": "deferred_unsupported_format", "reason": type(error).__name__, "capture_generation": generation})
             return self._report(item, "deferred_unsupported_format", type(error).__name__)
         # Canonical DB now owns the same raw provenance; the VPS inbox is no
