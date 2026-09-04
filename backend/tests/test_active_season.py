@@ -66,6 +66,54 @@ def test_real_epl_2026_sample_validates_as_mixed_active_season() -> None:
     assert sum(item.status_code == "FT" for item in validated.fixtures) == 11
 
 
+def test_active_season_accepts_a_partial_calendar_only_when_explicitly_requested() -> None:
+    collected = list(_collected())
+    fixtures = copy.deepcopy(collected[3].response.data)
+    fixtures["response"] = fixtures["response"][:-1]
+    fixtures["results"] = len(fixtures["response"])
+    collected[3] = CollectedBaseResponse(
+        request=collected[3].request,
+        response=_response(fixtures),
+        request_started_at=collected[3].request_started_at,
+        response_received_at=collected[3].response_received_at,
+    )
+    partial_scope = ActiveSeasonScope(
+        league_external_id=39,
+        season_start_year=2026,
+        expected_fixture_count=380,
+        require_complete_schedule=False,
+    )
+
+    validated = validate_base_responses(collected, scope=partial_scope)
+
+    assert len(validated.fixtures) == 379
+    with pytest.raises(ActiveSeasonImportError, match="expected complete schedule"):
+        validate_base_responses(
+            collected,
+            scope=ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380),
+        )
+
+
+def test_active_season_accepts_penalty_terminal_fixture() -> None:
+    collected = list(_collected())
+    fixtures = copy.deepcopy(collected[3].response.data)
+    fixture = next(item for item in fixtures["response"] if item["fixture"]["status"]["short"] == "FT")
+    fixture["fixture"]["status"]["short"] = "PEN"
+    collected[3] = CollectedBaseResponse(
+        request=collected[3].request,
+        response=_response(fixtures),
+        request_started_at=collected[3].request_started_at,
+        response_received_at=collected[3].response_received_at,
+    )
+
+    validated = validate_base_responses(
+        collected,
+        scope=ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380),
+    )
+
+    assert any(record.status_code == "PEN" for record in validated.fixtures)
+
+
 def test_active_season_rejects_unapproved_in_progress_status_before_dml() -> None:
     scope = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
     collected = list(_collected())
@@ -79,7 +127,7 @@ def test_active_season_rejects_unapproved_in_progress_status_before_dml() -> Non
         response_received_at=collected[3].response_received_at,
     )
 
-    with pytest.raises(ActiveSeasonImportError, match="NS, PST, or FT"):
+    with pytest.raises(ActiveSeasonImportError, match="NS, PST, FT, AET, or PEN"):
         validate_base_responses(collected, scope=scope)
 
 

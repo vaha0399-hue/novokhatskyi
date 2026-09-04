@@ -45,6 +45,18 @@ from app.importer.season_bootstrap import (
 from app.importer.season_coverage_contract import SeasonCoverageObservation, validate_season_coverage_response
 
 
+_LIFECYCLE_BY_STATUS = {
+    "NS": "scheduled",
+    "PST": "postponed",
+    "FT": "completed",
+    "AET": "completed",
+    "PEN": "completed",
+}
+_TERMINAL_STATUS_CODES = frozenset(
+    status for status, lifecycle in _LIFECYCLE_BY_STATUS.items() if lifecycle == "completed"
+)
+
+
 class ActiveSeasonImportError(SeasonBootstrapError):
     """An active-season response cannot safely become canonical data."""
 
@@ -117,13 +129,14 @@ class ActiveFixtureOverride:
 
 @dataclass(frozen=True)
 class ActiveSeasonScope:
-    """Generic complete-schedule identity for one currently active league."""
+    """Identity and publication contract for one current regular league season."""
 
     league_external_id: int
     season_start_year: int
     expected_fixture_count: int
     fixture_overrides: tuple[ActiveFixtureOverride, ...] = ()
     additional_team_country_names: frozenset[str] = frozenset()
+    require_complete_schedule: bool = True
 
     def __post_init__(self) -> None:
         SeasonBackfillScope(
@@ -137,6 +150,8 @@ class ActiveSeasonScope:
             raise ValueError("active season fixture overrides must have unique fixture IDs")
         if any(not isinstance(country, str) or not country.strip() for country in self.additional_team_country_names):
             raise ValueError("active season additional team countries must be non-empty strings")
+        if not isinstance(self.require_complete_schedule, bool):
+            raise ValueError("require_complete_schedule must be boolean")
 
     @property
     def season_scope(self) -> SeasonBackfillScope:
@@ -392,8 +407,8 @@ def _active_fixture_records(
         home_id = _required_positive(home.get("id"), "teams.home.id")
         away_id = _required_positive(away.get("id"), "teams.away.id")
         status = fixture.get("status")
-        if not isinstance(status, Mapping) or status.get("short") not in {"NS", "PST", "FT"}:
-            raise ActiveSeasonImportError("active season accepts only NS, PST, or FT fixtures")
+        if not isinstance(status, Mapping) or status.get("short") not in _LIFECYCLE_BY_STATUS:
+            raise ActiveSeasonImportError("active season accepts only NS, PST, FT, AET, or PEN fixtures")
         status_code = str(status["short"])
         kickoff_raw, timezone = fixture.get("date"), fixture.get("timezone")
         if status_code == "PST" and kickoff_raw is None:
@@ -453,12 +468,15 @@ def _active_fixture_records(
             record.home_penalty_goals, record.away_penalty_goals,
         )):
             raise ActiveSeasonImportError("non-terminal fixture must not contain results")
-        if record.status_code == "FT" and (record.home_goals is None or record.away_goals is None):
-            raise ActiveSeasonImportError("FT fixture must contain final goals")
+        if record.status_code in _TERMINAL_STATUS_CODES and (record.home_goals is None or record.away_goals is None):
+            raise ActiveSeasonImportError("terminal fixture must contain final goals")
         records.append(record)
-    expected_per_side = scope.expected_team_count - 1
-    if len(records) != scope.expected_fixture_count or set(home_counts.values()) != {expected_per_side} or set(away_counts.values()) != {expected_per_side}:
-        raise ActiveSeasonImportError("active season fixtures do not form the expected complete schedule")
+    if scope.require_complete_schedule:
+        expected_per_side = scope.expected_team_count - 1
+        if len(records) != scope.expected_fixture_count or set(home_counts.values()) != {expected_per_side} or set(away_counts.values()) != {expected_per_side}:
+            raise ActiveSeasonImportError("active season fixtures do not form the expected complete schedule")
+    elif len(records) > scope.expected_fixture_count:
+        raise ActiveSeasonImportError("partial active season has more fixtures than its regular schedule maximum")
     return tuple(sorted(records, key=lambda item: item.external_id))
 
 
@@ -483,12 +501,12 @@ def validate_base_responses(collected: Sequence[CollectedBaseResponse], *, scope
     if len(catalog) != scope.expected_team_count or {team.external_id for team in catalog} != standing_ids:
         raise ActiveSeasonImportError("active season team catalog and standings membership differ")
     fixtures = _active_fixture_records(by_endpoint["/fixtures"].response.data, scope=scope, allowed_team_ids=standing_ids)
-    statuses = validate_fixture_status_response(by_endpoint["/fixtures"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(), expected_fixture_ids={item.external_id for item in fixtures}, allowed_status_codes={"NS", "PST", "FT"})
+    statuses = validate_fixture_status_response(by_endpoint["/fixtures"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(), expected_fixture_ids={item.external_id for item in fixtures}, allowed_status_codes=_LIFECYCLE_BY_STATUS)
     return ValidatedActiveBase(scope, league, coverage, tuple(catalog), fixtures, statuses, standings)
 
 
 def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: StoredFetch, record: ActiveFixtureRecord) -> int:
-    state = {"NS": "scheduled", "PST": "postponed", "FT": "completed"}[record.status_code]
+    state = _LIFECYCLE_BY_STATUS[record.status_code]
     terminal = fetch.response_received_at if state == "completed" else None
     row = conn.execute("SELECT fixture_id FROM source.fixture_provider_refs WHERE provider_id=%s AND external_id=%s FOR UPDATE", (context.provider_id, str(record.external_id))).fetchone()
     if row is None:
@@ -576,7 +594,7 @@ def _bulk_insert_initial_fixtures(
             "kickoff_at": None if record.kickoff_at is None else record.kickoff_at.isoformat(),
             "source_timezone": record.source_timezone,
             "referee_name": record.referee_name,
-            "lifecycle_state": {"NS": "scheduled", "PST": "postponed", "FT": "completed"}[record.status_code],
+            "lifecycle_state": _LIFECYCLE_BY_STATUS[record.status_code],
             "home_goals": record.home_goals,
             "away_goals": record.away_goals,
             "home_halftime_goals": record.home_halftime_goals,
@@ -587,7 +605,7 @@ def _bulk_insert_initial_fixtures(
             "away_extratime_goals": record.away_extratime_goals,
             "home_penalty_goals": record.home_penalty_goals,
             "away_penalty_goals": record.away_penalty_goals,
-            "terminal_status_observed_at": fetch.response_received_at.isoformat() if record.status_code == "FT" else None,
+            "terminal_status_observed_at": fetch.response_received_at.isoformat() if record.status_code in _TERMINAL_STATUS_CODES else None,
         }
         for record in records
     ]
@@ -724,7 +742,13 @@ def verify_active_season(conn: Connection[Any], *, scope: ActiveSeasonScope) -> 
     if row is None:
         raise ActiveSeasonImportError("canonical active season mapping is missing")
     report = ActiveSeasonVerificationReport(*(int(value) for value in row))
-    if report.team_count != scope.expected_team_count or report.fixture_count != scope.expected_fixture_count or report.fixture_mapping_count != scope.expected_fixture_count or report.standing_row_count != scope.expected_team_count:
+    if (
+        report.team_count != scope.expected_team_count
+        or report.fixture_mapping_count != report.fixture_count
+        or report.standing_row_count != scope.expected_team_count
+        or report.fixture_count > scope.expected_fixture_count
+        or (scope.require_complete_schedule and report.fixture_count != scope.expected_fixture_count)
+    ):
         raise ActiveSeasonImportError("canonical active season counts do not match the requested scope")
     return report
 

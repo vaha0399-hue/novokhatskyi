@@ -11,7 +11,7 @@ import socket
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -332,20 +332,24 @@ def _team_count(response: APIFootballResponse) -> int:
     return len(rows)
 
 
-def _incomplete_calendar(collected: Sequence[CollectedBaseResponse], scope: ActiveSeasonScope) -> bool:
+def _publication_state(collected: Sequence[CollectedBaseResponse], scope: ActiveSeasonScope) -> str:
     by_endpoint = {item.request.endpoint: item.response.data for item in collected}
     fixtures, standings = by_endpoint["/fixtures"], by_endpoint["/standings"]
     fixture_rows = fixtures.get("response") if isinstance(fixtures, Mapping) else None
     standing_rows = standings.get("response") if isinstance(standings, Mapping) else None
     if not isinstance(fixture_rows, list) or not isinstance(standing_rows, list) or not standing_rows:
-        return True
+        return "incomplete_publication"
     league = standing_rows[0].get("league") if isinstance(standing_rows[0], Mapping) else None
     groups = league.get("standings") if isinstance(league, Mapping) else None
     if not isinstance(groups, list) or not groups or not isinstance(groups[0], list):
-        return True
+        return "invalid_standings"
     if len(groups) != 1:
-        return False
-    return len(fixture_rows) < scope.expected_fixture_count or len(groups[0]) < scope.expected_team_count
+        return "multi_group"
+    if len(groups[0]) < scope.expected_team_count:
+        return "incomplete_standings"
+    if len(fixture_rows) < scope.expected_fixture_count:
+        return "incomplete_calendar"
+    return "complete"
 
 
 class Worker:
@@ -443,12 +447,14 @@ class Worker:
         if tuple(requests[:2]) != (first, second): raise CatalogueBootstrapError("active-season request contract changed")
         self._repository.renew(item)
         collected.extend([await self._capture(directory, request) for request in requests[2:]])
-        if _incomplete_calendar(collected, scope):
-            self._repository.requeue(item, checkpoint={"outcome": "pending_not_published", "reason": "incomplete_calendar", "capture_generation": generation + 1, "next_check_at": (datetime.now(UTC) + timedelta(seconds=self._settings.not_published_delay_seconds)).isoformat()}, error="incomplete_calendar", delay_seconds=self._settings.not_published_delay_seconds)
-            return self._report(item, "pending_not_published", "incomplete_calendar")
+        publication_state = _publication_state(collected, scope)
+        if publication_state in {"incomplete_publication", "incomplete_standings"}:
+            self._repository.requeue(item, checkpoint={"outcome": "pending_not_published", "reason": publication_state, "capture_generation": generation + 1, "next_check_at": (datetime.now(UTC) + timedelta(seconds=self._settings.not_published_delay_seconds)).isoformat()}, error=publication_state, delay_seconds=self._settings.not_published_delay_seconds)
+            return self._report(item, "pending_not_published", publication_state)
+        import_scope = replace(scope, require_complete_schedule=publication_state == "complete")
         try:
             self._repository.renew(item)
-            validate_base_responses(collected, scope=scope); self._repository.import_and_verify(scope=scope, collected=collected)
+            validate_base_responses(collected, scope=import_scope); self._repository.import_and_verify(scope=import_scope, collected=collected)
         except SeasonBootstrapError as error:
             self._repository.complete(item, {"outcome": "deferred_unsupported_format", "reason": type(error).__name__, "capture_generation": generation})
             return self._report(item, "deferred_unsupported_format", type(error).__name__)
@@ -456,7 +462,8 @@ class Worker:
         # longer needed and is removed before this item becomes terminal.
         self._spool.purge_generation(directory)
         statistics = await self._backfill_statistics(item)
-        self._repository.complete(item, {"outcome": "imported", "capture_generation": generation, "statistics": statistics}); return self._report(item, "imported")
+        outcome = "imported" if publication_state == "complete" else "imported_partial"
+        self._repository.complete(item, {"outcome": outcome, "calendar_complete": publication_state == "complete", "observed_fixture_count": len(collected[-1].response.data["response"]), "expected_fixture_count": scope.expected_fixture_count, "capture_generation": generation, "statistics": statistics}); return self._report(item, outcome)
 
     async def run_once(self) -> Report:
         reports: list[LeagueReport] = []

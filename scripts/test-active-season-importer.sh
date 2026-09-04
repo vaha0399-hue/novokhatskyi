@@ -48,6 +48,7 @@ for migration in \
   "$ROOT_DIR/supabase/migrations/20260823010000_historical_lineups_foundation.sql" \
   "$ROOT_DIR/supabase/migrations/20260829010000_sync_control_plane_foundation.sql" \
   "$ROOT_DIR/supabase/migrations/20260902014134_add_postponed_fixture_status_mapping.sql" \
+  "$ROOT_DIR/supabase/migrations/20260904010000_add_terminal_fixture_status_mappings.sql" \
   "$ROOT_DIR/supabase/migrations/20260902014917_allow_unknown_postponed_kickoffs.sql" \
   "$ROOT_DIR/supabase/migrations/20260904000000_catalogue_bootstrap_daily_quota.sql"
 do

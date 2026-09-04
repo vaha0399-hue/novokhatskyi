@@ -19,9 +19,14 @@ reuses completed endpoint captures. A partial endpoint capture is discarded
 and only that endpoint is fetched again.
 
 Eligible regular leagues require one standings group and a complete
-double-round-robin fixture catalogue. A temporarily incomplete calendar is
-`pending_not_published`; its `ops.sync_work_items.available_at` is the
-authoritative next-check time. Cups, multi-group, split and playoff formats
+double-round-robin fixture catalogue. If the standings group already contains
+every season team but the fixture catalogue is temporarily incomplete, the
+worker imports the known teams, standings and fixtures as `imported_partial`.
+Its checkpoint records `calendar_complete: false`, observed/expected fixture
+counts and raw provenance; a later catalogue/fixtures sync may add only new
+provider fixture IDs or update existing kickoff/status values. It never deletes
+known fixtures. A standings response that does not yet cover every season team
+remains `pending_not_published`. Cups, multi-group, split and playoff formats
 are recorded as deferred without canonical writes until a deterministic format
 adapter is added.
 

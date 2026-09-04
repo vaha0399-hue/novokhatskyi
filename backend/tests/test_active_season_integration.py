@@ -58,6 +58,81 @@ def _collected(received_at: datetime) -> tuple[CollectedBaseResponse, ...]:
     )
 
 
+def _partial_collected(received_at: datetime) -> tuple[CollectedBaseResponse, ...]:
+    """A separate regular league with one not-yet-published fixture."""
+    scope = ActiveSeasonScope(
+        league_external_id=140,
+        season_start_year=2026,
+        expected_fixture_count=380,
+        require_complete_schedule=False,
+    )
+    original = _collected(received_at)
+    transformed: list[CollectedBaseResponse] = []
+    for item, request in zip(original, base_requests(scope), strict=True):
+        payload = copy.deepcopy(item.response.data)
+        payload["parameters"] = {key: str(value) for key, value in request.params.items()}
+        if request.endpoint == "/leagues":
+            payload["response"][0]["league"].update({"id": 140, "name": "Partial Test League"})
+        elif request.endpoint == "/standings":
+            payload["response"][0]["league"].update({"id": 140, "name": "Partial Test League"})
+        elif request.endpoint == "/fixtures":
+            payload["response"] = payload["response"][:-1]
+            payload["results"] = len(payload["response"])
+            for fixture in payload["response"]:
+                fixture["league"].update({"id": 140, "name": "Partial Test League"})
+                fixture["fixture"]["id"] += 1_000_000
+            next(fixture for fixture in payload["response"] if fixture["fixture"]["status"]["short"] == "FT")["fixture"]["status"]["short"] = "PEN"
+        transformed.append(
+            CollectedBaseResponse(
+                request=request,
+                response=_response(payload),
+                request_started_at=item.request_started_at,
+                response_received_at=item.response_received_at,
+            )
+        )
+    return tuple(transformed)
+
+
+def test_partial_calendar_is_upserted_without_claiming_a_full_schedule() -> None:
+    assert TEST_DB_URL is not None
+    partial_scope = ActiveSeasonScope(140, 2026, 380, require_complete_schedule=False)
+    full_scope = ActiveSeasonScope(140, 2026, 380)
+    received_at = datetime.now(UTC)
+    with psycopg.connect(TEST_DB_URL) as conn:
+        first = import_active_base(conn, collected=_partial_collected(received_at), scope=partial_scope)
+        partial = verify_active_season(conn, scope=partial_scope)
+
+        assert first.season_id == partial.season_id
+        assert (partial.team_count, partial.fixture_count, partial.fixture_mapping_count, partial.standing_row_count) == (20, 379, 379, 20)
+
+        full_payload = list(_partial_collected(received_at + timedelta(minutes=1)))
+        fixture_response = _collected(received_at + timedelta(minutes=1))[3].response.data
+        full_fixture_payload = {
+            **copy.deepcopy(fixture_response),
+            "parameters": {"league": "140", "season": "2026"},
+            "response": [
+                {
+                    **fixture,
+                    "fixture": {**fixture["fixture"], "id": fixture["fixture"]["id"] + 1_000_000},
+                    "league": {**fixture["league"], "id": 140, "name": "Partial Test League"},
+                }
+                for fixture in fixture_response["response"]
+            ],
+        }
+        full_fixture_payload["results"] = len(full_fixture_payload["response"])
+        full_payload[3] = CollectedBaseResponse(
+            request=full_payload[3].request,
+            response=_response(full_fixture_payload),
+            request_started_at=received_at,
+            response_received_at=received_at + timedelta(minutes=1),
+        )
+        import_active_base(conn, collected=tuple(full_payload), scope=full_scope)
+        full = verify_active_season(conn, scope=full_scope)
+
+        assert (full.fixture_count, full.fixture_mapping_count) == (380, 380)
+        conn.rollback()
+
+
 def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replay retained provider bytes only; never call API-Football or Supabase."""
     assert TEST_DB_URL is not None
