@@ -83,6 +83,7 @@ class Settings:
     fetch_retries: int = DEFAULT_FETCH_RETRIES
     item_attempt_limit: int = DEFAULT_ITEM_ATTEMPTS
     not_published_delay_seconds: int = DEFAULT_NOT_PUBLISHED_DELAY_SECONDS
+    league_ids: frozenset[int] | None = None
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -104,7 +105,14 @@ class Settings:
             raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_PACING_SECONDS must be numeric") from error
         if pacing < 0:
             raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_PACING_SECONDS must be non-negative")
-        return cls(database_url, Path(values.get("CATALOGUE_BOOTSTRAP_SPOOL_DIR", str(DEFAULT_SPOOL_DIR))), integer("CATALOGUE_BOOTSTRAP_QUOTA_RESERVE", DEFAULT_QUOTA_RESERVE, 0), integer("CATALOGUE_BOOTSTRAP_DAILY_REQUEST_CAP", DEFAULT_DAILY_REQUEST_CAP), integer("CATALOGUE_BOOTSTRAP_RUN_REQUEST_CAP", DEFAULT_RUN_REQUEST_CAP), pacing, integer("CATALOGUE_BOOTSTRAP_FETCH_RETRIES", DEFAULT_FETCH_RETRIES), integer("CATALOGUE_BOOTSTRAP_ITEM_ATTEMPTS", DEFAULT_ITEM_ATTEMPTS), integer("CATALOGUE_BOOTSTRAP_NOT_PUBLISHED_DELAY_SECONDS", DEFAULT_NOT_PUBLISHED_DELAY_SECONDS))
+        raw_ids = values.get("CATALOGUE_BOOTSTRAP_LEAGUE_IDS", "").strip()
+        try:
+            league_ids = None if not raw_ids else frozenset(int(value.strip()) for value in raw_ids.split(","))
+        except ValueError as error:
+            raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_LEAGUE_IDS must be comma-separated positive IDs") from error
+        if league_ids is not None and (not league_ids or min(league_ids) <= 0):
+            raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_LEAGUE_IDS must contain positive IDs")
+        return cls(database_url, Path(values.get("CATALOGUE_BOOTSTRAP_SPOOL_DIR", str(DEFAULT_SPOOL_DIR))), integer("CATALOGUE_BOOTSTRAP_QUOTA_RESERVE", DEFAULT_QUOTA_RESERVE, 0), integer("CATALOGUE_BOOTSTRAP_DAILY_REQUEST_CAP", DEFAULT_DAILY_REQUEST_CAP), integer("CATALOGUE_BOOTSTRAP_RUN_REQUEST_CAP", DEFAULT_RUN_REQUEST_CAP), pacing, integer("CATALOGUE_BOOTSTRAP_FETCH_RETRIES", DEFAULT_FETCH_RETRIES), integer("CATALOGUE_BOOTSTRAP_ITEM_ATTEMPTS", DEFAULT_ITEM_ATTEMPTS), integer("CATALOGUE_BOOTSTRAP_NOT_PUBLISHED_DELAY_SECONDS", DEFAULT_NOT_PUBLISHED_DELAY_SECONDS), league_ids)
 
 
 @dataclass(frozen=True)
@@ -263,7 +271,7 @@ class PostgresRepository:
 
 def parse_catalogue(response: APIFootballResponse) -> tuple[CatalogueCompetition, ...]:
     payload = response.data
-    if payload.get("get") != "leagues" or payload.get("parameters") != {} or payload.get("errors") not in ({}, [], None) or payload.get("paging") != {"current": 1, "total": 1}:
+    if payload.get("get") != "leagues" or payload.get("parameters") not in ({}, []) or payload.get("errors") not in ({}, [], None) or payload.get("paging") != {"current": 1, "total": 1}:
         raise CatalogueBootstrapError("invalid global catalogue envelope")
     records = payload.get("response")
     if not isinstance(records, list) or payload.get("results") != len(records):
@@ -426,6 +434,8 @@ class Worker:
             self._spool.stage(catalogue_dir, catalogue)
             self._spool.mark_catalogue_pending(catalogue_dir)
             items = parse_catalogue(catalogue.response)
+            if self._settings.league_ids is not None:
+                items = tuple(item for item in items if item.league_external_id in self._settings.league_ids)
             if not items: raise CatalogueBootstrapError("provider catalogue is empty")
             run_id = self._repository.create_run(items, catalogue_sha256=hashlib.sha256(catalogue.response.raw_body).hexdigest(), request_count=self._requests)
             self._spool.consume_pending_catalogues()
