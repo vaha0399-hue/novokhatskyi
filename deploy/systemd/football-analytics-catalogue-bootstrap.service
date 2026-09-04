@@ -1,0 +1,25 @@
+[Unit]
+Description=Football Analytics autonomous regular-league catalogue bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=football-analytics
+Group=football-analytics
+WorkingDirectory=/opt/football-analytics/backend
+EnvironmentFile=/opt/football-analytics/.env
+Environment=CATALOGUE_BOOTSTRAP_SPOOL_DIR=/var/lib/football-analytics/catalogue-bootstrap
+Environment=CATALOGUE_BOOTSTRAP_DAILY_REQUEST_CAP=6000
+Environment=CATALOGUE_BOOTSTRAP_QUOTA_RESERVE=25
+Environment=CATALOGUE_BOOTSTRAP_RUN_REQUEST_CAP=1000
+Environment=CATALOGUE_BOOTSTRAP_PACING_SECONDS=0.25
+Environment=UV_CACHE_DIR=/var/cache/football-analytics
+Environment=UV_PROJECT_ENVIRONMENT=/var/lib/football-analytics/venv
+CacheDirectory=football-analytics
+StateDirectory=football-analytics
+TimeoutStartSec=30m
+ExecStart=/var/lib/football-analytics/venv/bin/python -m app.importer.season_sync --catalogue
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict

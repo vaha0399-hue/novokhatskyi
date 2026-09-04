@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Football Analytics catalogue bootstrap hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=football-analytics-catalogue-bootstrap.service
+
+[Install]
+WantedBy=timers.target
