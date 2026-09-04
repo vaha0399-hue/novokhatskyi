@@ -3,8 +3,8 @@
 `python -m app.importer.season_sync --catalogue` is a backend-only worker. It
 does not use Codex, OpenAI, an HTTP endpoint, or user input at runtime.
 
-For each eligible provider `League` with one current season and standings
-coverage, it performs:
+For each selected eligible provider `League` with one current season and
+standings coverage, it performs:
 
 ```text
 API-Football → durable VPS raw capture → strict validation
@@ -28,6 +28,33 @@ adapter is added.
 The worker uses `ops.sync_runs` and `ops.sync_work_items` for restart-safe
 leases and checkpoints. `ops.provider_daily_request_usage` reserves an
 API-Football request before network I/O, so daily quota survives restarts.
+
+## Default approved queue: 50 next leagues
+
+With no `CATALOGUE_BOOTSTRAP_LEAGUE_IDS` environment override, the worker is
+restricted to the next approved tranche of **50** competitions from the
+retained scanner-candidate snapshot. It is not permitted to enumerate and
+import the provider's whole catalogue by default.
+
+The tranche is all remaining regular candidates from the 2026-09-01 snapshot
+after the 24 scopes already imported before catalogue bootstrap, excluding
+provider `1032` (Copa de la Liga Profesional) and `254` (NWSL Women), whose
+format handling is deferred. The exact versioned provider IDs live in
+`backend/app/importer/catalogue_bootstrap.py` as
+`DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS`:
+
+```text
+72, 80, 82, 89, 98, 114, 119, 128, 134, 144, 145, 169, 172, 179,
+197, 207, 210, 233, 235, 236, 239, 242, 244, 250, 252, 253, 262,
+265, 271, 281, 283, 286, 292, 301, 305, 307, 323, 327, 344, 345,
+357, 363, 383, 421, 475, 479, 549, 624, 813, 1104
+```
+
+An explicit `CATALOGUE_BOOTSTRAP_LEAGUE_IDS=39,218` replaces this default for
+a narrowly scoped smoke or recovery run. A candidate is still not guaranteed
+to import: the worker must validate teams, a complete regular calendar,
+standings, mappings and statistics. Unsupported/split formats are safely
+deferred, and incomplete calendars are retried at their checkpoint time.
 
 ## Deployment order
 

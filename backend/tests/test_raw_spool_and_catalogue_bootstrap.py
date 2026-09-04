@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.api_football import APIFootballResponse
-from app.importer.catalogue_bootstrap import CatalogueCompetition, Report, Settings, Worker, parse_catalogue
+from app.importer.catalogue_bootstrap import DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS, CatalogueCompetition, Report, Settings, Worker, parse_catalogue
 from app.importer.raw_spool import RawSpool, RawSpoolArtifact
 from app.importer.season_bootstrap import BaseRequest
 
@@ -74,6 +74,22 @@ def test_catalogue_classifies_only_current_regular_leagues() -> None:
     assert [(item.league_external_id, item.initial_outcome) for item in items] == [
         (2, "deferred_unsupported_type"), (9, "deferred_no_current_season"), (39, None)
     ]
+
+
+def test_environment_uses_the_approved_next_fifty_league_allow_list() -> None:
+    settings = Settings.from_environment({"SUPABASE_DB_URL": "postgresql://unused"})
+
+    assert settings.league_ids == DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS
+    assert len(settings.league_ids) == 50
+    assert 39 not in settings.league_ids
+    assert 1032 not in settings.league_ids
+    assert 254 not in settings.league_ids
+
+
+def test_environment_override_replaces_the_default_allow_list() -> None:
+    settings = Settings.from_environment({"SUPABASE_DB_URL": "postgresql://unused", "CATALOGUE_BOOTSTRAP_LEAGUE_IDS": "39, 218"})
+
+    assert settings.league_ids == frozenset({39, 218})
 
 
 @dataclass

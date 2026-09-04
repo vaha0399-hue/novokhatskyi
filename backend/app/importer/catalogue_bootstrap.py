@@ -41,6 +41,22 @@ DEFAULT_FETCH_RETRIES = 3
 DEFAULT_ITEM_ATTEMPTS = 3
 DEFAULT_NOT_PUBLISHED_DELAY_SECONDS = 6 * 60 * 60
 
+# This is the next approved expansion tranche, selected from the retained
+# 2026-09-01 scanner candidate snapshot.  It deliberately excludes the 24
+# scopes already imported before this worker was introduced, competition 1032
+# (a Copa despite the provider's `League` label), and 254 (NWSL, deferred with
+# the women's-format work).  It is a safety boundary: an unset environment
+# must never turn the timer into an all-catalogue import.
+DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS = frozenset(
+    {
+        72, 80, 82, 89, 98, 114, 119, 128, 134, 144, 145, 169, 172, 179,
+        197, 207, 210, 233, 235, 236, 239, 242, 244, 250, 252, 253, 262,
+        265, 271, 281, 283, 286, 292, 301, 305, 307, 323, 327, 344, 345,
+        357, 363, 383, 421, 475, 479, 549, 624, 813, 1104,
+    }
+)
+assert len(DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS) == 50
+
 
 class CatalogueBootstrapError(RuntimeError):
     """The autonomous catalogue bootstrap cannot safely continue."""
@@ -108,7 +124,7 @@ class Settings:
             raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_PACING_SECONDS must be non-negative")
         raw_ids = values.get("CATALOGUE_BOOTSTRAP_LEAGUE_IDS", "").strip()
         try:
-            league_ids = None if not raw_ids else frozenset(int(value.strip()) for value in raw_ids.split(","))
+            league_ids = DEFAULT_CATALOGUE_BOOTSTRAP_LEAGUE_IDS if not raw_ids else frozenset(int(value.strip()) for value in raw_ids.split(","))
         except ValueError as error:
             raise CatalogueBootstrapError("CATALOGUE_BOOTSTRAP_LEAGUE_IDS must be comma-separated positive IDs") from error
         if league_ids is not None and (not league_ids or min(league_ids) <= 0):
