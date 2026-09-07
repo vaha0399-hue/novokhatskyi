@@ -23,13 +23,13 @@ source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
   local cleanup_failed=0
-  if ! fa_assert_test_resource; then
+  if ! fa_assert_cleanup_resource; then
     printf 'refusing cleanup: test resource marker no longer matches %s\n' "$WORK_DIR" >&2
     return
   fi
   if [[ -n "$REDIS_PID" ]] && kill -0 "$REDIS_PID" 2>/dev/null; then
     if [[ -S "$REDIS_SOCKET" ]]; then
-      redis-cli -s "$REDIS_SOCKET" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+      fa_redis_client redis-cli -s "$REDIS_SOCKET" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
     fi
     for _ in {1..20}; do
       kill -0 "$REDIS_PID" 2>/dev/null || break
@@ -63,15 +63,17 @@ fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$REDIS_SOCKET" \
   "$CLEAN_DB" "$UPGRADE_DB" "$RESTORE_DB"
 
 pg_control() {
-  fa_assert_pg_control_connection
-  "$@" -h "$SOCKET_DIR" -p "$PORT" -U postgres
+  if ! fa_assert_pg_control_connection; then return 1; fi
+  fa_pg_client "$@" -h "$SOCKET_DIR" -p "$PORT" -U postgres
 }
 
 psql_db() {
   local database="$1"
   shift
-  fa_assert_pg_database "$database"
-  "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 "$(fa_pg_url "$database")" "$@"
+  local database_url
+  if ! fa_assert_pg_database "$database"; then return 1; fi
+  if ! database_url="$(fa_pg_url "$database")"; then return 1; fi
+  fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 "$database_url" "$@"
 }
 
 create_database() {
@@ -141,7 +143,7 @@ start_redis() {
   done
   [[ -S "$REDIS_SOCKET" ]]
   fa_assert_redis_url "unix://$REDIS_SOCKET"
-  redis-cli -s "$REDIS_SOCKET" PING | grep -qx PONG
+  fa_redis_client redis-cli -s "$REDIS_SOCKET" PING | grep -qx PONG
 }
 
 assert_clean_schema() {
@@ -156,8 +158,10 @@ assert_upgrade_preserves_synthetic_data() {
 
 schema_fingerprint() {
   local database="$1"
-  fa_assert_pg_database "$database"
-  "$PG_BIN/pg_dump" --schema-only --no-owner --no-privileges "$(fa_pg_url "$database")" \
+  local database_url
+  if ! fa_assert_pg_database "$database"; then return 1; fi
+  if ! database_url="$(fa_pg_url "$database")"; then return 1; fi
+  fa_pg_client "$PG_BIN/pg_dump" --schema-only --no-owner --no-privileges "$database_url" \
     | sed -e '/^\\connect /d' -e '/^\\restrict /d' -e '/^\\unrestrict /d' \
     | sha256sum | awk '{print $1}'
 }
@@ -176,11 +180,11 @@ verify_backup_restore() {
   fa_assert_pg_database "$UPGRADE_DB"
   fa_assert_pg_database "$RESTORE_DB"
   printf 'Create custom-format backup...\n'
-  "$PG_BIN/pg_dump" --format=custom --file="$BACKUP_FILE" "$(fa_pg_url "$UPGRADE_DB")"
+  fa_pg_client "$PG_BIN/pg_dump" --format=custom --file="$BACKUP_FILE" "$(fa_pg_url "$UPGRADE_DB")"
   [[ -s "$BACKUP_FILE" ]]
   printf 'Restore backup into a second disposable database...\n'
   create_database "$RESTORE_DB"
-  "$PG_BIN/pg_restore" --exit-on-error --no-owner --no-privileges -d "$(fa_pg_url "$RESTORE_DB")" "$BACKUP_FILE"
+  fa_pg_client "$PG_BIN/pg_restore" --exit-on-error --no-owner --no-privileges -d "$(fa_pg_url "$RESTORE_DB")" "$BACKUP_FILE"
   printf 'Compare restored schema...\n'
   [[ "$(schema_fingerprint "$UPGRADE_DB")" == "$(schema_fingerprint "$RESTORE_DB")" ]]
   printf 'Compare restored key records...\n'
@@ -196,6 +200,8 @@ run_safe_integrations() {
   redis_url="unix://$REDIS_SOCKET"
   fa_assert_redis_url "$redis_url"
   env -u API_FOOTBALL_KEY -u SUPABASE_DB_URL -u REDIS_URL \
+    -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD \
+    -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
     FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" \
     ANALYTICS_TEST_DB_URL="$database_url" \
     READ_API_TEST_DB_URL="$database_url" \
@@ -218,7 +224,8 @@ run_backend_suite() {
     -u CURRENT_SEASON_STATISTICS_TEST_DB_URL -u HISTORICAL_LINEUPS_TEST_DB_URL \
     -u LIVE_DOMAIN_TEST_DB_URL -u LIVE_REDIS_TEST_URL -u LIVE_WORKER_TEST_DB_URL \
     -u READ_API_TEST_DB_URL -u SEASON_BOOTSTRAP_TEST_DB_URL -u API_FOOTBALL_KEY \
-    -u SUPABASE_DB_URL \
+    -u SUPABASE_DB_URL -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER \
+    -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
     FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" REDIS_URL="$redis_url" \
     uv run --directory "$ROOT_DIR/backend" pytest -q
 }

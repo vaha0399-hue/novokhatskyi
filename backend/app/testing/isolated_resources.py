@@ -32,7 +32,19 @@ _DATABASE_ENVIRONMENT_VARIABLES = (
     "SEASON_BOOTSTRAP_TEST_DB_URL",
 )
 _REDIS_ENVIRONMENT_VARIABLES = ("LIVE_REDIS_TEST_URL", "REDIS_URL")
-_RUNTIME_PREFIX = "/tmp/football-analytics-isolated-"
+_LIBPQ_ENVIRONMENT_VARIABLES = (
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGDATABASE",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGPASSFILE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGOPTIONS",
+)
+_RUNTIME_PREFIX = "/tmp/football-analytics-"
 
 
 @dataclass(frozen=True)
@@ -88,12 +100,12 @@ def load_manifest(path_value: str | os.PathLike[str]) -> IsolatedResourceManifes
     if not isinstance(port, int) or not 1024 <= port <= 65535:
         raise IsolatedResourceError("test resource PostgreSQL port is invalid")
     if not isinstance(databases, list) or not databases or not all(
-        isinstance(name, str) and name.startswith("fa_iso_") for name in databases
+        isinstance(name, str) and name.startswith("fa_") for name in databases
     ):
         raise IsolatedResourceError("test resource database allowlist is invalid")
     postgres_socket = Path(socket_value)
     redis_socket = Path(redis_value)
-    if postgres_socket.resolve() != runtime_dir / "postgres-socket":
+    if postgres_socket.parent.resolve() != runtime_dir or not postgres_socket.is_dir():
         raise IsolatedResourceError("PostgreSQL socket directory is outside the test runtime")
     if redis_socket.parent.resolve() != runtime_dir:
         raise IsolatedResourceError("Redis socket is outside the test runtime")
@@ -137,6 +149,9 @@ def validate_redis_url(url: str, manifest: IsolatedResourceManifest) -> None:
 
 def validate_test_environment(environ: dict[str, str] | os._Environ[str]) -> None:
     """Validate every configured integration destination before pytest starts."""
+    for variable in _LIBPQ_ENVIRONMENT_VARIABLES:
+        if environ.get(variable):
+            raise IsolatedResourceError(f"unsafe inherited libpq setting: {variable}")
     configured = {
         name: environ[name]
         for name in (*_DATABASE_ENVIRONMENT_VARIABLES, *_REDIS_ENVIRONMENT_VARIABLES)

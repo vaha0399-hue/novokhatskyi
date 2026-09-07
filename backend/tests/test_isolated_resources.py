@@ -19,6 +19,7 @@ from app.testing.isolated_resources import (
 def manifest_path(tmp_path: Path) -> Path:
     runtime = Path("/tmp") / f"football-analytics-isolated-guard-{tmp_path.name}"
     runtime.mkdir()
+    (runtime / "postgres-socket").mkdir()
     token = "a" * 32
     (runtime / ".fa-test-resource").write_text(token, encoding="utf-8")
     path = runtime / "test-resource.json"
@@ -77,3 +78,37 @@ def test_environment_rejects_configured_url_without_runner_manifest() -> None:
 def test_environment_rejects_direct_redis_url_without_runner_manifest() -> None:
     with pytest.raises(IsolatedResourceError, match="require FA_TEST_RESOURCE_MANIFEST"):
         validate_test_environment({"REDIS_URL": "redis://127.0.0.1:6379/0"})
+
+
+def test_manifest_rejects_missing_ownership_marker(manifest_path: Path) -> None:
+    (manifest_path.parent / ".fa-test-resource").unlink()
+    with pytest.raises(IsolatedResourceError, match="marker is missing"):
+        load_manifest(manifest_path)
+
+
+def test_manifest_rejects_wrong_ownership_marker(manifest_path: Path) -> None:
+    (manifest_path.parent / ".fa-test-resource").write_text("b" * 32, encoding="utf-8")
+    with pytest.raises(IsolatedResourceError, match="does not match"):
+        load_manifest(manifest_path)
+
+
+def test_manifest_rejects_missing_file(manifest_path: Path) -> None:
+    manifest_path.unlink()
+    with pytest.raises(IsolatedResourceError, match="cannot read"):
+        load_manifest(manifest_path)
+
+
+def test_environment_rejects_missing_manifest_for_owned_looking_url() -> None:
+    with pytest.raises(IsolatedResourceError, match="require FA_TEST_RESOURCE_MANIFEST"):
+        validate_test_environment(
+            {"READ_API_TEST_DB_URL": "postgresql://postgres@/fa_iso_looks_owned?host=/tmp/x&port=55490"}
+        )
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE", "PGPASSFILE", "PGPASSWORD"],
+)
+def test_environment_rejects_inherited_libpq_connection_setting(variable: str) -> None:
+    with pytest.raises(IsolatedResourceError, match="libpq"):
+        validate_test_environment({variable: "external-value"})
