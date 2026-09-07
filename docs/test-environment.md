@@ -1,7 +1,8 @@
 # Isolated test environment
 
 This document describes the reproducible test environment validated against
-baseline commit `34fdb52c8ae4629d6165eb76531ea1671944f106` on 2026-09-07.
+baseline commit `34fdb52c8ae4629d6165eb76531ea1671944f106` and the local
+isolated-environment commits `e4f076e` and `cb1f44a` on 2026-09-07.
 It does not use `.env`, a Supabase connection, a production dump, raw provider
 data, Docker, or a TCP listener.
 
@@ -37,8 +38,8 @@ stop, or inspect application services.
 
 ## Connection protection
 
-Before PostgreSQL or Redis is contacted, the runner creates a nonce marker and
-`test-resource.json` in a new `/tmp/football-analytics-isolated-*` directory.
+Before PostgreSQL or Redis is contacted, every runner creates a nonce marker and
+`test-resource.json` in its own `/tmp/football-analytics-*` directory.
 The manifest records the one PostgreSQL socket directory, port, allowed database
 names, and the one Redis socket.
 
@@ -52,6 +53,15 @@ PostgreSQL host, and a database name absent from the run allowlist fail before
 any client connection. `backend/tests/test_isolated_resources.py` supplies the
 negative tests for those cases.
 
+The shell guard returns a non-zero status explicitly after every failed check,
+including when it is invoked in `if`, under `!`, or through command
+substitution. Cleanup verifies the same marker before it can call Redis,
+signal a process, stop PostgreSQL, or remove a file. PostgreSQL wrappers clear
+`PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`,
+`PGPASSFILE`, `PGSERVICE`, `PGSERVICEFILE`, and `PGOPTIONS`; pytest rejects a
+non-empty inherited value before collection, so a service file or credentials
+cannot redirect psycopg to another destination.
+
 A database name containing `test` is never accepted as proof of safety. The
 instance socket and nonce-bearing manifest prove ownership instead.
 
@@ -61,12 +71,18 @@ instance socket and nonce-bearing manifest prove ownership instead.
 
 | Check | Result |
 | --- | --- |
-| Negative destination guards | 7 passed; no connection is attempted for rejected URLs |
+| Positive guard unit tests | 17 passed: valid owned PostgreSQL/Redis manifest and URLs accepted |
+| Negative shell guard tests | passed: missing/wrong marker, missing manifest, direct/`if`/`!`/command-substitution failures, `PGHOSTADDR`, `PGSERVICE`, and cleanup mocks; no client was invoked |
+| Negative Python guard tests | included in the 17: missing marker/manifest, foreign PostgreSQL/Redis URL, absent manifest, inherited `PGHOSTADDR`, `PGSERVICE`, `PGSERVICEFILE`, `PGPASSFILE`, and `PGPASSWORD` |
+| Negative destination guards in full runner | passed; rejected URLs were stopped before connection |
 | All 15 migrations on an empty database | passed |
 | Upgrade from the earlier synthetic schema | passed; existing Stage 3D and historical-lineup preservation assertions passed |
 | Backup and restore | passed: custom `pg_dump`, `pg_restore --exit-on-error`, equal schema, key-record, and constraint fingerprints |
 | Selected isolated PostgreSQL/Redis integration tests | 5 passed |
-| Full backend suite with all database integration URLs unset | 316 passed, 50 skipped, 0 failed |
+| Full backend suite with all database integration URLs unset | 325 passed, 50 skipped, 0 failed |
+| Legacy PostgreSQL integration scripts | passed: active season 22; current statistics 1 then 8; historical lineups 25; live worker 1; season bootstrap 14 then 3 |
+| Legacy Redis integration script | passed: live REST 2 |
+| Legacy migration scripts | passed: Stage 3D additive; historical lineups additive |
 | Frontend `npm test` | 35 passed, 0 failed, 0 skipped |
 | Frontend typecheck and production build | passed |
 
