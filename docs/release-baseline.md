@@ -86,3 +86,29 @@ The sandbox process listing found no project process. No matching user timer
 was listed. Host systemd/Docker visibility was unavailable from this sandbox,
 so this is evidence only for the current namespace, not a claim about the
 host. No process or timer was restarted or changed.
+
+## Isolated test-environment reproducibility (2026-09-07)
+
+The baseline validated by this test run is
+`34fdb52c8ae4629d6165eb76531ea1671944f106`. The reproducible local gate is
+`bash scripts/test-isolated-environment.sh`; it creates its own PostgreSQL 18
+cluster and Redis 8 server under a nonce-bearing
+`/tmp/football-analytics-isolated-*` directory, applies all 15 migrations in
+lexical order, and removes only that directory at exit.
+
+Results on this VPS:
+
+- destination guard tests: 7 passed; foreign PostgreSQL and Redis destinations
+  are rejected before a connection is attempted;
+- clean schema and synthetic previous-schema migration runs: passed;
+- custom-format `pg_dump` / `pg_restore` into a second disposable database:
+  passed, with schema, key-record and constraint fingerprints equal;
+- selected database/Redis integration tests: 5 passed;
+- complete backend suite with all external integration URLs unset: 316 passed,
+  50 skipped, 0 failed;
+- frontend: 35 passed, typecheck passed, production build passed.
+
+`test_web_read_api_integration.py` is intentionally not run by the isolated
+gate because the existing synthetic upgrade fixture has no standings snapshot;
+it is documented as skipped rather than being adapted with product data. See
+`docs/test-environment.md` for commands, guard design, and limitations.
