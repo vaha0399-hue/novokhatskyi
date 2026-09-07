@@ -57,7 +57,7 @@ fa_initialize_test_resource() {
   done
   database_json="${database_json%,}"
 
-  local token manifest
+  local token manifest manifest_digest manifest_digest_line manifest_digest_file
   if ! token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"; then return 1; fi
   if [[ ! "$token" =~ ^[a-f0-9]{32}$ ]]; then
     _fa_fail "unable to create isolated test resource token"
@@ -72,6 +72,18 @@ fa_initialize_test_resource() {
     return 1
   fi
   if ! chmod 600 "$manifest"; then return 1; fi
+  if ! manifest_digest_line="$(sha256sum -- "$manifest")"; then
+    _fa_fail "unable to calculate isolated test resource manifest digest"
+    return 1
+  fi
+  manifest_digest="${manifest_digest_line%% *}"
+  if [[ ! "$manifest_digest" =~ ^[a-f0-9]{64}$ ]]; then
+    _fa_fail "isolated test resource manifest digest is invalid"
+    return 1
+  fi
+  manifest_digest_file="$runtime_dir/.fa-test-resource-manifest.sha256"
+  if ! printf '%s\n' "$manifest_digest" >"$manifest_digest_file"; then return 1; fi
+  if ! chmod 600 "$manifest_digest_file"; then return 1; fi
 
   FA_TEST_RESOURCE_TOKEN="$token"
   FA_TEST_RESOURCE_MANIFEST="$manifest"
@@ -88,6 +100,8 @@ fa_initialize_test_resource() {
 
 fa_assert_test_resource() {
   local runtime_dir="${FA_TEST_RESOURCE_RUNTIME:-}" marker="${FA_TEST_RESOURCE_TOKEN:-}"
+  local manifest_digest manifest_digest_line actual_digest
+  local manifest_digest_file
   if [[ -z "$runtime_dir" || -z "$marker" ]]; then
     _fa_fail "isolated test resource is not initialized"
     return 1
@@ -102,6 +116,25 @@ fa_assert_test_resource() {
   fi
   if [[ ! -f "${FA_TEST_RESOURCE_MANIFEST:-}" || "${FA_TEST_RESOURCE_MANIFEST:-}" != "$runtime_dir/test-resource.json" ]]; then
     _fa_fail "isolated test resource manifest is missing or invalid"
+    return 1
+  fi
+  manifest_digest_file="$runtime_dir/.fa-test-resource-manifest.sha256"
+  if [[ ! -f "$manifest_digest_file" ]]; then
+    _fa_fail "isolated test resource manifest digest is missing or invalid"
+    return 1
+  fi
+  manifest_digest="$(<"$manifest_digest_file")"
+  if [[ ! "$manifest_digest" =~ ^[a-f0-9]{64}$ ]]; then
+    _fa_fail "isolated test resource manifest digest is missing or invalid"
+    return 1
+  fi
+  if ! manifest_digest_line="$(sha256sum -- "$FA_TEST_RESOURCE_MANIFEST")"; then
+    _fa_fail "unable to calculate isolated test resource manifest digest"
+    return 1
+  fi
+  actual_digest="${manifest_digest_line%% *}"
+  if [[ ! "$actual_digest" =~ ^[a-f0-9]{64}$ || "$actual_digest" != "$manifest_digest" ]]; then
+    _fa_fail "isolated test resource manifest digest does not match"
     return 1
   fi
   if [[ "${FA_TEST_RESOURCE_PG_SOCKET_DIR:-}" != "$runtime_dir"/* || "${FA_TEST_RESOURCE_REDIS_SOCKET:-}" != "$runtime_dir"/* ]]; then

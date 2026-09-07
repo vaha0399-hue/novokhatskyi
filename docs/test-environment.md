@@ -38,8 +38,9 @@ stop, or inspect application services.
 
 ## Connection protection
 
-Before PostgreSQL or Redis is contacted, every runner creates a nonce marker and
-`test-resource.json` in its own `/tmp/football-analytics-*` directory.
+Before PostgreSQL or Redis is contacted, every runner creates a nonce marker,
+`test-resource.json`, and a private SHA-256 digest file in its own
+`/tmp/football-analytics-*` directory.
 The manifest records the one PostgreSQL socket directory, port, allowed database
 names, and the one Redis socket.
 
@@ -55,7 +56,10 @@ negative tests for those cases.
 
 The shell guard returns a non-zero status explicitly after every failed check,
 including when it is invoked in `if`, under `!`, or through command
-substitution. Cleanup verifies the same marker before it can call Redis,
+substitution. It records the SHA-256 only after writing the manifest and never
+replaces that stored value during verification; a missing, malformed,
+unreadable, or mismatched digest refuses the resource. Cleanup verifies the
+same marker and manifest digest before it can call Redis,
 signal a process, stop PostgreSQL, or remove a file. PostgreSQL wrappers clear
 `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`,
 `PGPASSFILE`, `PGSERVICE`, `PGSERVICEFILE`, and `PGOPTIONS`; pytest rejects a
@@ -71,8 +75,8 @@ instance socket and nonce-bearing manifest prove ownership instead.
 
 | Check | Result |
 | --- | --- |
-| Positive guard unit tests | 17 passed: valid owned PostgreSQL/Redis manifest and URLs accepted |
-| Negative shell guard tests | passed: missing/wrong marker, missing manifest, direct/`if`/`!`/command-substitution failures, `PGHOSTADDR`, `PGSERVICE`, and cleanup mocks; no client was invoked |
+| Python guard unit tests | 17 passed in total: both valid owned URLs and negative marker/manifest/environment cases |
+| Negative shell guard tests | passed: missing/wrong marker, missing manifest/digest, corrupted/truncated/changed manifest, direct/`if`/`!`/command-substitution failures, `PGHOSTADDR`, `PGSERVICE`, and cleanup mocks; no client was invoked |
 | Negative Python guard tests | included in the 17: missing marker/manifest, foreign PostgreSQL/Redis URL, absent manifest, inherited `PGHOSTADDR`, `PGSERVICE`, `PGSERVICEFILE`, `PGPASSFILE`, and `PGPASSWORD` |
 | Negative destination guards in full runner | passed; rejected URLs were stopped before connection |
 | All 15 migrations on an empty database | passed |
