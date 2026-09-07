@@ -121,3 +121,62 @@ uv run python -m app.importer.active_season \
 The command requires `SUPABASE_DB_URL`, validates each raw/request artifact's
 scope, HTTP status, byte count, SHA-256, and timestamps before opening its
 database transaction. It prints only the final verification counts.
+
+## Seasonal discovery worker
+
+`app.importer.season_sync` is a backend-only, one-shot job intended for a
+systemd timer. It discovers only the reviewed, versioned allow-list:
+Premier League, La Liga, Serie A, Bundesliga, and Ligue 1. It never scans the
+provider's global catalogue and does not expose an HTTP endpoint.
+
+Before any provider request, it checks the canonical season dates. While an
+imported season has not ended, the job records `season_in_progress` and makes
+**zero API-Football calls** for that league. Schedule the timer weekly (or more
+often only in the May--September preseason window); it is not a nine-month
+daily API polling process.
+
+When discovery is due, it makes one bounded `/leagues?id=...` call. Only a
+single provider-marked current `League` season that is absent from canonical
+mappings is eligible. The job then obtains the scope-specific
+league, teams, standings, and fixtures responses. It derives the expected
+fixture count from the reviewed team format, so a partial schedule is recorded
+as `not_ready` without canonical writes. A complete coherent response set is
+validated and passed to the existing atomic active-season importer.
+
+```bash
+uv run python -m app.importer.season_sync
+```
+
+The command requires `API_FOOTBALL_KEY` and `SUPABASE_DB_URL`. It prints a
+sanitised JSON run report and writes the operational checkpoint to
+`ops.sync_runs` / `ops.sync_work_items`; safe rate-limit headers go to
+`source.provider_rate_limit_state`. `SEASONAL_SYNC_QUOTA_RESERVE=3` stops a
+run before consuming the last known provider calls. A provider `429` stops the
+whole run; transport and server failures are recorded and are retried only by
+the next timer invocation, never in a tight loop.
+
+This job performs *first imports only*. Refreshing an existing schedule or
+standings is deliberately a separate worker, because the current canonical
+importer treats a changed future kickoff as an identity conflict.
+
+## Completed statistics worker
+
+`app.importer.incremental_statistics` is the second backend worker, separate
+from the 25-second live/Redis worker. It reuses one API-Football connection
+pool, finalizes only provider terminal results observed at least three hours
+after kickoff, then batch-fetches missing fixture statistics (up to 20 IDs per
+request) and refreshes rolling metrics for affected teams. The finalization
+function is schema-owned; postponed or rescheduled fixtures are not inferred
+as completed.
+
+Configure explicit league/season scopes as `league:season[:max_requests]` and
+run it periodically or continuously:
+
+```bash
+INCREMENTAL_STATISTICS_SCOPES=39:2026 \
+INCREMENTAL_STATISTICS_INTERVAL_SECONDS=900 \
+uv run python -m app.importer.incremental_statistics --continuous
+```
+
+The worker consumes the canonical finalized catalogue and does not write live
+state to Redis. It is intentionally not enabled by the API process.

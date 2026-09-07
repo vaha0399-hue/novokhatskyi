@@ -242,3 +242,10 @@ frontend/coverage/
 
 # Locally cached, provider-derived media. These assets are not source code.
 backend/var/assets/
+
+# Local API-Football capture runs and operational checkpoints may contain
+# provider-derived, non-anonymised data. Keep them available on the host but
+# outside version control.
+artifacts/
+samples/api-football/epl-2026-refresh-2026-08-31T1225Z/
+samples/api-football/predictions-2026-08-29T0653Z/
