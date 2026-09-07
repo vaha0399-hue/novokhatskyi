@@ -232,6 +232,8 @@ pnpm-debug.log*
 # Application source, not a Python environment library directory.
 !frontend/lib/
 !frontend/lib/**
+!scripts/lib/
+!scripts/lib/**
 
 # JavaScript / TypeScript test and build artifacts
 *.tsbuildinfo
