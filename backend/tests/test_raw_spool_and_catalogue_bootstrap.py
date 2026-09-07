@@ -76,6 +76,25 @@ def test_catalogue_classifies_only_current_regular_leagues() -> None:
     ]
 
 
+def test_catalogue_keeps_a_regular_league_with_explicitly_unavailable_standings() -> None:
+    response = _response(
+        {
+            "get": "leagues", "parameters": {}, "errors": {}, "results": 1,
+            "paging": {"current": 1, "total": 1},
+            "response": [
+                {"league": {"id": 187, "name": "Ligue 2", "type": "League"},
+                 "seasons": [{"year": 2026, "current": True, "coverage": {"standings": False}}]}
+            ],
+        }
+    )
+
+    item = parse_catalogue(response)[0]
+
+    assert item.initial_outcome is None
+    assert item.standings_coverage is False
+    assert item.fixture_statistics_coverage is False
+
+
 def test_environment_uses_the_approved_next_fifty_league_allow_list() -> None:
     settings = Settings.from_environment({"SUPABASE_DB_URL": "postgresql://unused"})
 

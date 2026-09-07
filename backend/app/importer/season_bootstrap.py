@@ -267,7 +267,9 @@ def _validate_envelope(collected: CollectedBaseResponse) -> dict[str, Any]:
     return payload
 
 
-def _league_record(payload: Mapping[str, Any], scope: BootstrapScope) -> LeagueRecord:
+def _league_record(
+    payload: Mapping[str, Any], scope: BootstrapScope, *, expected_provider_type: str = "League"
+) -> LeagueRecord:
     response = payload["response"]
     if len(response) != 1 or not isinstance(response[0], Mapping):
         raise SeasonBootstrapError("/leagues must return exactly one league")
@@ -280,7 +282,7 @@ def _league_record(payload: Mapping[str, Any], scope: BootstrapScope) -> LeagueR
     if _require_positive_int(league.get("id"), "league.id") != scope.league_external_id:
         raise SeasonBootstrapError("/leagues returned an unexpected league")
     provider_type = _require_string(league.get("type"), "league.type")
-    if provider_type != "League":
+    if provider_type != expected_provider_type:
         raise SeasonBootstrapError(f"unreviewed provider competition type: {provider_type}")
     matching = [item for item in seasons if isinstance(item, Mapping) and item.get("year") == scope.season_start_year]
     if len(matching) != 1:
@@ -295,13 +297,21 @@ def _league_record(payload: Mapping[str, Any], scope: BootstrapScope) -> LeagueR
         raise SeasonBootstrapError("provider season dates are invalid") from error
     if ends_on < starts_on:
         raise SeasonBootstrapError("provider season end precedes start")
+    country_name = _require_string(country.get("name"), "country.name")
+    country_code = country.get("code")
+    if expected_provider_type == "Cup" and (country_code is None or country_code == ""):
+        # API-Football identifies international cups as ``World`` but returns
+        # a null country code.  A namespaced synthetic provider reference is
+        # stable, non-colliding, and avoids treating this valid Cup shape as a
+        # malformed domestic League payload.
+        country_code = f"cup-country:{country_name.casefold()}"
     return LeagueRecord(
         external_id=scope.league_external_id,
         name=_require_string(league.get("name"), "league.name"),
-        country_name=_require_string(country.get("name"), "country.name"),
-        country_external_code=_require_string(country.get("code"), "country.code"),
+        country_name=country_name,
+        country_external_code=_require_string(country_code, "country.code"),
         country_flag_url=_optional_string(country.get("flag"), "country.flag"),
-        competition_type="league",
+        competition_type=expected_provider_type.lower(),
         logo_url=_optional_string(league.get("logo"), "league.logo"),
         starts_on=starts_on,
         ends_on=ends_on,
@@ -318,8 +328,6 @@ def _team_records(
     response = payload["response"]
     records: list[TeamRecord] = []
     seen: set[int] = set()
-    allowed_country_names = {country_name.casefold()}
-    allowed_country_names.update(item.casefold() for item in additional_team_country_names)
     for item in response:
         if not isinstance(item, Mapping) or not isinstance(item.get("team"), Mapping):
             raise SeasonBootstrapError("/teams item must contain a team object")
@@ -332,8 +340,6 @@ def _team_records(
             raise SeasonBootstrapError("/teams contains a duplicate provider team ID")
         seen.add(external_id)
         team_country = _require_string(team.get("country"), "team.country")
-        if team_country.casefold() not in allowed_country_names:
-            raise SeasonBootstrapError("team country does not match league country")
         founded = _optional_nonnegative_int(team.get("founded"), "team.founded")
         # API-Football uses 0 as an unknown founding year for some otherwise
         # valid clubs (for example Estrela in Primeira Liga 2026/27).
@@ -372,30 +378,36 @@ def _validate_standings(
     payload: Mapping[str, Any], scope: BootstrapScope, team_catalog_external_ids: set[int]
 ) -> tuple[dict[str, Any], frozenset[int]]:
     response = payload["response"]
+    if response == []:
+        if getattr(scope, "allow_empty_standings", False):
+            return dict(payload), frozenset()
+        raise SeasonBootstrapError("standings are not published for this season")
     if len(response) != 1 or not isinstance(response[0], Mapping):
         raise SeasonBootstrapError("/standings must return exactly one league")
     league = response[0].get("league")
     if not isinstance(league, Mapping) or league.get("id") != scope.league_external_id or league.get("season") != scope.season_start_year:
         raise SeasonBootstrapError("standings league/season mismatch")
     groups = league.get("standings")
-    if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], list):
-        raise SeasonBootstrapError("completed league standings must contain exactly one group")
-    rows = groups[0]
-    if len(rows) != scope.expected_team_count:
-        raise SeasonBootstrapError("standings team count mismatch")
+    if not isinstance(groups, list) or not groups or any(not isinstance(group, list) for group in groups):
+        raise SeasonBootstrapError("completed league standings must contain one or more groups")
     provider_ids: set[int] = set()
-    ranks: set[int] = set()
-    for row in rows:
-        if not isinstance(row, Mapping) or not isinstance(row.get("team"), Mapping):
-            raise SeasonBootstrapError("standings row has invalid team")
-        provider_ids.add(_require_positive_int(row["team"].get("id"), "standings.team.id"))
-        ranks.add(_require_positive_int(row.get("rank"), "standings.rank"))
-        for record_name in ("all", "home", "away"):
-            record = row.get(record_name)
-            if not isinstance(record, Mapping) or not isinstance(record.get("goals"), Mapping):
-                raise SeasonBootstrapError(f"standings.{record_name} has invalid structure")
-    if not provider_ids.issubset(team_catalog_external_ids) or ranks != set(range(1, scope.expected_team_count + 1)):
-        raise SeasonBootstrapError("standings membership or ranks do not match provider team catalog")
+    for rows in groups:
+        ranks: set[int] = set()
+        for row in rows:
+            if not isinstance(row, Mapping) or not isinstance(row.get("team"), Mapping):
+                raise SeasonBootstrapError("standings row has invalid team")
+            provider_ids.add(_require_positive_int(row["team"].get("id"), "standings.team.id"))
+            ranks.add(_require_positive_int(row.get("rank"), "standings.rank"))
+            for record_name in ("all", "home", "away"):
+                record = row.get(record_name)
+                if not isinstance(record, Mapping) or not isinstance(record.get("goals"), Mapping):
+                    raise SeasonBootstrapError(f"standings.{record_name} has invalid structure")
+        if ranks != set(range(1, len(rows) + 1)):
+            raise SeasonBootstrapError("standings group ranks do not match group rows")
+    if len(groups) == 1 and len(groups[0]) != scope.expected_team_count:
+        raise SeasonBootstrapError("standings team count mismatch")
+    if not provider_ids.issubset(team_catalog_external_ids):
+        raise SeasonBootstrapError("standings membership does not match provider team catalog")
     if scope.projection is None and provider_ids != team_catalog_external_ids:
         raise SeasonBootstrapError("standings membership does not match season teams")
     return dict(payload), frozenset(provider_ids)
@@ -573,6 +585,27 @@ def _resolve_country(conn: Connection[Any], *, provider_id: int, league: LeagueR
     return country_id
 
 
+def _resolve_team_country(
+    conn: Connection[Any], *, country_name: str, fallback_country_id: int
+) -> int:
+    """Resolve a team's provider country independently from its league."""
+    fallback = conn.execute("SELECT name FROM football.countries WHERE id=%s", (fallback_country_id,)).fetchone()
+    if fallback is None:
+        raise SeasonBootstrapError("canonical league country is missing")
+    if str(fallback[0]).casefold() == country_name.casefold():
+        return fallback_country_id
+    row = conn.execute(
+        """SELECT id FROM football.countries
+           WHERE lower(btrim(name))=lower(btrim(%s)) AND retired_at IS NULL FOR UPDATE""",
+        (country_name,),
+    ).fetchone()
+    if row is not None:
+        return int(row[0])
+    return int(
+        conn.execute("INSERT INTO football.countries(name) VALUES(%s) RETURNING id", (country_name,)).fetchone()[0]
+    )
+
+
 def _resolve_league(conn: Connection[Any], *, provider_id: int, league: LeagueRecord, country_id: int) -> int:
     row = conn.execute(
         """SELECT ref.league_id, target.name, target.country_id, target.competition_type
@@ -702,8 +735,14 @@ def _resolve_team_and_venue(
     ).fetchone()
     if row is not None:
         team_id, name, actual_country_id = row
-        if str(name) != record.name or actual_country_id != country_id:
+        if str(name) != record.name:
             raise SeasonBootstrapError("provider team mapping conflicts with canonical team")
+        if actual_country_id != country_id:
+            # Provider team IDs are the canonical identity.  Their country
+            # metadata can be corrected (for example Newport County is Wales,
+            # not England in an older imported mapping) without creating a
+            # duplicate team or rejecting an otherwise valid Cup season.
+            conn.execute("UPDATE football.teams SET country_id=%s WHERE id=%s", (country_id, team_id))
         team_id = int(team_id)
     else:
         team_id = int(
@@ -738,9 +777,11 @@ def _resolve_team_and_venue(
         (provider_id, str(record.venue_external_id)),
     ).fetchone()
     if row is not None:
-        venue_id, name = row
-        if record.venue_name is not None and str(name) != record.venue_name:
-            raise SeasonBootstrapError("provider venue mapping conflicts with canonical venue")
+        venue_id, _name = row
+        # API-Football rebrands venues while retaining its venue ID (for
+        # example Visma Arena -> Spiris Arena). The provider ID is canonical
+        # identity; display metadata is mutable and the raw response remains
+        # the evidence for a later metadata refresh.
         return team_id, int(venue_id)
     venue_id = int(
         conn.execute(

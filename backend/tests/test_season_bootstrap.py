@@ -112,6 +112,30 @@ def _projected_collected() -> tuple[CollectedBaseResponse, ...]:
     )
 
 
+def _with_multi_group_standings(
+    collected: tuple[CollectedBaseResponse, ...], *, omit_team: bool = False
+) -> tuple[CollectedBaseResponse, ...]:
+    """Split the retained complete table into two independently ranked groups."""
+    responses = list(collected)
+    standings = copy.deepcopy(responses[2].response.data)
+    rows = standings["response"][0]["league"]["standings"][0]
+    first_group, second_group = rows[:10], rows[10:]
+    for group_name, group_rows in (("Group A", first_group), ("Group B", second_group)):
+        for rank, row in enumerate(group_rows, start=1):
+            row["group"] = group_name
+            row["rank"] = rank
+    if omit_team:
+        second_group.pop()
+    standings["response"][0]["league"]["standings"] = [first_group, second_group]
+    responses[2] = CollectedBaseResponse(
+        request=responses[2].request,
+        response=_response(standings),
+        request_started_at=responses[2].request_started_at,
+        response_received_at=responses[2].response_received_at,
+    )
+    return tuple(responses)
+
+
 def test_retained_epl_2025_contract_validates_as_a_completed_season_bootstrap() -> None:
     scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
 
@@ -124,6 +148,38 @@ def test_retained_epl_2025_contract_validates_as_a_completed_season_bootstrap() 
     assert len(validated.teams) == 20
     assert len(validated.fixtures) == len(validated.statuses) == 380
     assert {status.status_code for status in validated.statuses} == {"FT"}
+
+
+def test_multi_group_standings_validate_when_all_catalog_teams_are_present() -> None:
+    scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
+
+    validated = validate_base_responses(_with_multi_group_standings(_collected()), scope=scope)
+
+    assert len(validated.teams) == 20
+    assert [len(group) for group in validated.standings_payload["response"][0]["league"]["standings"]] == [10, 10]
+
+
+def test_multi_group_standings_require_every_catalog_team_to_appear() -> None:
+    scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
+
+    with pytest.raises(SeasonBootstrapError, match="standings membership"):
+        validate_base_responses(_with_multi_group_standings(_collected(), omit_team=True), scope=scope)
+
+
+def test_multi_group_standings_require_ranks_to_be_unique_within_each_group() -> None:
+    scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
+    collected = list(_with_multi_group_standings(_collected()))
+    standings = copy.deepcopy(collected[2].response.data)
+    standings["response"][0]["league"]["standings"][1][0]["rank"] = 2
+    collected[2] = CollectedBaseResponse(
+        request=collected[2].request,
+        response=_response(standings),
+        request_started_at=collected[2].request_started_at,
+        response_received_at=collected[2].response_received_at,
+    )
+
+    with pytest.raises(SeasonBootstrapError, match="standings group ranks"):
+        validate_base_responses(tuple(collected), scope=scope)
 
 
 def test_team_founded_zero_is_normalized_as_unknown() -> None:
@@ -199,7 +255,7 @@ def test_bundesliga_2025_projection_is_exactly_scoped_to_reviewed_playoffs() -> 
     }
 
 
-def test_team_country_contract_drift_stops_before_canonical_dml() -> None:
+def test_team_country_is_not_constrained_to_the_league_country() -> None:
     scope = BootstrapScope(league_external_id=39, season_start_year=2025, expected_fixture_count=380)
     collected = list(_collected())
     teams = copy.deepcopy(collected[1].response.data)
@@ -211,8 +267,9 @@ def test_team_country_contract_drift_stops_before_canonical_dml() -> None:
         response_received_at=collected[1].response_received_at,
     )
 
-    with pytest.raises(SeasonBootstrapError, match="team country"):
-        validate_base_responses(collected, scope=scope)
+    validated = validate_base_responses(collected, scope=scope)
+
+    assert validated.teams[0].country_name == "Wrong Country"
 
 
 def test_unreviewed_competition_type_stops_before_canonical_dml() -> None:

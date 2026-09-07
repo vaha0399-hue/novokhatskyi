@@ -524,9 +524,12 @@ def _normalize_standings(
     if existing is not None:
         return
     response = payload.get("response") or []
-    if len(response) != 1:
+    if response == []:
+        groups: list[object] = []
+    elif len(response) == 1:
+        groups = response[0]["league"].get("standings") or []
+    else:
         raise ValueError("standings canary expects one league response")
-    groups = response[0]["league"].get("standings") or []
     snapshot_id = conn.execute(
         """
         INSERT INTO football.standings_snapshots (season_id, captured_at, source_fetch_id, group_count)

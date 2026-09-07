@@ -29,8 +29,8 @@ from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse, Se
 
 
 PROVIDER_CODE = "api-football"
-OPERATION = "catalogue_regular_league_bootstrap_v1"
-POLICY_VERSION = 1
+OPERATION = "catalogue_regular_league_bootstrap_v2"
+POLICY_VERSION = 2
 LEASE_SECONDS = 300
 DEFAULT_SPOOL_DIR = Path("/var/lib/football-analytics/catalogue-bootstrap")
 DEFAULT_QUOTA_RESERVE = 25
@@ -72,21 +72,23 @@ class CatalogueCompetition:
     name: str
     provider_type: str
     season_start_year: int | None
+    standings_coverage: bool = True
     initial_outcome: str | None = None
+    fixture_statistics_coverage: bool = True
 
     @property
     def scope_key(self) -> str:
         return f"catalogue-bootstrap:{self.league_external_id}:{self.season_start_year or 'no-current'}"
 
     def scope(self) -> dict[str, Any]:
-        return {"policy_version": POLICY_VERSION, "league_external_id": self.league_external_id, "name": self.name, "provider_type": self.provider_type, "season_start_year": self.season_start_year, "initial_outcome": self.initial_outcome}
+        return {"policy_version": POLICY_VERSION, "league_external_id": self.league_external_id, "name": self.name, "provider_type": self.provider_type, "season_start_year": self.season_start_year, "standings_coverage": self.standings_coverage, "initial_outcome": self.initial_outcome, "fixture_statistics_coverage": self.fixture_statistics_coverage}
 
     @classmethod
     def from_scope(cls, value: Mapping[str, Any]) -> "CatalogueCompetition":
-        league_id, name, kind, season, outcome = value.get("league_external_id"), value.get("name"), value.get("provider_type"), value.get("season_start_year"), value.get("initial_outcome")
-        if not isinstance(league_id, int) or league_id <= 0 or not isinstance(name, str) or not name.strip() or not isinstance(kind, str) or not kind.strip() or (season is not None and not isinstance(season, int)) or (outcome is not None and not isinstance(outcome, str)):
+        league_id, name, kind, season, coverage, outcome, fixture_statistics = value.get("league_external_id"), value.get("name"), value.get("provider_type"), value.get("season_start_year"), value.get("standings_coverage", True), value.get("initial_outcome"), value.get("fixture_statistics_coverage", True)
+        if not isinstance(league_id, int) or league_id <= 0 or not isinstance(name, str) or not name.strip() or not isinstance(kind, str) or not kind.strip() or (season is not None and not isinstance(season, int)) or not isinstance(coverage, bool) or (outcome is not None and not isinstance(outcome, str)) or not isinstance(fixture_statistics, bool):
             raise CatalogueBootstrapError("invalid catalogue work-item scope")
-        return cls(league_id, name, kind, season, outcome)
+        return cls(league_id, name, kind, season, coverage, outcome, fixture_statistics)
 
 
 @dataclass(frozen=True)
@@ -307,14 +309,26 @@ def parse_catalogue(response: APIFootballResponse) -> tuple[CatalogueCompetition
         seen.add(league_id)
         current = [value for value in seasons if isinstance(value, Mapping) and value.get("current") is True]
         season: int | None = None
+        standings_coverage = True
+        fixture_statistics_coverage = False
         if kind != "League": outcome = "deferred_unsupported_type"
         elif not current: outcome = "deferred_no_current_season"
         elif len(current) != 1 or not isinstance(current[0].get("year"), int): outcome = "deferred_invalid_current_season"
         else:
             season = current[0]["year"]
             coverage = current[0].get("coverage")
-            outcome = None if isinstance(coverage, Mapping) and coverage.get("standings") is True else "deferred_no_standings_coverage"
-        result.append(CatalogueCompetition(league_id, name, kind, season, outcome))
+            if not isinstance(coverage, Mapping) or not isinstance(coverage.get("standings"), bool):
+                outcome = "deferred_no_standings_coverage"
+                standings_coverage = True
+            else:
+                outcome = None
+                standings_coverage = coverage["standings"]
+                fixtures_coverage = coverage.get("fixtures")
+                fixture_statistics_coverage = (
+                    isinstance(fixtures_coverage, Mapping)
+                    and fixtures_coverage.get("statistics_fixtures") is True
+                )
+        result.append(CatalogueCompetition(league_id, name, kind, season, standings_coverage, outcome, fixture_statistics_coverage))
     return tuple(sorted(result, key=lambda value: value.league_external_id))
 
 
@@ -322,7 +336,12 @@ def _scope(competition: CatalogueCompetition, team_count: int) -> ActiveSeasonSc
     if competition.season_start_year is None or team_count < 2:
         raise ActiveSeasonImportError("season has no usable team catalogue")
     # Future deterministic adapters attach here, without changing queue/spool mechanics.
-    return ActiveSeasonScope(competition.league_external_id, competition.season_start_year, team_count * (team_count - 1))
+    return ActiveSeasonScope(
+        competition.league_external_id,
+        competition.season_start_year,
+        team_count * (team_count - 1),
+        allow_empty_standings=not competition.standings_coverage,
+    )
 
 
 def _team_count(response: APIFootballResponse) -> int:
@@ -337,8 +356,10 @@ def _publication_state(collected: Sequence[CollectedBaseResponse], scope: Active
     fixtures, standings = by_endpoint["/fixtures"], by_endpoint["/standings"]
     fixture_rows = fixtures.get("response") if isinstance(fixtures, Mapping) else None
     standing_rows = standings.get("response") if isinstance(standings, Mapping) else None
-    if not isinstance(fixture_rows, list) or not isinstance(standing_rows, list) or not standing_rows:
+    if not isinstance(fixture_rows, list) or not isinstance(standing_rows, list):
         return "incomplete_publication"
+    if not standing_rows:
+        return "no_standings"
     league = standing_rows[0].get("league") if isinstance(standing_rows[0], Mapping) else None
     groups = league.get("standings") if isinstance(league, Mapping) else None
     if not isinstance(groups, list) or not groups or not isinstance(groups[0], list):
@@ -367,6 +388,8 @@ class Worker:
     async def _backfill_statistics(self, item: WorkItem) -> dict[str, Any]:
         competition = item.competition
         assert competition.season_start_year is not None
+        if not competition.fixture_statistics_coverage:
+            return {"outcome": "unavailable_by_catalogue", "fixtures_normalized": 0, "statistics_rows_written": 0, "api_requests": 0}
         report = await self._statistics_backfill(competition.league_external_id, competition.season_start_year)
         stopped_reason = getattr(report, "stopped_reason", None)
         errors = getattr(report, "errors", ())
@@ -448,7 +471,9 @@ class Worker:
         self._repository.renew(item)
         collected.extend([await self._capture(directory, request) for request in requests[2:]])
         publication_state = _publication_state(collected, scope)
-        if publication_state in {"incomplete_publication", "incomplete_standings"}:
+        if publication_state in {"incomplete_publication", "incomplete_standings"} or (
+            publication_state == "no_standings" and not scope.allow_empty_standings
+        ):
             self._repository.requeue(item, checkpoint={"outcome": "pending_not_published", "reason": publication_state, "capture_generation": generation + 1, "next_check_at": (datetime.now(UTC) + timedelta(seconds=self._settings.not_published_delay_seconds)).isoformat()}, error=publication_state, delay_seconds=self._settings.not_published_delay_seconds)
             return self._report(item, "pending_not_published", publication_state)
         import_scope = replace(scope, require_complete_schedule=publication_state == "complete")
@@ -462,7 +487,9 @@ class Worker:
         # longer needed and is removed before this item becomes terminal.
         self._spool.purge_generation(directory)
         statistics = await self._backfill_statistics(item)
-        outcome = "imported" if publication_state == "complete" else "imported_partial"
+        outcome = "imported" if publication_state == "complete" else (
+            "imported_no_standings" if publication_state == "no_standings" else "imported_partial"
+        )
         self._repository.complete(item, {"outcome": outcome, "calendar_complete": publication_state == "complete", "observed_fixture_count": len(collected[-1].response.data["response"]), "expected_fixture_count": scope.expected_fixture_count, "capture_generation": generation, "statistics": statistics}); return self._report(item, outcome)
 
     async def run_once(self) -> Report:

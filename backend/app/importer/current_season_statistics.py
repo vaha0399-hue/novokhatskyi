@@ -65,6 +65,7 @@ class CurrentSeasonStatisticsScope:
     daily_request_cap: int = DEFAULT_DAILY_REQUEST_CAP
     require_finalized_results: bool = False
     project_discovery: bool = True
+    select_all_completed: bool = False
 
     def __post_init__(self) -> None:
         if self.league_external_id <= 0:
@@ -75,6 +76,8 @@ class CurrentSeasonStatisticsScope:
             raise ValueError(f"max_requests must be between 1 and {DEFAULT_MAX_REQUESTS}")
         if not 1 <= self.daily_request_cap <= 6_000:
             raise ValueError("daily_request_cap must be between 1 and 6000")
+        if not isinstance(self.select_all_completed, bool):
+            raise ValueError("select_all_completed must be boolean")
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,7 @@ class BatchFetch:
 class BatchParseResult:
     returned_fixture_ids: frozenset[int]
     statistics_by_fixture: Mapping[int, list[dict[str, Any]] | None]
+    statistics_unavailable_fixture_ids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -243,6 +247,7 @@ def _batch_entries(
     by_external = {target.external_fixture_id: target for target in targets}
     parsed: dict[int, list[dict[str, Any]] | None] = {target.fixture_id: None for target in targets}
     seen: set[int] = set()
+    unavailable: set[int] = set()
     for entry in response:
         if not isinstance(entry, Mapping):
             raise StatisticsContractError("batch fixture entry must be an object")
@@ -276,7 +281,12 @@ def _batch_entries(
             if {row["external_team_id"] for row in mapped} != expected:
                 raise StatisticsContractError("statistics teams differ from canonical fixture participants")
             parsed[target.fixture_id] = mapped
-    return BatchParseResult(frozenset(by_external[external_id].fixture_id for external_id in seen), parsed)
+        elif state == "empty":
+            unavailable.add(target.fixture_id)
+    return BatchParseResult(
+        frozenset(by_external[external_id].fixture_id for external_id in seen), parsed,
+        frozenset(unavailable),
+    )
 
 
 def _context(conn: Connection[Any], scope: CurrentSeasonStatisticsScope) -> tuple[int, int]:
@@ -296,7 +306,12 @@ def load_completed_targets(
     conn: Connection[Any], *, provider_id: int, season_id: int,
     require_finalized_results: bool = False,
 ) -> tuple[FixtureTarget, ...]:
-    """Load canonical completed fixtures; malformed partial statistics stop safely."""
+    """Load completed fixtures; one existing team row remains incomplete.
+
+    A previous interrupted upsert can leave one valid participant row.  It is
+    intentionally selected for repair: the later two-row upsert is conflict
+    safe and restores the exact pair without deleting existing data.
+    """
     rows = conn.execute(
         """SELECT fixture.id, fixture_ref.external_id, fixture.home_team_id, fixture.away_team_id,
                   home_ref.external_id, away_ref.external_id, fixture.kickoff_at,
@@ -310,10 +325,12 @@ def load_completed_targets(
            JOIN source.team_provider_refs away_ref
              ON away_ref.team_id=fixture.away_team_id AND away_ref.provider_id=%s
            LEFT JOIN football.fixture_team_statistics statistics ON statistics.fixture_id=fixture.id
+           LEFT JOIN football.fixture_statistics_coverage coverage ON coverage.fixture_id=fixture.id
            WHERE fixture.season_id=%s
              AND fixture.lifecycle_state='completed'
              AND fixture.result_available_at IS NOT NULL
              AND (%s = FALSE OR fixture.result_finalized_at IS NOT NULL)
+             AND (coverage.fixture_id IS NULL OR coverage.next_retry_at <= clock_timestamp())
            GROUP BY fixture.id, fixture_ref.external_id, home_ref.external_id, away_ref.external_id
            ORDER BY fixture.kickoff_at DESC, fixture.id DESC""",
         (provider_id, provider_id, provider_id, season_id, require_finalized_results),
@@ -321,7 +338,7 @@ def load_completed_targets(
     targets: list[FixtureTarget] = []
     for row in rows:
         fixture_id, external_id, home_id, away_id, home_external, away_external, kickoff, statistics_rows, teams_ok = row
-        if int(statistics_rows) not in (0, 2) or (int(statistics_rows) == 2 and teams_ok is not True):
+        if int(statistics_rows) > 2 or (int(statistics_rows) > 0 and teams_ok is not True):
             raise CurrentSeasonStatisticsError("canonical fixture statistics are not an exact two-team pair")
         try:
             targets.append(
@@ -329,7 +346,7 @@ def load_completed_targets(
                     fixture_id=int(fixture_id), external_fixture_id=int(external_id),
                     home_team_id=int(home_id), away_team_id=int(away_id),
                     home_external_team_id=int(home_external), away_external_team_id=int(away_external), kickoff_at=kickoff,
-                    statistics_complete=int(statistics_rows) == 2,
+                    statistics_complete=int(statistics_rows) == 2 and teams_ok is True,
                 )
             )
         except ValueError as error:
@@ -379,6 +396,46 @@ def _persist_season_success(
     return BatchFetch(fetch_id, request_started_at, response_received_at, response)
 
 
+def _load_reusable_batch_fetch(
+    conn: Connection[Any], *, provider_id: int, season_id: int, params: Mapping[str, str | int]
+) -> BatchFetch | None:
+    """Return a hash-verified retained batch before spending another API call.
+
+    An empty or partial provider statistics response is not a completed pair,
+    but it is still durable evidence. Replaying it lets a one-off run resume
+    without repeatedly charging quota for the same known absence.
+    """
+    row = conn.execute(
+        """SELECT provider_fetch.id,provider_fetch.request_started_at,provider_fetch.response_received_at,
+                  provider_fetch.http_status,provider_fetch.content_sha256,payload.inline_body
+           FROM source.provider_fetches provider_fetch
+           JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+           WHERE provider_fetch.provider_id=%s AND provider_fetch.subject_season_id=%s
+             AND provider_fetch.endpoint=%s AND provider_fetch.outcome='success'
+             AND provider_fetch.request_params_sha256=%s AND payload.purged_at IS NULL
+             AND payload.inline_body IS NOT NULL
+           ORDER BY provider_fetch.response_received_at DESC NULLS LAST,provider_fetch.id DESC LIMIT 1""",
+        (provider_id, season_id, ENDPOINT, request_params_sha256(params)),
+    ).fetchone()
+    if row is None:
+        return None
+    fetch_id, started, received, status, digest, body = row
+    if received is None or status is None or digest is None:
+        raise CurrentSeasonStatisticsError("retained batch raw metadata is incomplete")
+    raw = bytes(body)
+    if hashlib.sha256(raw).digest() != bytes(digest):
+        raise CurrentSeasonStatisticsError("retained batch raw payload hash mismatch")
+    try:
+        payload = json.loads(raw)
+    except ValueError as error:
+        raise CurrentSeasonStatisticsError("retained batch raw payload is invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise CurrentSeasonStatisticsError("retained batch raw payload has invalid top-level shape")
+    return BatchFetch(
+        int(fetch_id), started, received, APIFootballResponse(payload, raw, int(status), {})
+    )
+
+
 def _bind_returned_fixture_subjects(
     conn: Connection[Any], *, fetch_id: int, returned_fixture_ids: Iterable[int], targets: Sequence[FixtureTarget]
 ) -> None:
@@ -393,7 +450,7 @@ def _bind_returned_fixture_subjects(
         raise StatisticsContractError("batch provenance contains an unrequested fixture")
     with conn.cursor() as cursor:
         cursor.executemany(
-            "INSERT INTO source.provider_fetch_fixture_subjects(fetch_id,fixture_id) VALUES(%s,%s)",
+            "INSERT INTO source.provider_fetch_fixture_subjects(fetch_id,fixture_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
             [(fetch_id, fixture_id) for fixture_id in ids],
         )
 
@@ -699,6 +756,26 @@ def _statistics_rows(
     return rows, affected_teams, skipped
 
 
+def _mark_statistics_unavailable(
+    conn: Connection[Any], *, fixture_ids: frozenset[int], fetch: BatchFetch
+) -> None:
+    """Persist an empty provider response as retryable coverage, never zeroes."""
+    if not fixture_ids:
+        return
+    conn.execute(
+        """INSERT INTO football.fixture_statistics_coverage(
+                fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts
+            )
+            SELECT fixture_id,'empty'::football.snapshot_coverage_state,0,%s,%s,%s,1
+            FROM unnest(%s::bigint[]) AS fixture_id
+            ON CONFLICT (fixture_id) DO UPDATE
+              SET coverage_state='empty',team_count=0,last_source_fetch_id=excluded.last_source_fetch_id,
+                  observed_at=excluded.observed_at,next_retry_at=excluded.next_retry_at,
+                  attempts=football.fixture_statistics_coverage.attempts + 1""",
+        (fetch.fetch_id, fetch.response_received_at, fetch.response_received_at + timedelta(hours=6), list(fixture_ids)),
+    )
+
+
 def bulk_upsert_statistics(conn: Connection[Any], *, rows: Sequence[Mapping[str, object]]) -> int:
     """Upsert all rows from one provider batch in one SQL command."""
     if not rows:
@@ -967,12 +1044,19 @@ async def run_current_season_statistics_backfill_async(
                     conn, provider_id=provider_id, season_id=season_id,
                     require_finalized_results=scope.require_finalized_results,
                 )
-                selected_history = select_recent_history(discovered_targets)
-                selected = tuple(target for target in selected_history if not target.statistics_complete)
+                selected_candidates = (
+                    discovered_targets
+                    if scope.select_all_completed
+                    else select_recent_history(discovered_targets)
+                )
+                selected = tuple(target for target in selected_candidates if not target.statistics_complete)
                 for batch in chunk_fixture_targets(selected):
-                    fetched = await request(
-                        params={"ids": fixture_ids_parameter(target.external_fixture_id for target in batch)}, kind="batch", targets=batch
+                    params = {"ids": fixture_ids_parameter(target.external_fixture_id for target in batch)}
+                    fetched = _load_reusable_batch_fetch(
+                        conn, provider_id=provider_id, season_id=season_id, params=params
                     )
+                    if fetched is None:
+                        fetched = await request(params=params, kind="batch", targets=batch)
                     if fetched is None:
                         break
                     try:
@@ -990,6 +1074,11 @@ async def run_current_season_statistics_backfill_async(
                             )
                             rows, teams, skipped_in_batch = _statistics_rows(
                                 parsed=parsed.statistics_by_fixture, targets=batch, fetch=fetched
+                            )
+                            _mark_statistics_unavailable(
+                                conn,
+                                fixture_ids=parsed.statistics_unavailable_fixture_ids,
+                                fetch=fetched,
                             )
                             written += bulk_upsert_statistics(conn, rows=rows)
                             if teams:

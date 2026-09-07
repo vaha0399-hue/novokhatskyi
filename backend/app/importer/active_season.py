@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ from app.importer.season_bootstrap import (
     _persist_fetch,
     _provider_id,
     _resolve_country,
+    _resolve_team_country,
     _resolve_league,
     _resolve_season,
     _resolve_team_and_venue,
@@ -48,12 +49,18 @@ from app.importer.season_coverage_contract import SeasonCoverageObservation, val
 _LIFECYCLE_BY_STATUS = {
     "NS": "scheduled",
     "PST": "postponed",
+    "1H": "in_progress",
+    "HT": "in_progress",
+    "2H": "in_progress",
     "FT": "completed",
     "AET": "completed",
     "PEN": "completed",
+    "AWD": "completed",
+    "ABD": "abandoned",
 }
 _TERMINAL_STATUS_CODES = frozenset(
-    status for status, lifecycle in _LIFECYCLE_BY_STATUS.items() if lifecycle == "completed"
+    status for status, lifecycle in _LIFECYCLE_BY_STATUS.items()
+    if lifecycle in {"completed", "cancelled", "abandoned"}
 )
 
 
@@ -137,6 +144,7 @@ class ActiveSeasonScope:
     fixture_overrides: tuple[ActiveFixtureOverride, ...] = ()
     additional_team_country_names: frozenset[str] = frozenset()
     require_complete_schedule: bool = True
+    allow_empty_standings: bool = False
 
     def __post_init__(self) -> None:
         SeasonBackfillScope(
@@ -152,6 +160,8 @@ class ActiveSeasonScope:
             raise ValueError("active season additional team countries must be non-empty strings")
         if not isinstance(self.require_complete_schedule, bool):
             raise ValueError("require_complete_schedule must be boolean")
+        if not isinstance(self.allow_empty_standings, bool):
+            raise ValueError("allow_empty_standings must be boolean")
 
     @property
     def season_scope(self) -> SeasonBackfillScope:
@@ -160,6 +170,11 @@ class ActiveSeasonScope:
             season_start_year=self.season_start_year,
             expected_fixture_count=self.expected_fixture_count,
         )
+
+    @property
+    def fixture_request_params(self) -> dict[str, int]:
+        """Provider parameters for the season-wide fixture response."""
+        return self.season_scope.request_params
 
     @property
     def expected_team_count(self) -> int:
@@ -177,6 +192,41 @@ class ActiveSeasonScope:
     @property
     def fixture_override_by_external_id(self) -> dict[int, ActiveFixtureOverride]:
         return {override.external_fixture_id: override for override in self.fixture_overrides}
+
+
+@dataclass(frozen=True)
+class CupSeasonScope:
+    """Identity contract for one provider cup season.
+
+    Cups intentionally do not inherit :class:`SeasonBackfillScope`: knockout
+    and group-stage tournaments have no predictable round-robin team or
+    fixture count.  A caller may therefore retain and normalize any valid
+    provider fixture set, including completed and scheduled fixtures, without
+    weakening the completed-league contract.
+    """
+
+    league_external_id: int
+    season_start_year: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("league_external_id", self.league_external_id),
+            ("season_start_year", self.season_start_year),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    @property
+    def fixture_request_params(self) -> dict[str, int]:
+        return {"league": self.league_external_id, "season": self.season_start_year}
+
+    @property
+    def fixture_override_by_external_id(self) -> dict[int, ActiveFixtureOverride]:
+        return {}
+
+    @property
+    def lock_key(self) -> str:
+        return f"{PROVIDER_CODE}:cup-season:{self.league_external_id}:{self.season_start_year}:v1"
 
 
 # API-Football's 2026/27 Ligue 1 calendar has two reviewed source defects:
@@ -253,6 +303,19 @@ class ActiveFixtureRecord:
 @dataclass(frozen=True)
 class ValidatedActiveBase:
     scope: ActiveSeasonScope
+    league: LeagueRecord
+    coverage: SeasonCoverageObservation
+    teams: tuple[Any, ...]
+    fixtures: tuple[ActiveFixtureRecord, ...]
+    statuses: tuple[FixtureStatusObservation, ...]
+    standings_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ValidatedCupBase:
+    """Provider-validated cup base data, ready for a cup-specific writer."""
+
+    scope: CupSeasonScope
     league: LeagueRecord
     coverage: SeasonCoverageObservation
     teams: tuple[Any, ...]
@@ -341,6 +404,17 @@ def base_requests(scope: ActiveSeasonScope) -> tuple[BaseRequest, ...]:
     )
 
 
+def cup_base_requests(scope: CupSeasonScope) -> tuple[BaseRequest, ...]:
+    """The retained base responses required for one cup season."""
+    params = scope.fixture_request_params
+    return (
+        BaseRequest("/leagues", {"id": scope.league_external_id, "season": scope.season_start_year}),
+        BaseRequest("/teams", params),
+        BaseRequest("/standings", params),
+        BaseRequest("/fixtures", params),
+    )
+
+
 def _required_positive(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ActiveSeasonImportError(f"{field} must be a positive integer")
@@ -371,9 +445,9 @@ def _score(score: Mapping[str, Any], period: str, side: str) -> int | None:
 
 
 def _active_fixture_records(
-    payload: Mapping[str, Any], *, scope: ActiveSeasonScope, allowed_team_ids: Iterable[int]
+    payload: Mapping[str, Any], *, scope: ActiveSeasonScope | CupSeasonScope, allowed_team_ids: Iterable[int]
 ) -> tuple[ActiveFixtureRecord, ...]:
-    if payload.get("parameters") != {key: str(value) for key, value in scope.season_scope.request_params.items()}:
+    if payload.get("parameters") != {key: str(value) for key, value in scope.fixture_request_params.items()}:
         raise ActiveSeasonImportError("provider parameters mismatch for active season fixtures")
     if payload.get("errors") not in ({}, [], None) or payload.get("paging") != {"current": 1, "total": 1}:
         raise ActiveSeasonImportError("active season fixtures response is incomplete")
@@ -383,9 +457,6 @@ def _active_fixture_records(
     allowed = set(allowed_team_ids)
     records: list[ActiveFixtureRecord] = []
     seen_ids: set[int] = set()
-    pairs: set[tuple[int, int]] = set()
-    home_counts = {team_id: 0 for team_id in allowed}
-    away_counts = {team_id: 0 for team_id in allowed}
     overrides = scope.fixture_override_by_external_id
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -444,12 +515,6 @@ def _active_fixture_records(
             venue_external_id = override.canonical_venue_external_id
         if home_id == away_id or home_id not in allowed or away_id not in allowed:
             raise ActiveSeasonImportError("fixture participant is not a distinct mapped season team")
-        pair = (home_id, away_id)
-        if pair in pairs:
-            raise ActiveSeasonImportError("active season schedule has a duplicate directed pairing")
-        pairs.add(pair)
-        home_counts[home_id] += 1
-        away_counts[away_id] += 1
         record = ActiveFixtureRecord(
             external_id=external_id, home_external_id=home_id, away_external_id=away_id,
             venue_external_id=venue_external_id,
@@ -470,13 +535,21 @@ def _active_fixture_records(
             raise ActiveSeasonImportError("non-terminal fixture must not contain results")
         if record.status_code in _TERMINAL_STATUS_CODES and (record.home_goals is None or record.away_goals is None):
             raise ActiveSeasonImportError("terminal fixture must contain final goals")
+        if _LIFECYCLE_BY_STATUS[record.status_code] != "completed":
+            # Scores of live/abandoned fixtures are retained in provider raw
+            # (and in the live domain); canonical results exist only for FT.
+            record = replace(
+                record,
+                home_goals=None, away_goals=None,
+                home_halftime_goals=None, away_halftime_goals=None,
+                home_fulltime_goals=None, away_fulltime_goals=None,
+                home_extratime_goals=None, away_extratime_goals=None,
+                home_penalty_goals=None, away_penalty_goals=None,
+            )
         records.append(record)
-    if scope.require_complete_schedule:
-        expected_per_side = scope.expected_team_count - 1
-        if len(records) != scope.expected_fixture_count or set(home_counts.values()) != {expected_per_side} or set(away_counts.values()) != {expected_per_side}:
+    if isinstance(scope, ActiveSeasonScope) and scope.require_complete_schedule:
+        if len(records) != scope.expected_fixture_count:
             raise ActiveSeasonImportError("active season fixtures do not form the expected complete schedule")
-    elif len(records) > scope.expected_fixture_count:
-        raise ActiveSeasonImportError("partial active season has more fixtures than its regular schedule maximum")
     return tuple(sorted(records, key=lambda item: item.external_id))
 
 
@@ -498,22 +571,122 @@ def validate_base_responses(collected: Sequence[CollectedBaseResponse], *, scope
         additional_team_country_names=scope.additional_team_country_names,
     )  # type: ignore[arg-type]
     standings, standing_ids = _validate_standings(by_endpoint["/standings"].response.data, scope, {team.external_id for team in catalog})  # type: ignore[arg-type]
-    if len(catalog) != scope.expected_team_count or {team.external_id for team in catalog} != standing_ids:
+    if len(catalog) != scope.expected_team_count or (
+        not scope.allow_empty_standings and {team.external_id for team in catalog} != standing_ids
+    ):
         raise ActiveSeasonImportError("active season team catalog and standings membership differ")
-    fixtures = _active_fixture_records(by_endpoint["/fixtures"].response.data, scope=scope, allowed_team_ids=standing_ids)
+    fixture_team_ids = standing_ids or frozenset(team.external_id for team in catalog)
+    fixtures = _active_fixture_records(by_endpoint["/fixtures"].response.data, scope=scope, allowed_team_ids=fixture_team_ids)
     statuses = validate_fixture_status_response(by_endpoint["/fixtures"].response, expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(), expected_fixture_ids={item.external_id for item in fixtures}, allowed_status_codes=_LIFECYCLE_BY_STATUS)
     return ValidatedActiveBase(scope, league, coverage, tuple(catalog), fixtures, statuses, standings)
 
 
+def _validate_cup_standings(
+    payload: Mapping[str, Any], *, scope: CupSeasonScope, team_catalog_external_ids: set[int]
+) -> tuple[dict[str, Any], frozenset[int]]:
+    """Validate 0..N independently ranked cup tables without projecting them.
+
+    A cup can have knockout-only fixtures (no standings) or several group
+    tables.  Standings membership is deliberately a subset of the season team
+    catalog: teams eliminated before a group phase remain valid cup entrants.
+    """
+    response = payload.get("response")
+    if response == []:
+        return dict(payload), frozenset()
+    if not isinstance(response, list) or len(response) != 1 or not isinstance(response[0], Mapping):
+        raise ActiveSeasonImportError("/standings must return zero or one cup league")
+    league = response[0].get("league")
+    if (
+        not isinstance(league, Mapping)
+        or league.get("id") != scope.league_external_id
+        or league.get("season") != scope.season_start_year
+    ):
+        raise ActiveSeasonImportError("cup standings league/season mismatch")
+    groups = league.get("standings")
+    if not isinstance(groups, list) or not groups or any(not isinstance(group, list) or not group for group in groups):
+        raise ActiveSeasonImportError("cup standings must contain one or more non-empty groups")
+    provider_ids: set[int] = set()
+    for rows in groups:
+        ranks: set[int] = set()
+        for row in rows:
+            if not isinstance(row, Mapping) or not isinstance(row.get("team"), Mapping):
+                raise ActiveSeasonImportError("cup standings row has invalid team")
+            provider_ids.add(_required_positive(row["team"].get("id"), "standings.team.id"))
+            ranks.add(_required_positive(row.get("rank"), "standings.rank"))
+            for record_name in ("all", "home", "away"):
+                record = row.get(record_name)
+                if not isinstance(record, Mapping) or not isinstance(record.get("goals"), Mapping):
+                    raise ActiveSeasonImportError(f"standings.{record_name} has invalid structure")
+        if ranks != set(range(1, len(rows) + 1)):
+            raise ActiveSeasonImportError("cup standings group ranks do not match group rows")
+    if not provider_ids.issubset(team_catalog_external_ids):
+        raise ActiveSeasonImportError("cup standings include an unmapped team")
+    return dict(payload), frozenset(provider_ids)
+
+
+def validate_cup_base_responses(
+    collected: Sequence[CollectedBaseResponse], *, scope: CupSeasonScope
+) -> ValidatedCupBase:
+    """Validate retained cup base responses before a cup writer performs DML.
+
+    This path accepts an arbitrary fixture count and preserves fixture status
+    semantics from active seasons.  It never applies league double-round-robin
+    or full-standings membership assumptions.
+    """
+    expected = {request.endpoint: request for request in cup_base_requests(scope)}
+    by_endpoint = {item.request.endpoint: item for item in collected}
+    if len(collected) != len(expected) or set(by_endpoint) != set(expected):
+        raise ActiveSeasonImportError("cup base response set is incomplete or contains duplicates")
+    for endpoint, request in expected.items():
+        if by_endpoint[endpoint].request.params != request.params:
+            raise ActiveSeasonImportError(f"unexpected cup request parameters for {endpoint}")
+        _validate_envelope(by_endpoint[endpoint])
+    league = _league_record(
+        by_endpoint["/leagues"].response.data,  # type: ignore[arg-type]
+        scope,  # type: ignore[arg-type]
+        expected_provider_type="Cup",
+    )
+    coverage = validate_season_coverage_response(
+        by_endpoint["/leagues"].response,
+        expected_content_sha256=hashlib.sha256(by_endpoint["/leagues"].response.raw_body).digest(),
+        external_league_id=scope.league_external_id,
+        external_season=scope.season_start_year,
+    )
+    catalog = _team_records(
+        by_endpoint["/teams"].response.data,  # type: ignore[arg-type]
+        scope,  # type: ignore[arg-type]
+        league.country_name,
+    )
+    team_ids = {team.external_id for team in catalog}
+    standings, _ = _validate_cup_standings(
+        by_endpoint["/standings"].response.data,  # type: ignore[arg-type]
+        scope=scope,
+        team_catalog_external_ids=team_ids,
+    )
+    fixtures = _active_fixture_records(
+        by_endpoint["/fixtures"].response.data,  # type: ignore[arg-type]
+        scope=scope,
+        allowed_team_ids=team_ids,
+    )
+    statuses = validate_fixture_status_response(
+        by_endpoint["/fixtures"].response,
+        expected_content_sha256=hashlib.sha256(by_endpoint["/fixtures"].response.raw_body).digest(),
+        expected_fixture_ids={item.external_id for item in fixtures},
+        allowed_status_codes=_LIFECYCLE_BY_STATUS,
+    )
+    return ValidatedCupBase(scope, league, coverage, tuple(catalog), fixtures, statuses, standings)
+
+
 def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: StoredFetch, record: ActiveFixtureRecord) -> int:
     state = _LIFECYCLE_BY_STATUS[record.status_code]
-    terminal = fetch.response_received_at if state == "completed" else None
+    terminal = fetch.response_received_at if state in {"completed", "cancelled", "abandoned"} else None
+    result_available = fetch.response_received_at if state == "completed" else None
     row = conn.execute("SELECT fixture_id FROM source.fixture_provider_refs WHERE provider_id=%s AND external_id=%s FOR UPDATE", (context.provider_id, str(record.external_id))).fetchone()
     if row is None:
         venue_id = _resolve_venue(conn, context=context, record=record, seen_at=fetch.response_received_at)
         fixture_id = int(conn.execute(
             """INSERT INTO football.fixtures (season_id,home_team_id,away_team_id,venue_id,round_label,kickoff_at,source_timezone,referee_name,lifecycle_state,home_goals,away_goals,home_halftime_goals,away_halftime_goals,home_fulltime_goals,away_fulltime_goals,home_extratime_goals,away_extratime_goals,home_penalty_goals,away_penalty_goals,terminal_status_observed_at,result_available_at,availability_basis,first_seen_at,last_seen_at,last_source_fetch_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'observed',%s,%s,%s) RETURNING id""",
-            (context.season_id, context.team_ids[record.home_external_id], context.team_ids[record.away_external_id], venue_id, record.round_label, record.kickoff_at, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, terminal, fetch.response_received_at, fetch.response_received_at, fetch.fetch_id)).fetchone()[0])
+            (context.season_id, context.team_ids[record.home_external_id], context.team_ids[record.away_external_id], venue_id, record.round_label, record.kickoff_at, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, result_available, fetch.response_received_at, fetch.response_received_at, fetch.fetch_id)).fetchone()[0])
         conn.execute("INSERT INTO source.fixture_provider_refs(provider_id,external_id,fixture_id,first_seen_at,last_seen_at) VALUES(%s,%s,%s,%s,%s)", (context.provider_id, str(record.external_id), fixture_id, fetch.response_received_at, fetch.response_received_at))
         return fixture_id
     fixture_id = int(row[0])
@@ -538,7 +711,7 @@ def _normalize_fixture(conn: Connection[Any], *, context: SeasonContext, fetch: 
     if existing[4] == "completed" and state != "completed":
         raise ActiveSeasonImportError(f"completed fixture regressed to NS for {record.external_id}")
     venue_id = _resolve_venue(conn, context=context, record=record, seen_at=fetch.response_received_at)
-    conn.execute("""UPDATE football.fixtures SET venue_id=%s,round_label=%s,kickoff_at=%s,source_timezone=%s,referee_name=%s,lifecycle_state=%s,home_goals=%s,away_goals=%s,home_halftime_goals=%s,away_halftime_goals=%s,home_fulltime_goals=%s,away_fulltime_goals=%s,home_extratime_goals=%s,away_extratime_goals=%s,home_penalty_goals=%s,away_penalty_goals=%s,terminal_status_observed_at=%s,result_available_at=%s,last_seen_at=greatest(last_seen_at,%s),last_source_fetch_id=%s WHERE id=%s""", (venue_id, record.round_label, record.kickoff_at, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, terminal, fetch.response_received_at, fetch.fetch_id, fixture_id))
+    conn.execute("""UPDATE football.fixtures SET venue_id=%s,round_label=%s,kickoff_at=%s,source_timezone=%s,referee_name=%s,lifecycle_state=%s,home_goals=%s,away_goals=%s,home_halftime_goals=%s,away_halftime_goals=%s,home_fulltime_goals=%s,away_fulltime_goals=%s,home_extratime_goals=%s,away_extratime_goals=%s,home_penalty_goals=%s,away_penalty_goals=%s,terminal_status_observed_at=%s,result_available_at=%s,last_seen_at=greatest(last_seen_at,%s),last_source_fetch_id=%s WHERE id=%s""", (venue_id, record.round_label, record.kickoff_at, record.source_timezone, record.referee_name, state, record.home_goals, record.away_goals, record.home_halftime_goals, record.away_halftime_goals, record.home_fulltime_goals, record.away_fulltime_goals, record.home_extratime_goals, record.away_extratime_goals, record.home_penalty_goals, record.away_penalty_goals, terminal, result_available, fetch.response_received_at, fetch.fetch_id, fixture_id))
     return fixture_id
 
 
@@ -606,6 +779,7 @@ def _bulk_insert_initial_fixtures(
             "home_penalty_goals": record.home_penalty_goals,
             "away_penalty_goals": record.away_penalty_goals,
             "terminal_status_observed_at": fetch.response_received_at.isoformat() if record.status_code in _TERMINAL_STATUS_CODES else None,
+            "result_available_at": fetch.response_received_at.isoformat() if _LIFECYCLE_BY_STATUS[record.status_code] == "completed" else None,
         }
         for record in records
     ]
@@ -619,7 +793,7 @@ def _bulk_insert_initial_fixtures(
                     home_fulltime_goals smallint, away_fulltime_goals smallint,
                     home_extratime_goals smallint, away_extratime_goals smallint,
                     home_penalty_goals smallint, away_penalty_goals smallint,
-                    terminal_status_observed_at timestamptz
+                    terminal_status_observed_at timestamptz, result_available_at timestamptz
                 )
             ), inserted AS (
                 INSERT INTO football.fixtures (
@@ -633,7 +807,7 @@ def _bulk_insert_initial_fixtures(
                     referee_name,lifecycle_state::football.fixture_lifecycle_state,home_goals,away_goals,
                     home_halftime_goals,away_halftime_goals,home_fulltime_goals,away_fulltime_goals,
                     home_extratime_goals,away_extratime_goals,home_penalty_goals,away_penalty_goals,
-                    terminal_status_observed_at,terminal_status_observed_at,'observed',%s,%s,%s
+                    terminal_status_observed_at,result_available_at,'observed',%s,%s,%s
                 FROM input
                 RETURNING id,home_team_id,away_team_id,kickoff_at
             )
@@ -677,9 +851,18 @@ def _bulk_insert_initial_fixtures(
     return {int(external_id): int(fixture_id) for external_id, fixture_id in mappings}
 
 
-def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBaseResponse], scope: ActiveSeasonScope) -> SeasonContext:
-    """Atomically create or refresh canonical scheduled/finished season data."""
-    validated = validate_base_responses(collected, scope=scope)
+def import_validated_base(
+    conn: Connection[Any],
+    validated: ValidatedActiveBase | ValidatedCupBase,
+    collected: Sequence[CollectedBaseResponse],
+) -> SeasonContext:
+    """Atomically persist one already validated League or Cup response set.
+
+    Validation remains competition-specific, but raw provenance, canonical
+    mappings, fixtures, statuses, and standings intentionally share this one
+    transaction.  That is the only canonical writer used by catalogue imports.
+    """
+    scope = validated.scope
     by_endpoint = {item.request.endpoint: item for item in collected}
     with conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (scope.lock_key,))
@@ -691,10 +874,21 @@ def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBa
         _insert_coverage_snapshot(conn, provider_id=provider_id, season_id=season_id, fetch_id=fetch_ids["/leagues"], captured_at=by_endpoint["/leagues"].response_received_at, coverage=validated.coverage)
         team_ids: dict[int, int] = {}
         for team in validated.teams:
-            team_id, venue_id = _resolve_team_and_venue(conn, provider_id=provider_id, country_id=country_id, record=team)
+            team_country_id = _resolve_team_country(
+                conn, country_name=team.country_name, fallback_country_id=country_id
+            )
+            team_id, venue_id = _resolve_team_and_venue(
+                conn, provider_id=provider_id, country_id=team_country_id, record=team
+            )
             team_ids[team.external_id] = team_id
             conn.execute("""INSERT INTO football.season_teams(season_id,team_id,default_venue_id,first_seen_at,last_seen_at,last_source_fetch_id) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(season_id,team_id) DO UPDATE SET default_venue_id=excluded.default_venue_id,last_seen_at=greatest(football.season_teams.last_seen_at,excluded.last_seen_at),last_source_fetch_id=excluded.last_source_fetch_id""", (season_id, team_id, venue_id, by_endpoint["/teams"].response_received_at, by_endpoint["/teams"].response_received_at, fetch_ids["/teams"]))
-        context = SeasonContext(provider_id, league_id, season_id, team_ids, scope.season_scope)
+        context = SeasonContext(
+            provider_id,
+            league_id,
+            season_id,
+            team_ids,
+            scope.season_scope if isinstance(scope, ActiveSeasonScope) else scope,  # type: ignore[arg-type]
+        )
         fixture_item = by_endpoint["/fixtures"]
         fetch = StoredFetch(fetch_ids["/fixtures"], fixture_item.response, fixture_item.request_started_at, fixture_item.response_received_at, None, False)
         existing = conn.execute(
@@ -736,6 +930,11 @@ def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBa
         return context
 
 
+def import_active_base(conn: Connection[Any], *, collected: Sequence[CollectedBaseResponse], scope: ActiveSeasonScope) -> SeasonContext:
+    """Validate and atomically create or refresh one active League season."""
+    return import_validated_base(conn, validate_base_responses(collected, scope=scope), collected)
+
+
 def verify_active_season(conn: Connection[Any], *, scope: ActiveSeasonScope) -> ActiveSeasonVerificationReport:
     """Return canonical counts needed before enabling a league's live worker."""
     row = conn.execute("""SELECT ref.season_id,(SELECT count(*) FROM football.season_teams st WHERE st.season_id=ref.season_id),(SELECT count(*) FROM football.fixtures f WHERE f.season_id=ref.season_id),(SELECT count(*) FROM source.fixture_provider_refs mapping JOIN football.fixtures f ON f.id=mapping.fixture_id WHERE mapping.provider_id=provider.id AND f.season_id=ref.season_id),(SELECT count(*) FROM football.standings_snapshot_rows rows WHERE rows.snapshot_id=(SELECT snapshots.id FROM football.standings_snapshots snapshots WHERE snapshots.season_id=ref.season_id ORDER BY snapshots.captured_at DESC,snapshots.id DESC LIMIT 1)) FROM source.providers provider JOIN source.season_provider_refs ref ON ref.provider_id=provider.id WHERE provider.code=%s AND ref.league_external_id=%s AND ref.external_season=%s""", (PROVIDER_CODE, str(scope.league_external_id), scope.season_start_year)).fetchone()
@@ -745,8 +944,7 @@ def verify_active_season(conn: Connection[Any], *, scope: ActiveSeasonScope) -> 
     if (
         report.team_count != scope.expected_team_count
         or report.fixture_mapping_count != report.fixture_count
-        or report.standing_row_count != scope.expected_team_count
-        or report.fixture_count > scope.expected_fixture_count
+        or report.standing_row_count != (0 if scope.allow_empty_standings else scope.expected_team_count)
         or (scope.require_complete_schedule and report.fixture_count != scope.expected_fixture_count)
     ):
         raise ActiveSeasonImportError("canonical active season counts do not match the requested scope")

@@ -115,6 +115,16 @@ def test_partial_statistics_are_skipped_without_inventing_a_half_pair() -> None:
     assert parsed.statistics_by_fixture[1] is not None and parsed.statistics_by_fixture[3] is not None
 
 
+def test_empty_statistics_is_a_retryable_fixture_coverage_state() -> None:
+    payload = json.loads(SAMPLE.read_text())
+    payload["response"][1]["statistics"] = []
+
+    parsed = _batch_entries(payload, targets=_sample_targets(), league_external_id=39)
+
+    assert parsed.statistics_by_fixture[2] is None
+    assert parsed.statistics_unavailable_fixture_ids == {2}
+
+
 def test_batch_provenance_memberships_include_only_provider_returned_fixture_ids() -> None:
     payload = json.loads(SAMPLE.read_text())
     payload["response"] = payload["response"][:2]
