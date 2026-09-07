@@ -8,8 +8,12 @@ readonly DATA_DIR="$WORK_DIR/data"
 readonly SOCKET_DIR="$WORK_DIR/socket"
 readonly PORT="55449"
 readonly DATABASE="fa_live_worker"
+readonly REDIS_SOCKET="$WORK_DIR/redis.sock"
+
+source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
+  if ! fa_assert_cleanup_resource; then return; fi
   if [[ -f "$DATA_DIR/postmaster.pid" ]]; then
     sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -m fast stop >/dev/null 2>&1 || true
   fi
@@ -17,6 +21,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$SOCKET_DIR"
+fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$REDIS_SOCKET" "$DATABASE"
 chown postgres:postgres "$WORK_DIR"
 install -d -o postgres -g postgres "$DATA_DIR" "$SOCKET_DIR"
 sudo -u postgres "$PG_BIN/initdb" -D "$DATA_DIR" --auth=trust --no-locale --encoding=UTF8 >/dev/null
@@ -28,10 +34,10 @@ sudo -u postgres "$PG_BIN/initdb" -D "$DATA_DIR" --auth=trust --no-locale --enco
 sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -l "$WORK_DIR/postgres.log" start >/dev/null
 
 psql_db() {
-  "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$DATABASE" "$@"
+  fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$DATABASE" "$@"
 }
 
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
 psql_db -c "CREATE ROLE anon NOLOGIN" >/dev/null
 psql_db -c "CREATE ROLE authenticated NOLOGIN" >/dev/null
 
@@ -45,5 +51,7 @@ do
   psql_db -f "$migration" >/dev/null
 done
 
-LIVE_WORKER_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
+env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
+  FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" \
+  LIVE_WORKER_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
   uv run --directory "$ROOT_DIR/backend" pytest -q tests/test_live_terminal_repository_integration.py

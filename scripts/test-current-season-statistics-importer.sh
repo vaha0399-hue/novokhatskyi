@@ -10,8 +10,12 @@ readonly DATA_DIR="$WORK_DIR/data"
 readonly SOCKET_DIR="$WORK_DIR/socket"
 readonly PORT="55451"
 readonly DATABASE="fa_current_season_statistics_test"
+readonly REDIS_SOCKET="$WORK_DIR/redis.sock"
+
+source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
+  if ! fa_assert_cleanup_resource; then return; fi
   if [[ -f "$DATA_DIR/postmaster.pid" ]]; then
     sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -m fast stop >/dev/null 2>&1 || true
   fi
@@ -20,9 +24,11 @@ cleanup() {
 trap cleanup EXIT
 
 psql_db() {
-  "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$DATABASE" "$@"
+  fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$DATABASE" "$@"
 }
 
+mkdir -p "$SOCKET_DIR"
+fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$REDIS_SOCKET" "$DATABASE"
 chown postgres:postgres "$WORK_DIR"
 install -d -o postgres -g postgres "$DATA_DIR" "$SOCKET_DIR"
 sudo -u postgres "$PG_BIN/initdb" -D "$DATA_DIR" --auth=trust --no-locale --encoding=UTF8 >/dev/null
@@ -33,12 +39,12 @@ sudo -u postgres "$PG_BIN/initdb" -D "$DATA_DIR" --auth=trust --no-locale --enco
 } >>"$DATA_DIR/postgresql.conf"
 sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -l "$WORK_DIR/postgres.log" start >/dev/null
 
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres postgres >/dev/null 2>&1 || true
-"$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d postgres -c 'CREATE ROLE anon NOLOGIN' >/dev/null
-"$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d postgres -c 'CREATE ROLE authenticated NOLOGIN' >/dev/null
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres postgres >/dev/null 2>&1 || true
+fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d postgres -c 'CREATE ROLE anon NOLOGIN' >/dev/null
+fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d postgres -c 'CREATE ROLE authenticated NOLOGIN' >/dev/null
 
 prepare_database() {
-  "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
+  fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
   for migration in \
     "$ROOT_DIR/supabase/migrations/20260821193000_stage_3b_core_schema.sql" \
     "$ROOT_DIR/supabase/migrations/20260822010000_fix_standings_child_guard.sql" \
@@ -58,14 +64,19 @@ prepare_database() {
 
 prepare_database
 
-CURRENT_SEASON_STATISTICS_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
+env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
+  FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" \
+  CURRENT_SEASON_STATISTICS_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
   uv run --directory "$ROOT_DIR/backend" pytest -q tests/test_scanner_sample_count_migration.py
 
-"$PG_BIN/dropdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
+fa_pg_client "$PG_BIN/dropdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$DATABASE"
 prepare_database
 psql_db -f "$ROOT_DIR/supabase/migrations/20260901193000_scanner_metric_sample_counts.sql" >/dev/null
+psql_db -f "$ROOT_DIR/supabase/migrations/20260905022146_fixture_statistics_unavailable_state.sql" >/dev/null
 
-CURRENT_SEASON_STATISTICS_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
+env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
+  FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" \
+  CURRENT_SEASON_STATISTICS_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
   uv run --directory "$ROOT_DIR/backend" pytest -q \
     tests/test_current_season_statistics_integration.py \
     tests/test_scanner_repository_integration.py

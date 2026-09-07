@@ -11,8 +11,12 @@ readonly BASE_MIGRATION="$ROOT_DIR/supabase/migrations/20260821193000_stage_3b_c
 readonly FIX_MIGRATION="$ROOT_DIR/supabase/migrations/20260822010000_fix_standings_child_guard.sql"
 readonly STAGE_3D_MIGRATION="$ROOT_DIR/supabase/migrations/20260822210000_multi_competition_foundation.sql"
 readonly ADDITIVE_MIGRATION="$ROOT_DIR/supabase/migrations/20260823010000_historical_lineups_foundation.sql"
+readonly REDIS_SOCKET="$WORK_DIR/redis.sock"
+
+source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
+  if ! fa_assert_cleanup_resource; then return; fi
   if [[ -f "$DATA_DIR/postmaster.pid" ]]; then
     sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -m fast stop >/dev/null 2>&1 || true
   fi
@@ -20,6 +24,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$SOCKET_DIR"
+fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$REDIS_SOCKET" \
+  fa_historical_lineups_clean fa_historical_lineups_upgrade fa_historical_lineups_failure
 chown postgres:postgres "$WORK_DIR"
 install -d -o postgres -g postgres "$DATA_DIR" "$SOCKET_DIR"
 sudo -u postgres "$PG_BIN/initdb" -D "$DATA_DIR" --auth=trust --no-locale --encoding=UTF8 >/dev/null
@@ -33,7 +40,8 @@ sudo -u postgres "$PG_BIN/pg_ctl" -D "$DATA_DIR" -l "$WORK_DIR/postgres.log" sta
 psql_db() {
   local database="$1"
   shift
-  "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$database" "$@"
+  if [[ "$database" != postgres ]] && ! fa_assert_pg_database "$database"; then return 1; fi
+  fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$database" "$@"
 }
 
 apply_file() {
@@ -43,12 +51,12 @@ apply_file() {
   psql_db "$database" -f "$file" >/dev/null
 }
 
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres postgres >/dev/null 2>&1 || true
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres postgres >/dev/null 2>&1 || true
 psql_db postgres -c "CREATE ROLE anon NOLOGIN" >/dev/null
 psql_db postgres -c "CREATE ROLE authenticated NOLOGIN" >/dev/null
 
 printf 'Clean database migration...\n'
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_clean
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_clean
 apply_file fa_historical_lineups_clean "$BASE_MIGRATION"
 apply_file fa_historical_lineups_clean "$FIX_MIGRATION"
 apply_file fa_historical_lineups_clean "$STAGE_3D_MIGRATION"
@@ -56,7 +64,7 @@ apply_file fa_historical_lineups_clean "$ADDITIVE_MIGRATION"
 apply_file fa_historical_lineups_clean "$ROOT_DIR/supabase/tests/historical_lineups_clean_assertions.sql"
 
 printf 'Upgrade migration with EPL 2024 preservation fingerprints...\n'
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_upgrade
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_upgrade
 apply_file fa_historical_lineups_upgrade "$BASE_MIGRATION"
 apply_file fa_historical_lineups_upgrade "$FIX_MIGRATION"
 apply_file fa_historical_lineups_upgrade "$ROOT_DIR/supabase/tests/stage_3d_upgrade_seed.sql"
@@ -78,7 +86,7 @@ psql_db fa_historical_lineups_upgrade -Atc \
   | rg -qx 'deferred-rollback-ok'
 
 printf 'Atomic migration failure/rollback...\n'
-"$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_failure
+fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres fa_historical_lineups_failure
 apply_file fa_historical_lineups_failure "$BASE_MIGRATION"
 apply_file fa_historical_lineups_failure "$FIX_MIGRATION"
 apply_file fa_historical_lineups_failure "$STAGE_3D_MIGRATION"
