@@ -15,6 +15,7 @@ from app.importer.cup_queue_repository import PostgresCupQueueRepository
 from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
+from app.sync.worker import RepeatableSyncWorker, WorkResult
 
 TEST_DB_URL = os.environ.get("REPEATABLE_SYNC_QUEUE_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="REPEATABLE_SYNC_QUEUE_TEST_DB_URL is not configured")
@@ -314,3 +315,23 @@ def test_q03_legacy_apis_cannot_claim_or_mutate_repeatable_work() -> None:
         claimed = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", ("new", "1 minute", 3)).fetchone()
         assert claimed is not None and int(claimed[0]) == item_id
         assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, "new", Jsonb({}))).fetchone()[0] is None
+
+
+def test_q03_runner_commits_before_fetch_and_heartbeats_on_separate_connection() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = int(setup.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-runner-{suffix}", "Q03 runner")).fetchone()[0])
+        run_id = _run(setup, provider, f"q03-runner-{suffix}")
+        item_id, _ = _enqueue(setup, run_id, f"q03-runner:{suffix}", priority=13_000_000, execution_key=f"q03-runner:{suffix}")
+        setup.execute("UPDATE ops.sync_work_items SET scope=%s WHERE id=%s", (Jsonb({"_sync_policy": {"provider_id": provider, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}), item_id))
+    class Gate:
+        def before_enqueue(self, request): return type("A", (), {"coverage": None, "refresh_interval": None})()
+        def before_execution(self, authorization): return authorization
+    with psycopg.connect(TEST_DB_URL) as connection:
+        worker = RepeatableSyncWorker(connection, Gate(), f"runner-{suffix}", heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL))  # type: ignore[arg-type]
+        def fetch(*_args):
+            assert connection.info.transaction_status.name == "IDLE"
+            return WorkResult({"done": True})
+        worker.run_once(fetch, lambda writer, *_: writer.execute("CREATE TEMP TABLE q03_runner_persist(value text)"))
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE stable_key=%s", (f"q03-runner:{suffix}",)).fetchone()[0] == "succeeded"
