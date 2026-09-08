@@ -110,4 +110,30 @@ REVOKE EXECUTE ON FUNCTION ops.claim_next_repeatable_sync_work_item_with_lease(t
  ops.heartbeat_repeatable_sync_work_item(bigint,text,bigint,interval), ops.checkpoint_repeatable_sync_work_item(bigint,text,bigint,jsonb),
  ops.requeue_repeatable_sync_work_item(bigint,text,bigint,jsonb,text,interval,boolean), ops.retry_quarantined_repeatable_sync_work_item(bigint),
  ops.guard_repeatable_sync_work_item_lease(bigint,text,bigint), ops.complete_repeatable_sync_work_item(bigint,text,bigint,jsonb) FROM PUBLIC;
+
+-- Fence the pre-Q03 APIs to their compatibility lane.  This keeps Cup/season
+-- unchanged while preventing a token-less legacy caller from mutating durable work.
+CREATE OR REPLACE FUNCTION ops.claim_next_sync_work_item(p_run_id bigint,p_lease_owner text,p_lease_duration interval DEFAULT interval '5 minutes')
+RETURNS TABLE (id bigint,scope_key text,scope jsonb,checkpoint jsonb,attempts integer) LANGUAGE plpgsql AS $$
+BEGIN
+ RETURN QUERY WITH candidate AS (SELECT item.id FROM ops.sync_work_items item WHERE item.run_id=p_run_id AND item.job_type='legacy'
+  AND item.available_at<=clock_timestamp() AND (item.status='pending' OR (item.status='running' AND item.lease_expires_at<clock_timestamp()))
+  ORDER BY item.id FOR UPDATE SKIP LOCKED LIMIT 1)
+ UPDATE ops.sync_work_items item SET status='running',attempts=item.attempts+1,lease_owner=p_lease_owner,
+ lease_expires_at=clock_timestamp()+p_lease_duration,started_at=coalesce(item.started_at,clock_timestamp()),last_error=NULL
+ FROM candidate WHERE item.id=candidate.id RETURNING item.id,item.scope_key,item.scope,item.checkpoint,item.attempts;
+END; $$;
+CREATE OR REPLACE FUNCTION ops.renew_sync_work_item(p_item_id bigint,p_lease_owner text,p_lease_duration interval DEFAULT interval '5 minutes') RETURNS boolean LANGUAGE sql AS $$
+ UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()+p_lease_duration WHERE id=p_item_id AND job_type='legacy'
+ AND status='running' AND lease_owner=p_lease_owner AND lease_expires_at>=clock_timestamp() RETURNING true;
+$$;
+CREATE OR REPLACE FUNCTION ops.checkpoint_sync_work_item(p_item_id bigint,p_lease_owner text,p_checkpoint jsonb) RETURNS boolean LANGUAGE sql AS $$
+ UPDATE ops.sync_work_items SET checkpoint=p_checkpoint WHERE id=p_item_id AND job_type='legacy' AND status='running'
+ AND lease_owner=p_lease_owner AND lease_expires_at>=clock_timestamp() AND jsonb_typeof(p_checkpoint)='object' RETURNING true;
+$$;
+CREATE OR REPLACE FUNCTION ops.complete_sync_work_item(p_item_id bigint,p_lease_owner text,p_checkpoint jsonb DEFAULT '{}'::jsonb) RETURNS boolean LANGUAGE sql AS $$
+ UPDATE ops.sync_work_items SET status='succeeded',checkpoint=p_checkpoint,finished_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL
+ WHERE id=p_item_id AND job_type='legacy' AND status='running' AND lease_owner=p_lease_owner AND lease_expires_at>=clock_timestamp()
+ AND jsonb_typeof(p_checkpoint)='object' RETURNING true;
+$$;
 COMMIT;

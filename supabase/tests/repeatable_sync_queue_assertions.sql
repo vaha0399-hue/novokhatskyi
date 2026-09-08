@@ -27,7 +27,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM ops.sync_work_items WHERE execution_key='entity:team:1' AND status='running' AND id <> first_id) THEN
         RAISE EXCEPTION 'conflicting execution group ran concurrently';
     END IF;
-    IF NOT ops.complete_sync_work_item(first_id, 'q02-worker', '{}'::jsonb) THEN RAISE EXCEPTION 'completion failed'; END IF;
+    IF NOT ops.complete_repeatable_sync_work_item(first_id, 'q02-worker',
+        (SELECT lease_token FROM ops.sync_work_items WHERE id=first_id), '{}'::jsonb) THEN RAISE EXCEPTION 'completion failed'; END IF;
     IF (SELECT enqueued FROM ops.enqueue_repeatable_sync_work_item(
         r2, 'scope-a-after-complete', '{}'::jsonb, 'metrics', 9, clock_timestamp(),
         'recalculation:metrics:' || p || ':1:team:1:v1', 'team:1', 'entity:team:1')) THEN

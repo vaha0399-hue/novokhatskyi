@@ -56,7 +56,8 @@ def test_repeatable_queue_uses_real_concurrent_connections_and_preserves_version
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (stable,)).fetchone()[0] == 1
         item_id = results[0][0]
         assert connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"q02-{suffix}", "1 minute")).fetchone()[0] == item_id
-        assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, f"q02-{suffix}", Jsonb({}))).fetchone()[0] is True
+        token = connection.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
+        assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"q02-{suffix}", token, Jsonb({}))).fetchone()[0] is True
         owning_run = connection.execute("SELECT run_id FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
         with pytest.raises(psycopg.errors.RestrictViolation):
             connection.execute("DELETE FROM ops.sync_runs WHERE id=%s", (owning_run,))
@@ -129,7 +130,8 @@ def test_repeatable_identity_cannot_be_changed_or_deleted_after_completion() -> 
             connection.execute("DELETE FROM ops.sync_work_items WHERE id=%s", (item_id,))
         claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"immutable-{suffix}", "1 minute")).fetchone()
         assert claimed is not None and int(claimed[0]) == item_id
-        assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, f"immutable-{suffix}", Jsonb({}))).fetchone()[0] is True
+        token = connection.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
+        assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"immutable-{suffix}", token, Jsonb({}))).fetchone()[0] is True
         assert _enqueue(connection, run_id, stable) == (item_id, False)
 
 
@@ -299,3 +301,16 @@ def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_complet
             connection.execute("INSERT INTO q03_atomic_marker VALUES('dependent')")
             assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"txn-{suffix}", token, Jsonb({}))).fetchone()[0] is True
         assert connection.execute("SELECT count(*) FROM q03_atomic_marker").fetchone()[0] == 2
+
+
+def test_q03_legacy_apis_cannot_claim_or_mutate_repeatable_work() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider = int(connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-legacy-api-{suffix}", "Q03 legacy api")).fetchone()[0])
+        run_id = _run(connection, provider, f"q03-legacy-api-{suffix}")
+        item_id, _ = _enqueue(connection, run_id, f"q03-legacy-api:{suffix}", priority=12_000_000, execution_key=f"q03-legacy-api:{suffix}")
+        assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, "old", "1 minute")).fetchone() is None
+        claimed = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", ("new", "1 minute", 3)).fetchone()
+        assert claimed is not None and int(claimed[0]) == item_id
+        assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, "new", Jsonb({}))).fetchone()[0] is None
