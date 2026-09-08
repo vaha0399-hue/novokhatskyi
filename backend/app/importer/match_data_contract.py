@@ -8,6 +8,8 @@ for review rather than coerced into a result or a zero-valued statistic.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -54,10 +56,19 @@ class StatisticsPeriod(StrEnum):
     UNKNOWN = "unknown"
 
 
-class TransitionAction(StrEnum):
+class PhaseTransitionAction(StrEnum):
     ACCEPT = "accept"
-    IGNORE_STALE = "ignore_stale"
-    RECONCILE_RESULT_CORRECTION = "reconcile_result_correction"
+    ACCEPT_AMBIGUOUS_LIVE = "accept_ambiguous_live"
+    REVIEW_REGRESSION = "review_regression"
+    REVIEW_CONFLICT = "review_conflict"
+
+
+class ObservationAction(StrEnum):
+    APPLY = "apply"
+    APPLY_CORRECTION = "apply_correction"
+    NO_CHANGE = "no_change"
+    IGNORE_OLDER_REQUEST = "ignore_older_request"
+    REVIEW_PHASE_REGRESSION = "review_phase_regression"
     REVIEW_CONFLICT = "review_conflict"
 
 
@@ -100,6 +111,32 @@ class ResolvedResult:
     eligible_for_played_match_analytics: bool
 
 
+@dataclass(frozen=True)
+class PollObservation:
+    """One immutable per-fixture response snapshot from a local poll request.
+
+    ``request_sequence`` is allocated locally when a request is sent.  It is
+    the sole freshness order at this boundary; ``received_at`` is retained for
+    audit and latency analysis only.  The fingerprint must cover the complete
+    retained per-fixture content, including status and all score fields.
+    """
+
+    provider_code: str
+    content_fingerprint: str
+    request_sequence: int
+    received_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_code, str):
+            raise ValueError("provider status code must be a string")
+        if not isinstance(self.request_sequence, int) or isinstance(self.request_sequence, bool) or self.request_sequence < 0:
+            raise ValueError("request sequence must be a non-negative integer")
+        if not isinstance(self.content_fingerprint, str) or not _SHA256_RE.fullmatch(self.content_fingerprint):
+            raise ValueError("content fingerprint must be a SHA-256 hex digest")
+        if not isinstance(self.received_at, datetime) or self.received_at.tzinfo is None:
+            raise ValueError("received_at must be timezone-aware")
+
+
 _RULES = (
     StatusRule("TBD", MatchState.SCHEDULED, StatusAction.STORE_SCHEDULE, False, False),
     StatusRule("NS", MatchState.SCHEDULED, StatusAction.STORE_SCHEDULE, False, False),
@@ -123,6 +160,7 @@ _RULES = (
 )
 _BY_CODE = {rule.provider_code: rule for rule in _RULES}
 UNKNOWN_STATUS = StatusRule("UNKNOWN", MatchState.UNKNOWN, StatusAction.PRESERVE_RAW_AND_REVIEW, False, False)
+_SHA256_RE = re.compile(r"[a-f0-9]{64}")
 
 
 def status_rule(provider_code: object) -> StatusRule:
@@ -160,36 +198,77 @@ def regulation_statistics_bucket(period: StatisticsPeriod) -> StatisticsPeriod |
     return StatisticsPeriod.REGULATION_90 if period is StatisticsPeriod.REGULATION_90 else None
 
 
-_FORWARD_STATES = {
-    MatchState.SCHEDULED: frozenset({MatchState.SCHEDULED, MatchState.IN_PROGRESS, MatchState.POSTPONED, MatchState.CANCELLED, MatchState.ADMINISTRATIVE}),
-    MatchState.POSTPONED: frozenset({MatchState.POSTPONED, MatchState.SCHEDULED, MatchState.CANCELLED, MatchState.ADMINISTRATIVE}),
-    MatchState.IN_PROGRESS: frozenset({MatchState.IN_PROGRESS, MatchState.PAUSED, MatchState.SUSPENDED, MatchState.INTERRUPTED, MatchState.COMPLETED, MatchState.ABANDONED}),
-    MatchState.PAUSED: frozenset({MatchState.PAUSED, MatchState.IN_PROGRESS, MatchState.SUSPENDED, MatchState.INTERRUPTED, MatchState.COMPLETED, MatchState.ABANDONED}),
-    MatchState.SUSPENDED: frozenset({MatchState.SUSPENDED, MatchState.IN_PROGRESS, MatchState.POSTPONED, MatchState.COMPLETED, MatchState.CANCELLED, MatchState.ABANDONED}),
-    MatchState.INTERRUPTED: frozenset({MatchState.INTERRUPTED, MatchState.IN_PROGRESS, MatchState.POSTPONED, MatchState.COMPLETED, MatchState.CANCELLED, MatchState.ABANDONED}),
-}
+_PRECISE_PHASE_ORDER = {"1H": 10, "HT": 20, "2H": 30, "ET": 40, "BT": 45, "P": 50}
+_SCHEDULE_CODES = frozenset({"TBD", "NS", "PST"})
+_INTERRUPTION_CODES = frozenset({"SUSP", "INT"})
 
 
-def transition_action(
-    previous_code: object,
-    incoming_code: object,
-    *,
-    previous_observed_at: datetime,
-    incoming_observed_at: datetime,
-) -> TransitionAction:
-    """Decide whether a newer provider observation may advance a fixture."""
-    if incoming_observed_at < previous_observed_at:
-        return TransitionAction.IGNORE_STALE
+def observation_fingerprint(provider_code: str, snapshot: bytes) -> str:
+    """Return an immutable fixture identity that always includes its status."""
+    if not isinstance(provider_code, str):
+        raise ValueError("provider status code must be a string")
+    if not isinstance(snapshot, bytes):
+        raise ValueError("fixture snapshot must be bytes")
+    return hashlib.sha256(provider_code.encode("utf-8") + b"\0" + snapshot).hexdigest()
+
+
+def phase_transition_action(previous_code: object, incoming_code: object) -> PhaseTransitionAction:
+    """Evaluate football phases only; this function has no polling-time input.
+
+    A poll may miss phases, so any forward jump from a schedule to a terminal
+    phase is valid.  Precise live phases cannot regress.  ``LIVE`` is an
+    in-progress provider signal with no reliable ordinal phase: it can update
+    a live snapshot, but cannot claim a precise phase rollback.
+    """
     previous = status_rule(previous_code)
     incoming = status_rule(incoming_code)
-    if incoming.state is MatchState.UNKNOWN or previous.state is MatchState.UNKNOWN:
-        return TransitionAction.REVIEW_CONFLICT
-    if incoming_observed_at == previous_observed_at and incoming.provider_code != previous.provider_code:
-        return TransitionAction.REVIEW_CONFLICT
+    if previous.state is MatchState.UNKNOWN or incoming.state is MatchState.UNKNOWN:
+        return PhaseTransitionAction.REVIEW_CONFLICT
+    if previous.provider_code == incoming.provider_code:
+        return PhaseTransitionAction.ACCEPT
     if previous.is_terminal:
-        if incoming_observed_at > previous_observed_at:
-            return TransitionAction.RECONCILE_RESULT_CORRECTION
-        return TransitionAction.REVIEW_CONFLICT
-    if incoming.state in _FORWARD_STATES.get(previous.state, frozenset()):
-        return TransitionAction.ACCEPT
-    return TransitionAction.REVIEW_CONFLICT
+        return PhaseTransitionAction.REVIEW_CONFLICT
+    if incoming.is_terminal:
+        return PhaseTransitionAction.ACCEPT
+    if previous.provider_code in _SCHEDULE_CODES:
+        return PhaseTransitionAction.ACCEPT
+    if incoming.provider_code in _SCHEDULE_CODES:
+        return PhaseTransitionAction.REVIEW_REGRESSION
+    if previous.provider_code in _INTERRUPTION_CODES or incoming.provider_code in _INTERRUPTION_CODES:
+        return PhaseTransitionAction.ACCEPT
+    if incoming.provider_code == "LIVE":
+        return PhaseTransitionAction.ACCEPT_AMBIGUOUS_LIVE
+    if previous.provider_code == "LIVE":
+        return PhaseTransitionAction.ACCEPT
+    previous_phase = _PRECISE_PHASE_ORDER.get(previous.provider_code)
+    incoming_phase = _PRECISE_PHASE_ORDER.get(incoming.provider_code)
+    if previous_phase is None or incoming_phase is None:
+        return PhaseTransitionAction.REVIEW_CONFLICT
+    if previous.provider_code == "BT" and incoming.provider_code == "ET":
+        return PhaseTransitionAction.ACCEPT
+    if incoming_phase < previous_phase:
+        return PhaseTransitionAction.REVIEW_REGRESSION
+    return PhaseTransitionAction.ACCEPT
+
+
+def observation_action(current: PollObservation, incoming: PollObservation) -> ObservationAction:
+    """Combine local request order, identity, then football phase semantics.
+
+    A response from an earlier dispatched request is ignored even if it arrives
+    later.  Receipt time is intentionally absent from ordering.  Equal status
+    does not mean no change: only the same immutable content fingerprint does.
+    """
+    if incoming.request_sequence < current.request_sequence:
+        return ObservationAction.IGNORE_OLDER_REQUEST
+    if incoming.content_fingerprint == current.content_fingerprint:
+        return ObservationAction.NO_CHANGE
+    if incoming.request_sequence == current.request_sequence:
+        return ObservationAction.REVIEW_CONFLICT
+    if status_rule(current.provider_code).is_terminal and status_rule(incoming.provider_code).is_terminal:
+        return ObservationAction.APPLY_CORRECTION
+    phase = phase_transition_action(current.provider_code, incoming.provider_code)
+    if phase is PhaseTransitionAction.REVIEW_REGRESSION:
+        return ObservationAction.REVIEW_PHASE_REGRESSION
+    if phase is PhaseTransitionAction.REVIEW_CONFLICT:
+        return ObservationAction.REVIEW_CONFLICT
+    return ObservationAction.APPLY

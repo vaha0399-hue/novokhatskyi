@@ -6,16 +6,20 @@ import pytest
 
 from app.importer.match_data_contract import (
     MatchState,
+    ObservationAction,
+    PollObservation,
+    PhaseTransitionAction,
     ResultKind,
     ResultObservation,
     ScorePair,
     StatisticsPeriod,
     StatusAction,
-    TransitionAction,
     regulation_statistics_bucket,
+    observation_action,
+    observation_fingerprint,
+    phase_transition_action,
     resolve_result,
     status_rule,
-    transition_action,
 )
 
 
@@ -95,22 +99,74 @@ def test_unknown_or_extra_time_statistics_never_enter_regulation_bucket() -> Non
     assert regulation_statistics_bucket(StatisticsPeriod.UNKNOWN) is None
 
 
-def test_transition_ignores_stale_and_allows_later_terminal_correction() -> None:
-    observed = datetime(2026, 9, 7, 12, tzinfo=UTC)
-    assert transition_action("1H", "FT", previous_observed_at=observed, incoming_observed_at=observed - timedelta(seconds=1)) is TransitionAction.IGNORE_STALE
-    assert transition_action("FT", "SUSP", previous_observed_at=observed, incoming_observed_at=observed + timedelta(seconds=1)) is TransitionAction.RECONCILE_RESULT_CORRECTION
-
-
 @pytest.mark.parametrize(
     ("previous", "incoming", "expected"),
     [
-        ("PST", "NS", TransitionAction.ACCEPT),
-        ("1H", "HT", TransitionAction.ACCEPT),
-        ("HT", "2H", TransitionAction.ACCEPT),
-        ("CANC", "NS", TransitionAction.RECONCILE_RESULT_CORRECTION),
-        ("NS", "VAR_DELAY", TransitionAction.REVIEW_CONFLICT),
+        ("NS", "HT", PhaseTransitionAction.ACCEPT),
+        ("NS", "FT", PhaseTransitionAction.ACCEPT),
+        ("2H", "1H", PhaseTransitionAction.REVIEW_REGRESSION),
+        ("ET", "2H", PhaseTransitionAction.REVIEW_REGRESSION),
+        ("ET", "BT", PhaseTransitionAction.ACCEPT),
+        ("BT", "ET", PhaseTransitionAction.ACCEPT),
+        ("ET", "ET", PhaseTransitionAction.ACCEPT),
+        ("2H", "LIVE", PhaseTransitionAction.ACCEPT_AMBIGUOUS_LIVE),
+        ("LIVE", "ET", PhaseTransitionAction.ACCEPT),
     ],
 )
-def test_transition_table(previous: str, incoming: str, expected: TransitionAction) -> None:
-    observed = datetime(2026, 9, 7, 12, tzinfo=UTC)
-    assert transition_action(previous, incoming, previous_observed_at=observed, incoming_observed_at=observed + timedelta(seconds=1)) is expected
+def test_phase_transition_allows_skipped_polls_but_not_phase_regressions(
+    previous: str, incoming: str, expected: PhaseTransitionAction
+) -> None:
+    assert phase_transition_action(previous, incoming) is expected
+
+
+def _poll(code: str, payload: bytes, request_sequence: int, received_at: datetime) -> PollObservation:
+    return PollObservation(
+        provider_code=code,
+        content_fingerprint=observation_fingerprint(code, payload),
+        request_sequence=request_sequence,
+        received_at=received_at,
+    )
+
+
+def test_identical_terminal_observation_is_no_change_by_content_not_status() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    current = _poll("FT", b'{"goals":{"home":1,"away":0}}', 10, received)
+    repeated = _poll("FT", b'{"goals":{"home":1,"away":0}}', 11, received + timedelta(seconds=1))
+    corrected = _poll("FT", b'{"goals":{"home":2,"away":0}}', 12, received + timedelta(seconds=2))
+    assert observation_action(current, repeated) is ObservationAction.NO_CHANGE
+    assert observation_action(current, corrected) is ObservationAction.APPLY_CORRECTION
+
+
+def test_newer_changed_terminal_status_is_also_a_result_correction() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    current = _poll("FT", b'{"score":"1-1"}', 10, received)
+    corrected = _poll("AET", b'{"score":"2-1"}', 11, received + timedelta(seconds=1))
+    assert observation_action(current, corrected) is ObservationAction.APPLY_CORRECTION
+
+
+def test_late_response_from_an_older_dispatched_request_cannot_rollback_projection() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    newer_response = _poll("2H", b'{"score":"1-0"}', 8, received)
+    older_response_arriving_later = _poll("1H", b'{"score":"0-0"}', 7, received + timedelta(seconds=5))
+    assert observation_action(newer_response, older_response_arriving_later) is ObservationAction.IGNORE_OLDER_REQUEST
+
+
+def test_same_request_sequence_with_different_content_requires_review() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    current = _poll("2H", b'{"score":"1-0"}', 8, received)
+    conflicting_response = _poll("2H", b'{"score":"1-1"}', 8, received + timedelta(seconds=2))
+    assert observation_action(current, conflicting_response) is ObservationAction.REVIEW_CONFLICT
+
+
+def test_newer_phase_regression_requires_review_even_when_response_is_newer() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    current = _poll("ET", b'{"score":"2-2"}', 20, received)
+    regression = _poll("2H", b'{"score":"1-1"}', 21, received + timedelta(seconds=1))
+    assert observation_action(current, regression) is ObservationAction.REVIEW_PHASE_REGRESSION
+
+
+def test_newer_terminal_to_live_observation_requires_review() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    current = _poll("FT", b'{"score":"1-0"}', 30, received)
+    repair = _poll("SUSP", b'{"score":"1-0"}', 31, received + timedelta(seconds=1))
+    assert observation_action(current, repair) is ObservationAction.REVIEW_CONFLICT

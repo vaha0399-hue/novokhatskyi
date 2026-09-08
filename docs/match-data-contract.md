@@ -75,17 +75,45 @@ object do not prove neutral or non-neutral venue. **Product rule:** use
 
 ## Transitions, delayed responses, and corrections
 
-**Product rule:** retain each raw observation with its provider observation
-time. An observation older than the current projection is stale and does not
-change it. Equal timestamps with different status codes require review.
+Football phase validity and periodic-poll freshness are separate decisions.
+Neither kickoff time, provider time, nor response-arrival order proves that a
+snapshot is newer.
+
+**Product rule:** assign each poll request a monotonically increasing local
+`request_sequence` when it is sent, per fixture/projection. Store
+`received_at` separately for audit and latency analysis, but never use it to
+order projections. A response with a lower `request_sequence` is ignored even
+when it arrives later. This contract does not introduce a queue, worker, or
+storage implementation.
+
+Each retained per-fixture snapshot has an immutable SHA-256 content fingerprint
+covering its status and every retained score/period field (normally the
+canonical raw fixture object). The pure helper explicitly includes the status
+code in its hash input. Fingerprints are compared, never recreated from the
+current projection. The decision order is:
+
+1. Lower local request sequence: ignore the older request response.
+2. Same fingerprint: `NO_CHANGE`, regardless of a later request sequence.
+3. Same sequence but different fingerprint: review conflict.
+4. Newer, different content: apply the football phase graph below.
+
+Thus a repeated identical `FT` is `NO_CHANGE`; an `FT` with a changed score is
+a result correction, not a no-op merely because the status code matches.
 
 Usual allowed forward paths are `TBD/NS → 1H → HT → 2H → FT`, with
 `2H → ET → BT → ET/P → AET/PEN`; `PST → NS` is expected after a new date is
-published. `SUSP` and `INT` may move to live, postponed, cancelled, abandoned,
-or a provider-confirmed completed state. A later authoritative response may
-correct a terminal status or result, including terminal-to-live/suspended;
-reconcile the current projection while retaining prior raw evidence. Unknown
-or impossible equal-time conflicts require review, never a guessed transition.
+published. Polling can miss intermediate phases, so `NS → HT` and `NS → FT`
+are valid forward observations. Precise phase regressions such as `2H → 1H`
+and `ET → 2H` require review and are never applied automatically. Repeated
+`ET`, and `ET → BT → ET`, are valid. `LIVE` means in-progress with an
+unspecified phase: it may refresh a nonterminal live snapshot, but cannot
+prove that a previously known precise phase moved backward.
+
+`SUSP` and `INT` may move to live, postponed, cancelled, abandoned, or a
+provider-confirmed completed state. A newer terminal snapshot with changed
+content is a result correction. A terminal-to-live/suspended response is a
+phase conflict pending reviewed repair; raw evidence is retained. Unknown
+codes and other phase conflicts require review, never a guessed transition.
 
 ## Statistics, corners, and cards
 
@@ -111,8 +139,9 @@ proves their inclusion. Corners follow the same period/provenance rule.
 
 `backend/app/importer/match_data_contract.py` is the executable pure-function
 form of this document. Its table tests cover all 19 documented codes, FT/AET/
-PEN/admin examples, missing fulltime, period isolation, stale responses, and
-terminal corrections.
+PEN/admin examples, missing fulltime, period isolation, skipped phases, phase
+regressions, repeated ET around BT, ambiguous LIVE, local request ordering,
+identical observations, and terminal corrections.
 
 Current behavior differs intentionally until a separately approved integration:
 
