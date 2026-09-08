@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -328,10 +329,16 @@ def test_q03_runner_commits_before_fetch_and_heartbeats_on_separate_connection()
     class Gate:
         def before_enqueue(self, request): return type("A", (), {"coverage": None, "refresh_interval": None})()
         def before_execution(self, authorization): return authorization
+    heartbeat_connections: list[object] = []
+    def heartbeat_connection():
+        heartbeat_connections.append(object())
+        return psycopg.connect(TEST_DB_URL)
     with psycopg.connect(TEST_DB_URL) as connection:
-        worker = RepeatableSyncWorker(connection, Gate(), f"runner-{suffix}", heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL))  # type: ignore[arg-type]
+        worker = RepeatableSyncWorker(connection, Gate(), f"runner-{suffix}", heartbeat_connection_factory=heartbeat_connection, heartbeat_interval=0.01)  # type: ignore[arg-type]
         def fetch(*_args):
             assert connection.info.transaction_status.name == "IDLE"
+            time.sleep(0.05)
+            assert heartbeat_connections
             return WorkResult({"done": True})
         worker.run_once(fetch, lambda writer, *_: writer.execute("CREATE TEMP TABLE q03_runner_persist(value text)"))
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE stable_key=%s", (f"q03-runner:{suffix}",)).fetchone()[0] == "succeeded"
