@@ -77,6 +77,14 @@ def test_runner_policy_denial_quarantines_without_fetch_or_apply() -> None:
     assert calls and calls[0][-1] == "competition sync policy denied: disabled"
 
 
+def test_runner_heartbeat_failure_prevents_apply_after_fetch() -> None:
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat=lambda _: False)  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    with pytest.raises(LeaseLost, match="heartbeat"):
+        worker.run_once(lambda *_: WorkResult({}), lambda *_: pytest.fail("apply"))
+
+
 def test_atomic_writer_capability_rejects_commit_rollback_close_and_connection_access() -> None:
     writer = AtomicWorkTransaction(_Connection())  # type: ignore[arg-type]
     assert writer.execute("SELECT 1") == ("SELECT 1", None)

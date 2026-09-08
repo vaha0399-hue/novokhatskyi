@@ -19,15 +19,16 @@ class LeaseLost(RuntimeError):
 
 class AtomicWorkTransaction:
     """Restricted writer capability: no commit and no connection factory."""
+    __slots__ = ("_execute", "_transaction")
     def __init__(self, connection: Connection[Any]) -> None:
-        self._connection = connection
+        self._execute, self._transaction = connection.execute, connection.transaction
 
     def execute(self, query: str, params: Any = None) -> Any:
-        return self._connection.execute(query, params)
+        return self._execute(query, params)
 
     def transaction(self) -> Any:
         """Permit canonical writers' nested savepoints, never a top-level commit."""
-        return self._connection.transaction()
+        return self._transaction()
 
 
 @dataclass(frozen=True)
@@ -47,21 +48,37 @@ class RepeatableSyncWorker:
     commit or open another connection; this is the integration boundary for
     canonical writers until those writers are adapted for Q03.
     """
-    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str) -> None:
+    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str, heartbeat: Callable[[LeasedWorkItem], bool] | None = None) -> None:
         self._connection, self._gate, self._owner = connection, policy_gate, owner
         self.repository = PostgresSyncRepository(connection, policy_gate)
+        self._heartbeat = heartbeat
 
     def run_once(self, fetch: FetchExecutor, apply_result: Callable[[AtomicWorkTransaction, LeasedWorkItem, WorkResult], None], *, max_attempts: int = 5) -> bool:
-        item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
-        if item is None:
-            return False
         try:
-            authorization = self._authorization(item)
+            # Claim and policy recheck are a short transaction, deliberately
+            # committed before any network wait.
+            with self._connection.transaction():
+                item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
+                if item is None:
+                    return False
+                authorization = self._authorization(item)
         except SyncPolicyDenied as exc:
-            self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            with self._connection.transaction():
+                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            return True
+        except ValueError as exc:
+            with self._connection.transaction():
+                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
             return True
         # Fetchers may wait on HTTP; no transaction is active here.
-        result = fetch(item, authorization)
+        try:
+            result = fetch(item, authorization)
+        except Exception as exc:
+            with self._connection.transaction():
+                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            return True
+        if self._heartbeat is not None and not self._heartbeat(item):
+            raise LeaseLost("repeatable work-item heartbeat failed")
         with self._connection.transaction():
             guarded = self._connection.execute(
                 "SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)",
