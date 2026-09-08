@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from threading import Event, Thread
+from time import sleep
 from typing import Any, Protocol
 
 from psycopg import Connection
@@ -48,11 +50,12 @@ class RepeatableSyncWorker:
     commit or open another connection; this is the integration boundary for
     canonical writers until those writers are adapted for Q03.
     """
-    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str, heartbeat: Callable[[LeasedWorkItem], bool] | None = None, heartbeat_connection_factory: Callable[[], Connection[Any]] | None = None) -> None:
+    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str, heartbeat: Callable[[LeasedWorkItem], bool] | None = None, heartbeat_connection_factory: Callable[[], Connection[Any]] | None = None, heartbeat_interval: float = 30.0) -> None:
         self._connection, self._gate, self._owner = connection, policy_gate, owner
         self.repository = PostgresSyncRepository(connection, policy_gate)
         self._heartbeat = heartbeat
         self._heartbeat_connection_factory = heartbeat_connection_factory
+        self._heartbeat_interval = heartbeat_interval
 
     def run_once(self, fetch: FetchExecutor, apply_result: Callable[[AtomicWorkTransaction, LeasedWorkItem, WorkResult], None], *, max_attempts: int = 5) -> bool:
         # Claim and policy recheck are a short transaction, deliberately
@@ -68,20 +71,25 @@ class RepeatableSyncWorker:
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
                 return True
         # Fetchers may wait on HTTP; no transaction is active here.
+        failed = Event()
+        stop = Event()
+        def beat() -> None:
+            while not stop.wait(self._heartbeat_interval):
+                if not self._send_heartbeat(item):
+                    failed.set(); return
+        thread = Thread(target=beat, daemon=True) if self._heartbeat_connection_factory is not None else None
+        if thread is not None: thread.start()
         try:
             result = fetch(item, authorization)
         except Exception as exc:
+            stop.set()
+            if thread is not None: thread.join()
             with self._connection.transaction():
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
             return True
-        if self._heartbeat_connection_factory is not None:
-            with self._heartbeat_connection_factory() as heartbeat_connection:
-                with heartbeat_connection.transaction():
-                    row = heartbeat_connection.execute("SELECT ops.heartbeat_repeatable_sync_work_item(%s,%s,%s,%s::interval)", (item.id, self._owner, item.lease_token, "5 minutes")).fetchone()
-                    heartbeat_ok = row is not None and row[0] is True
-        else:
-            heartbeat_ok = self._heartbeat(item) if self._heartbeat is not None else True
-        if not heartbeat_ok:
+        stop.set()
+        if thread is not None: thread.join()
+        if failed.is_set() or (thread is None and not self._send_heartbeat(item)):
             raise LeaseLost("repeatable work-item heartbeat failed")
         with self._connection.transaction():
             guarded = self._connection.execute(
@@ -101,6 +109,14 @@ class RepeatableSyncWorker:
             if completed is None or completed[0] is not True:
                 raise LeaseLost("repeatable work-item lease was lost before completion")
         return True
+
+    def _send_heartbeat(self, item: LeasedWorkItem) -> bool:
+        if self._heartbeat_connection_factory is not None:
+            with self._heartbeat_connection_factory() as heartbeat_connection:
+                with heartbeat_connection.transaction():
+                    row = heartbeat_connection.execute("SELECT ops.heartbeat_repeatable_sync_work_item(%s,%s,%s,%s::interval)", (item.id, self._owner, item.lease_token, "5 minutes")).fetchone()
+                    return row is not None and row[0] is True
+        return self._heartbeat(item) if self._heartbeat is not None else True
 
     def _authorization(self, item: LeasedWorkItem) -> AuthorizedSyncWork:
         policy = item.scope.get("_sync_policy")
