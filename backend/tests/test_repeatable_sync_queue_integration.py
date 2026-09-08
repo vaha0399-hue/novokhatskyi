@@ -378,6 +378,10 @@ def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
     with psycopg.connect(TEST_DB_URL) as connection:
         worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
         worker.run_once(lambda *_: WorkResult({}, (lambda writer: writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')"),)), apply)
+        connection.commit()
+        connection.execute("UPDATE ops.sync_work_items SET available_at=clock_timestamp()+interval '1 hour' WHERE status='pending' AND id<>%s", (item_id,))
+        connection.commit()
+        assert worker.run_once(lambda *_: pytest.fail("duplicate fetch"), lambda *_: pytest.fail("duplicate apply")) is False
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
         assert verify.execute(f"SELECT count(*) FROM ops.{table}").fetchone()[0] == 2
         assert verify.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0] == "succeeded"
