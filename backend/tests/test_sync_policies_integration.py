@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
 
 from app.sync.policies import (
@@ -49,7 +50,7 @@ def test_db_policy_recreation_rejects_stale_authorization_before_callback() -> N
             "INSERT INTO source.season_provider_refs(provider_id,league_external_id,external_season,season_id) VALUES(%s,'adapter-league',2026,%s)",
             (provider_id, season_id),
         )
-        connection.execute(
+        old_instance_id = connection.execute(
             """INSERT INTO ops.competition_sync_policies(
                    provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals
                  ) VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s) RETURNING policy_instance_id""",
@@ -62,16 +63,23 @@ def test_db_policy_recreation_rejects_stale_authorization_before_callback() -> N
         request = SyncWorkRequest(int(provider_id), int(season_id), "coverage_refresh")
         enqueued: list[object] = []
         authorization = PolicyCheckedEnqueuer(gate).enqueue(request, lambda value: (enqueued.append(value), value)[1])
+        with pytest.raises(CheckViolation, match="instance is immutable"):
+            connection.execute(
+                "UPDATE ops.competition_sync_policies SET policy_instance_id=DEFAULT WHERE provider_id=%s AND season_id=%s",
+                (provider_id, season_id),
+            )
         connection.execute(
             "DELETE FROM ops.competition_sync_policies WHERE provider_id=%s AND season_id=%s",
             (provider_id, season_id),
         )
-        connection.execute(
+        recreated_instance_id = connection.execute(
             """INSERT INTO ops.competition_sync_policies(
-                   provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals
-                 ) VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s)""",
-            (provider_id, season_id, Jsonb({}), Jsonb({"coverage_refresh": {"value": 25, "unit": "second"}})),
-        )
+                   provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals,policy_instance_id,policy_version
+                 ) OVERRIDING SYSTEM VALUE VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s,%s,1)
+                 RETURNING policy_instance_id""",
+            (provider_id, season_id, Jsonb({}), Jsonb({"coverage_refresh": {"value": 25, "unit": "second"}}), old_instance_id),
+        ).fetchone()[0]
+        assert recreated_instance_id != old_instance_id
         executed: list[object] = []
 
         with pytest.raises(SyncPolicyDenied, match="instance_changed"):

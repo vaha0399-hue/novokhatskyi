@@ -93,6 +93,8 @@ AS $$
        );
 $$;
 
+CREATE SEQUENCE ops.competition_sync_policy_instance_id_seq AS bigint NO CYCLE;
+
 CREATE TABLE ops.competition_sync_policies (
     provider_id smallint NOT NULL REFERENCES source.providers(id) ON DELETE RESTRICT,
     season_id bigint NOT NULL REFERENCES football.seasons(id) ON DELETE RESTRICT,
@@ -121,6 +123,20 @@ CREATE INDEX competition_sync_policies_enabled_idx
     ON ops.competition_sync_policies (provider_id, season_id)
     WHERE enabled;
 
+CREATE FUNCTION ops.assign_competition_sync_policy_instance_id()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.policy_instance_id := nextval('ops.competition_sync_policy_instance_id_seq');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER competition_sync_policies_instance_on_insert
+BEFORE INSERT ON ops.competition_sync_policies
+FOR EACH ROW EXECUTE FUNCTION ops.assign_competition_sync_policy_instance_id();
+
 CREATE FUNCTION ops.version_competition_sync_policy()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -141,8 +157,10 @@ FOR EACH ROW EXECUTE FUNCTION ops.version_competition_sync_policy();
 
 ALTER TABLE ops.competition_sync_policies ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON ops.competition_sync_policies FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON SEQUENCE ops.competition_sync_policy_instance_id_seq FROM PUBLIC, anon, authenticated;
 REVOKE EXECUTE ON FUNCTION ops.has_distinct_nonblank_texts(text[]), ops.has_valid_coverage_observations(jsonb),
     ops.has_valid_refresh_intervals(jsonb), ops.refresh_intervals_match_work_types(text[], jsonb),
-    ops.version_competition_sync_policy() FROM PUBLIC, anon, authenticated;
+    ops.assign_competition_sync_policy_instance_id(), ops.version_competition_sync_policy()
+    FROM PUBLIC, anon, authenticated;
 
 COMMIT;

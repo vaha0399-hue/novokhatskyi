@@ -5,6 +5,7 @@ DO $$
 DECLARE
     provider_one smallint; provider_two smallint; country_id bigint; league_id bigint;
     season_one bigint; season_two bigint; season_three bigint; instance_id bigint;
+    update_instance_failed boolean := false;
     duplicate_failed boolean := false; mapping_fk_failed boolean := false; season_fk_failed boolean := false;
     coverage_missing_state boolean := false; coverage_state_type boolean := false; coverage_state_value boolean := false;
     coverage_missing_date boolean := false; coverage_date_type boolean := false; coverage_basic_date boolean := false;
@@ -131,6 +132,14 @@ BEGIN
 
     SELECT policy_instance_id INTO instance_id FROM ops.competition_sync_policies
       WHERE provider_id=provider_one AND season_id=season_one;
+    BEGIN
+        UPDATE ops.competition_sync_policies SET policy_instance_id=DEFAULT
+          WHERE provider_id=provider_one AND season_id=season_one;
+    EXCEPTION WHEN check_violation THEN update_instance_failed := true;
+    END;
+    IF NOT update_instance_failed THEN
+        RAISE EXCEPTION 'policy instance update was accepted';
+    END IF;
     UPDATE ops.competition_sync_policies SET priority=21 WHERE provider_id=provider_one AND season_id=season_one;
     IF (SELECT policy_instance_id FROM ops.competition_sync_policies WHERE provider_id=provider_one AND season_id=season_one) <> instance_id
        OR (SELECT policy_version FROM ops.competition_sync_policies WHERE provider_id=provider_one AND season_id=season_one) <> 2 THEN
