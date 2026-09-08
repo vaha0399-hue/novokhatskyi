@@ -11,6 +11,7 @@ import httpx
 
 from app.api_football import APIFootballClient
 from app.api_football.budget import APIFootballBudgetDenied, PostgresAPIFootballBudget
+from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy
 TEST_DB_URL = os.environ.get("API_FOOTBALL_BUDGET_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="API_FOOTBALL_BUDGET_TEST_DB_URL is not configured")
 
@@ -27,6 +28,30 @@ def _reserve(connection: psycopg.Connection, consumer: str) -> tuple[bool, str, 
     row = connection.execute("SELECT allowed, reason, retry_at FROM ops.reserve_api_football_request(%s)", (consumer,)).fetchone()
     assert row is not None
     return bool(row[0]), str(row[1]), row[2]
+
+
+def test_season_budget_defer_resumes_the_same_due_legacy_item_without_duplication() -> None:
+    assert TEST_DB_URL is not None
+    policy = SeasonalLeaguePolicy("q04-resume", 987654, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-first") as first:
+        first_run = first.start_run([policy])
+        item = first.claim_next(first_run, {policy.league_external_id: policy})
+        assert item is not None
+        first.defer(item, checkpoint={"outcome": "budget_pending"}, error="APIFootballBudgetDenied", delay_seconds=0)
+        first.finish_run(first_run, status="failed", checkpoint={"outcome": "budget_pending"})
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-second") as second:
+        resumed_run = second.start_run([policy])
+        resumed_item = second.claim_next(resumed_run, {policy.league_external_id: policy})
+        assert resumed_run == first_run
+        assert resumed_item is not None and resumed_item.id == item.id
+        assert second.pending_delay_seconds(resumed_run) is None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute("SELECT count(*) FROM ops.sync_runs WHERE operation=%s", ("seasonal_active_bootstrap",)).fetchone() == (1,)
+        assert verify.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (first_run,)).fetchone() == (1,)
 
 
 def test_budget_is_atomic_across_real_connections_and_enforces_each_share() -> None:

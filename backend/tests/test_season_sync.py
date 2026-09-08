@@ -100,6 +100,9 @@ class FakeRepository:
     def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None:
         self.deferred.append({"id": item.id, "checkpoint": dict(checkpoint), "error": error, "delay_seconds": delay_seconds})
 
+    def pending_delay_seconds(self, run_id: int) -> float | None:
+        return None
+
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
         self.finished = (status, dict(checkpoint))
 

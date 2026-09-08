@@ -157,6 +157,8 @@ class SeasonalSyncRepository(Protocol):
 
     def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None: ...
 
+    def pending_delay_seconds(self, run_id: int) -> float | None: ...
+
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None: ...
 
 
@@ -197,6 +199,21 @@ class PostgresSeasonalSyncRepository:
         return self._provider_id
 
     def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> int:
+        # A quota-deferred legacy job belongs to its original run.  Resuming
+        # that row preserves its attempts/checkpoint and prevents a duplicate
+        # season scope when the next timer starts after ``available_at``.
+        prior = self._conn.execute(
+            """SELECT run.id FROM ops.sync_runs run
+               WHERE run.provider_id=%s AND run.operation=%s AND run.status='failed'
+                 AND EXISTS(SELECT 1 FROM ops.sync_work_items item
+                            WHERE item.run_id=run.id AND item.status='pending' AND item.job_type='legacy')
+               ORDER BY run.created_at DESC FOR UPDATE SKIP LOCKED LIMIT 1""",
+            (self._provider, OPERATION),
+        ).fetchone()
+        if prior is not None:
+            run_id = int(prior[0])
+            self._conn.execute("UPDATE ops.sync_runs SET status='running', finished_at=NULL WHERE id=%s", (run_id,))
+            return run_id
         row = self._conn.execute(
             """INSERT INTO ops.sync_runs(provider_id,operation,scope,status,started_at)
                VALUES(%s,%s,%s,'running',clock_timestamp()) RETURNING id""",
@@ -309,6 +326,13 @@ class PostgresSeasonalSyncRepository:
         )
         if cursor.rowcount != 1:
             raise SeasonalSyncError("seasonal work item lease was lost before budget deferral")
+
+    def pending_delay_seconds(self, run_id: int) -> float | None:
+        row = self._conn.execute(
+            "SELECT extract(epoch FROM min(available_at)-clock_timestamp()) FROM ops.sync_work_items WHERE run_id=%s AND status='pending' AND job_type='legacy'",
+            (run_id,),
+        ).fetchone()
+        return None if row is None or row[0] is None else max(0.0, float(row[0]))
 
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
         cursor = self._conn.execute(
@@ -498,6 +522,8 @@ class SeasonalSyncWorker:
                     terminal_status = "failed"
                     self._repository.fail(item, checkpoint={"outcome": "failed"}, error=type(error).__name__)
                     reports.append(SeasonalLeagueReport(item.policy.code, item.policy.league_external_id, "failed", detail=type(error).__name__))
+            if self._repository.pending_delay_seconds(run_id) is not None:
+                terminal_status = "failed"
         except ProviderQuotaExhausted:
             pass
         finally:
