@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from app.testing.isolated_resources import (
@@ -13,6 +14,7 @@ from app.testing.isolated_resources import (
     validate_redis_url,
     validate_test_environment,
 )
+from conftest import pytest_sessionstart
 
 
 @pytest.fixture
@@ -103,6 +105,103 @@ def test_environment_rejects_missing_manifest_for_owned_looking_url() -> None:
         validate_test_environment(
             {"READ_API_TEST_DB_URL": "postgresql://postgres@/fa_iso_looks_owned?host=/tmp/x&port=55490"}
         )
+
+
+def test_repeatable_queue_url_rejects_missing_manifest_before_psycopg_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connects: list[tuple[object, ...]] = []
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: connects.append(args))
+    for variable in (
+        "SUPABASE_DB_URL",
+        "ACTIVE_SEASON_TEST_DB_URL",
+        "ANALYTICS_TEST_DB_URL",
+        "BACKFILL_TEST_DB_URL",
+        "CURRENT_SEASON_STATISTICS_TEST_DB_URL",
+        "HISTORICAL_LINEUPS_TEST_DB_URL",
+        "LIVE_DOMAIN_TEST_DB_URL",
+        "LIVE_WORKER_TEST_DB_URL",
+        "COMPETITION_SYNC_POLICIES_TEST_DB_URL",
+        "READ_API_TEST_DB_URL",
+        "REPEATABLE_SYNC_QUEUE_TEST_DB_URL",
+        "SEASON_BOOTSTRAP_TEST_DB_URL",
+        "LIVE_REDIS_TEST_URL",
+        "REDIS_URL",
+        "FA_TEST_RESOURCE_MANIFEST",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(
+        "REPEATABLE_SYNC_QUEUE_TEST_DB_URL",
+        "postgresql://postgres@/fa_iso_guard_clean?host=/tmp/x&port=55490",
+    )
+
+    with pytest.raises(pytest.exit.Exception, match="require FA_TEST_RESOURCE_MANIFEST"):
+        pytest_sessionstart(None)  # type: ignore[arg-type]
+    assert connects == []
+
+
+def test_repeatable_queue_url_rejects_external_database_before_psycopg_connect(
+    manifest_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connects: list[tuple[object, ...]] = []
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: connects.append(args))
+    for variable in (
+        "SUPABASE_DB_URL",
+        "ACTIVE_SEASON_TEST_DB_URL",
+        "ANALYTICS_TEST_DB_URL",
+        "BACKFILL_TEST_DB_URL",
+        "CURRENT_SEASON_STATISTICS_TEST_DB_URL",
+        "HISTORICAL_LINEUPS_TEST_DB_URL",
+        "LIVE_DOMAIN_TEST_DB_URL",
+        "LIVE_WORKER_TEST_DB_URL",
+        "COMPETITION_SYNC_POLICIES_TEST_DB_URL",
+        "READ_API_TEST_DB_URL",
+        "REPEATABLE_SYNC_QUEUE_TEST_DB_URL",
+        "SEASON_BOOTSTRAP_TEST_DB_URL",
+        "LIVE_REDIS_TEST_URL",
+        "REDIS_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("FA_TEST_RESOURCE_MANIFEST", str(manifest_path))
+    monkeypatch.setenv("REPEATABLE_SYNC_QUEUE_TEST_DB_URL", "postgresql://postgres@db.example.test/app")
+
+    with pytest.raises(pytest.exit.Exception, match="not owned"):
+        pytest_sessionstart(None)  # type: ignore[arg-type]
+    assert connects == []
+
+
+def test_repeatable_queue_url_rejects_foreign_temporary_database_before_psycopg_connect(
+    manifest_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connects: list[tuple[object, ...]] = []
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: connects.append(args))
+    for variable in (
+        "SUPABASE_DB_URL",
+        "ACTIVE_SEASON_TEST_DB_URL",
+        "ANALYTICS_TEST_DB_URL",
+        "BACKFILL_TEST_DB_URL",
+        "CURRENT_SEASON_STATISTICS_TEST_DB_URL",
+        "HISTORICAL_LINEUPS_TEST_DB_URL",
+        "LIVE_DOMAIN_TEST_DB_URL",
+        "LIVE_WORKER_TEST_DB_URL",
+        "COMPETITION_SYNC_POLICIES_TEST_DB_URL",
+        "READ_API_TEST_DB_URL",
+        "REPEATABLE_SYNC_QUEUE_TEST_DB_URL",
+        "SEASON_BOOTSTRAP_TEST_DB_URL",
+        "LIVE_REDIS_TEST_URL",
+        "REDIS_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    manifest = load_manifest(manifest_path)
+    monkeypatch.setenv("FA_TEST_RESOURCE_MANIFEST", str(manifest_path))
+    monkeypatch.setenv(
+        "REPEATABLE_SYNC_QUEUE_TEST_DB_URL",
+        f"postgresql://postgres@/fa_foreign_temporary?host={manifest.postgres_socket}&port={manifest.postgres_port}",
+    )
+
+    with pytest.raises(pytest.exit.Exception, match="not owned"):
+        pytest_sessionstart(None)  # type: ignore[arg-type]
+    assert connects == []
 
 
 @pytest.mark.parametrize(
