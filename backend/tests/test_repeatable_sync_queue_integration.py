@@ -17,6 +17,7 @@ from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLea
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
 from app.sync.worker import RepeatableSyncWorker, WorkResult
+from app.importer.cup_canonical import CupCanonicalSink
 
 TEST_DB_URL = os.environ.get("REPEATABLE_SYNC_QUEUE_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="REPEATABLE_SYNC_QUEUE_TEST_DB_URL is not configured")
@@ -342,3 +343,36 @@ def test_q03_runner_commits_before_fetch_and_heartbeats_on_separate_connection()
             return WorkResult({"done": True})
         worker.run_once(fetch, lambda writer, *_: writer.execute("CREATE TEMP TABLE q03_runner_persist(value text)"))
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE stable_key=%s", (f"q03-runner:{suffix}",)).fetchone()[0] == "succeeded"
+
+
+def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    table = f"q03_canonical_{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        setup.execute(f"CREATE TABLE ops.{table}(value text PRIMARY KEY)")
+        provider = int(setup.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-canon-{suffix}", "Q03 canonical")).fetchone()[0])
+        run_id = _run(setup, provider, f"q03-canon-{suffix}")
+        item_id, _ = _enqueue(setup, run_id, f"q03-canon:{suffix}", priority=14_000_000, execution_key=f"q03-canon:{suffix}")
+        setup.execute("UPDATE ops.sync_work_items SET scope=%s WHERE id=%s", (Jsonb({"_sync_policy": {"provider_id": provider, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}), item_id))
+    class Gate:
+        def before_enqueue(self, request): return type("A", (), {"coverage": None, "refresh_interval": None})()
+        def before_execution(self, authorization): return authorization
+    def apply(writer, *_):
+        sink = CupCanonicalSink(writer, write_validated_base=lambda conn, *_: _canonical(conn))  # type: ignore[arg-type]
+        sink.write_cup_base(validated=None, collected=[])  # type: ignore[arg-type]
+    def _canonical(conn):
+        with conn.transaction(): conn.execute(f"INSERT INTO ops.{table} VALUES('canonical')")
+    with psycopg.connect(TEST_DB_URL) as connection:
+        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError):
+            worker.run_once(lambda *_: WorkResult({}, (lambda writer: (_ for _ in ()).throw(RuntimeError("dependent")),)), apply)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(f"SELECT count(*) FROM ops.{table}").fetchone()[0] == 0
+        token = verify.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
+        verify.execute("SELECT ops.requeue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s)", (item_id, f"canon-{suffix}", token, Jsonb({}), "retry", "0 seconds", False))
+    with psycopg.connect(TEST_DB_URL) as connection:
+        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
+        worker.run_once(lambda *_: WorkResult({}, (lambda writer: writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')"),)), apply)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(f"SELECT count(*) FROM ops.{table}").fetchone()[0] == 2
