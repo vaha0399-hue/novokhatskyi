@@ -363,12 +363,16 @@ def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
         sink.write_cup_base(validated=None, collected=[])  # type: ignore[arg-type]
     def _canonical(conn):
         with conn.transaction(): conn.execute(f"INSERT INTO ops.{table} VALUES('canonical')")
+    def dependent_then_fail(writer):
+        writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')")
+        raise RuntimeError("dependent")
     with psycopg.connect(TEST_DB_URL) as connection:
         worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
         with pytest.raises(RuntimeError):
-            worker.run_once(lambda *_: WorkResult({}, (lambda writer: (_ for _ in ()).throw(RuntimeError("dependent")),)), apply)
+            worker.run_once(lambda *_: WorkResult({}, (dependent_then_fail,)), apply)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
         assert verify.execute(f"SELECT count(*) FROM ops.{table}").fetchone()[0] == 0
+        assert verify.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0] == "running"
         token = verify.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
         verify.execute("SELECT ops.requeue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s)", (item_id, f"canon-{suffix}", token, Jsonb({}), "retry", "0 seconds", False))
     with psycopg.connect(TEST_DB_URL) as connection:
@@ -376,3 +380,4 @@ def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
         worker.run_once(lambda *_: WorkResult({}, (lambda writer: writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')"),)), apply)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
         assert verify.execute(f"SELECT count(*) FROM ops.{table}").fetchone()[0] == 2
+        assert verify.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0] == "succeeded"
