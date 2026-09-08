@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -10,9 +12,11 @@ from typing import Any
 import httpx
 
 from .errors import APIFootballAPIError, APIFootballConfigurationError, APIFootballHTTPError
+from .budget import PostgresAPIFootballBudget, RequestBudget, UnavailableAPIFootballBudget
 
 DEFAULT_BASE_URL = "https://v3.football.api-sports.io"
 DEFAULT_TIMEOUT_SECONDS = 15.0
+DEFAULT_MAX_5XX_RETRIES = 2
 SAFE_RATE_LIMIT_HEADERS = frozenset(
     {
         "x-ratelimit-limit",
@@ -53,9 +57,16 @@ class APIFootballClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float | httpx.Timeout = DEFAULT_TIMEOUT_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
+        budget: RequestBudget | None = None,
+        budget_consumer: str = "legacy_manual",
+        max_5xx_retries: int = DEFAULT_MAX_5XX_RETRIES,
     ) -> None:
         if not api_key:
             raise APIFootballConfigurationError("API_FOOTBALL_KEY is required.")
+        if budget_consumer not in {"operations", "history", "legacy_manual"}:
+            raise ValueError("budget_consumer must be operations, history, or legacy_manual")
+        if max_5xx_retries < 0:
+            raise ValueError("max_5xx_retries must be non-negative")
 
         self._api_key = api_key
         self._client = httpx.AsyncClient(
@@ -64,6 +75,9 @@ class APIFootballClient:
             timeout=timeout,
             transport=transport,
         )
+        self._budget = budget or UnavailableAPIFootballBudget()
+        self._budget_consumer = budget_consumer
+        self._max_5xx_retries = max_5xx_retries
 
     @classmethod
     def from_environment(cls, **kwargs: Any) -> "APIFootballClient":
@@ -71,23 +85,40 @@ class APIFootballClient:
         api_key = os.environ.get("API_FOOTBALL_KEY")
         if not api_key:
             raise APIFootballConfigurationError("API_FOOTBALL_KEY is required.")
-        return cls(api_key, **kwargs)
+        return cls(api_key, budget=PostgresAPIFootballBudget.from_environment(), **kwargs)
 
     async def get(
         self, endpoint: str, *, params: Mapping[str, str | int] | None = None
     ) -> APIFootballResponse:
-        """Make one GET request. This method deliberately does not retry requests."""
+        """Make metered physical GETs; every internal retry reserves again."""
         normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        try:
-            response = await self._client.get(normalized_endpoint, params=params)
-        except httpx.HTTPError as error:
-            # Do not include the underlying message: it can contain the request URL.
-            raise APIFootballHTTPError(0) from error
+        for attempt in range(self._max_5xx_retries + 1):
+            # This is intentionally immediately before the transport call.  It
+            # commits before a timeout/unknown outcome and is never released.
+            await self._budget.reserve(self._budget_consumer)
+            try:
+                response = await self._client.get(normalized_endpoint, params=params)
+            except httpx.HTTPError as error:
+                # An unknown outcome may have reached the provider; preserve
+                # the reservation and retry only after a bounded jitter delay.
+                if attempt < self._max_5xx_retries:
+                    await asyncio.sleep((2**attempt) + random.uniform(0, 1))
+                    continue
+                raise APIFootballHTTPError(0) from error
+
+            safe_headers = safe_rate_limit_headers(response.headers)
+            # A 429 consumes its pre-reserved slot then creates one shared
+            # cooldown before this client exposes the failure to its caller.
+            await self._budget.observe(response.status_code, safe_headers)
+            if response.status_code >= 500 and attempt < self._max_5xx_retries:
+                await asyncio.sleep((2**attempt) + random.uniform(0, 1))
+                continue
+            break
 
         if response.is_error:
             raise APIFootballHTTPError(
                 response.status_code,
-                safe_headers=safe_rate_limit_headers(response.headers),
+                safe_headers=safe_headers,
             )
 
         try:
@@ -97,7 +128,7 @@ class APIFootballClient:
                 "invalid JSON response",
                 raw_body=response.content,
                 status_code=response.status_code,
-                safe_headers=safe_rate_limit_headers(response.headers),
+                safe_headers=safe_headers,
             ) from error
 
         if not isinstance(payload, dict):
@@ -105,7 +136,7 @@ class APIFootballClient:
                 "invalid top-level response",
                 raw_body=response.content,
                 status_code=response.status_code,
-                safe_headers=safe_rate_limit_headers(response.headers),
+                safe_headers=safe_headers,
             )
         if payload.get("errors"):
             raise APIFootballAPIError(

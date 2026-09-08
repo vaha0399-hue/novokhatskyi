@@ -5,11 +5,24 @@ import httpx
 import pytest
 
 from app.api_football import APIFootballClient
+from app.api_football.budget import APIFootballBudgetDenied, APIFootballBudgetError
 from app.api_football.errors import (
     APIFootballAPIError,
     APIFootballConfigurationError,
     APIFootballHTTPError,
 )
+
+
+class AllowBudget:
+    async def reserve(self, consumer: str) -> None:
+        return None
+
+    async def observe(self, status_code: int, headers: object) -> None:
+        return None
+
+
+def _client(*args: object, **kwargs: object) -> APIFootballClient:
+    return APIFootballClient(*args, budget=AllowBudget(), **kwargs)
 from scripts.collect_api_football_samples import (
     MAX_REQUESTS,
     SampleCollector,
@@ -34,7 +47,7 @@ def test_request_uses_header_and_preserves_raw_body() -> None:
         return httpx.Response(200, content=b'{"errors":{},"response":[null]}')
 
     async def exercise() -> None:
-        client = APIFootballClient("test-secret", transport=httpx.MockTransport(handler))
+        client = _client("test-secret", transport=httpx.MockTransport(handler))
         response = await client.get("fixtures", params={"league": 39})
         assert response.raw_body == b'{"errors":{},"response":[null]}'
         assert response.data["response"] == [None]
@@ -69,7 +82,7 @@ def test_client_reuses_one_async_http_pool_and_closes_it(
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
 
     async def exercise() -> None:
-        async with APIFootballClient("test-secret") as client:
+        async with _client("test-secret") as client:
             await client.get("/fixtures", params={"live": 39})
             await client.get("/fixtures", params={"id": 1})
 
@@ -96,7 +109,7 @@ def test_http_error_is_sanitized_and_not_retried() -> None:
         )
 
     async def exercise() -> None:
-        client = APIFootballClient("test-secret", transport=httpx.MockTransport(handler))
+        client = _client("test-secret", transport=httpx.MockTransport(handler))
         with pytest.raises(APIFootballHTTPError) as captured:
             await client.get("fixtures")
         assert str(captured.value) == "API-Football returned HTTP 401."
@@ -107,11 +120,54 @@ def test_http_error_is_sanitized_and_not_retried() -> None:
     assert calls == 1
 
 
+def test_client_reserves_every_retry_and_denial_never_calls_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    class RecordingBudget:
+        def __init__(self) -> None:
+            self.reservations = 0
+
+        async def reserve(self, consumer: str) -> None:
+            self.reservations += 1
+
+        async def observe(self, status_code: int, headers: object) -> None:
+            return None
+
+    budget = RecordingBudget()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503 if calls == 1 else 200, json={"errors": {}, "response": []})
+
+    async def no_wait(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.api_football.client.asyncio.sleep", no_wait)
+    asyncio.run(APIFootballClient("test-secret", budget=budget, max_5xx_retries=1, transport=httpx.MockTransport(handler)).get("fixtures"))
+    assert (calls, budget.reservations) == (2, 2)
+
+    class DeniedBudget:
+        async def reserve(self, consumer: str) -> None:
+            raise APIFootballBudgetDenied("daily_limit")
+
+        async def observe(self, status_code: int, headers: object) -> None:
+            raise AssertionError("HTTP response must not be observed")
+
+    with pytest.raises(APIFootballBudgetDenied):
+        asyncio.run(APIFootballClient("test-secret", budget=DeniedBudget(), transport=httpx.MockTransport(handler)).get("fixtures"))
+    assert calls == 2
+
+    with pytest.raises(APIFootballBudgetError):
+        asyncio.run(APIFootballClient("test-secret", transport=httpx.MockTransport(handler)).get("fixtures"))
+    assert calls == 2
+
+
 def test_api_error_is_sanitized() -> None:
     raw = b'{"errors":{"token":"provider-error"},"results":0,"response":[]}'
 
     async def exercise() -> None:
-        client = APIFootballClient(
+        client = _client(
             "test-secret",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
@@ -137,7 +193,7 @@ def test_api_error_is_sanitized() -> None:
 
 def test_collector_writes_raw_body_and_safe_metadata(tmp_path) -> None:
     async def exercise() -> None:
-        client = APIFootballClient(
+        client = _client(
             "test-secret",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(
@@ -184,7 +240,7 @@ def test_collector_refuses_to_exceed_request_cap(tmp_path) -> None:
     async def exercise() -> None:
         collector = SampleCollector(
             tmp_path,
-            APIFootballClient("test-secret", transport=httpx.MockTransport(handler)),
+            _client("test-secret", transport=httpx.MockTransport(handler)),
             season=2024,
             request_limit=MAX_REQUESTS,
         )
@@ -198,7 +254,7 @@ def test_collector_refuses_to_exceed_request_cap(tmp_path) -> None:
 
 def test_collector_refuses_raw_body_that_contains_key(tmp_path) -> None:
     async def exercise() -> None:
-        client = APIFootballClient(
+        client = _client(
             "test-secret",
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(200, content=b'{"errors":{},"echo":"test-secret"}')

@@ -493,7 +493,7 @@ async def run_from_environment() -> SeasonalSyncReport:
     """Run once with one reusable API-Football connection pool."""
     settings = SeasonalSyncSettings.from_environment()
     with PostgresSeasonalSyncRepository(settings.database_url) as repository:
-        async with APIFootballClient.from_environment() as provider:
+        async with APIFootballClient.from_environment(budget_consumer="operations") as provider:
             return await SeasonalSyncWorker(
                 provider=provider, repository=repository, quota_reserve=settings.quota_reserve
             ).run_once()

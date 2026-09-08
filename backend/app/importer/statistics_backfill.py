@@ -908,7 +908,7 @@ def run_statistics_backfill(
     """Run one quota-bounded batch. All unsafe states stop before the next fixture."""
     if not 1 <= max_calls <= DEFAULT_RUN_ATTEMPT_CAP:
         raise ValueError("max_calls must be between 1 and 90")
-    api = client or APIFootballClient.from_environment()
+    api = client or APIFootballClient.from_environment(budget_consumer="history")
     protected = (
         "football.fixtures", "football.fixture_availability_snapshots", "football.fixture_player_availability",
         "football.fixture_lineup_snapshots", "football.fixture_lineups", "football.fixture_lineup_players",

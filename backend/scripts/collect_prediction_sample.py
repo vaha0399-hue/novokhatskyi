@@ -92,7 +92,7 @@ def main() -> None:
     parser.add_argument("--fixture", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    summary = asyncio.run(collect(args.output_dir, fixture_id=args.fixture, client=APIFootballClient.from_environment()))
+    summary = asyncio.run(collect(args.output_dir, fixture_id=args.fixture, client=APIFootballClient.from_environment(budget_consumer="legacy_manual")))
     print(f"Saved predictions sample for fixture {args.fixture}: results={summary['response_count']}")
 
 

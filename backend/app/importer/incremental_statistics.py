@@ -124,7 +124,7 @@ class CompletedFixturesWorker:
 
 async def run_from_environment() -> IncrementalStatisticsReport:
     settings = IncrementalStatisticsSettings.from_environment()
-    async with APIFootballClient.from_environment() as provider:
+    async with APIFootballClient.from_environment(budget_consumer="operations") as provider:
         return await CompletedFixturesWorker(settings=settings, provider=provider).run_once()
 
 
@@ -135,7 +135,7 @@ def main() -> None:
     settings = IncrementalStatisticsSettings.from_environment()
 
     async def execute() -> None:
-        async with APIFootballClient.from_environment() as provider:
+        async with APIFootballClient.from_environment(budget_consumer="operations") as provider:
             worker = CompletedFixturesWorker(settings=settings, provider=provider)
             if args.continuous:
                 await worker.run_forever()

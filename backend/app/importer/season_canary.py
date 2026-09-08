@@ -624,7 +624,7 @@ def run_controlled_canary(
 ) -> SeasonCanaryReport:
     """Run the approved 4 + 5 + 5 controlled canary and then stop."""
 
-    api = client or APIFootballClient.from_environment()
+    api = client or APIFootballClient.from_environment(budget_consumer="legacy_manual")
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         lock_keys = _acquire_canary_locks(conn, scope=scope)
         try:

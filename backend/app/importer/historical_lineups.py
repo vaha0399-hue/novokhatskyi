@@ -1321,7 +1321,7 @@ def run_controlled_canary(
     """
     if first_batch_calls != FIRST_BATCH_CALLS or second_batch_calls != FIRST_BATCH_CALLS:
         raise ValueError("controlled historical-lineups canary requires two batches of exactly five calls")
-    api = client or APIFootballClient.from_environment()
+    api = client or APIFootballClient.from_environment(budget_consumer="legacy_manual")
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         provider_id, season_id = acquire_context_and_lock(conn, scope=scope)
         try:
@@ -1472,7 +1472,7 @@ def run_historical_lineups_backfill(
     if not 1 <= max_calls <= DEFAULT_BULK_CALL_CAP:
         raise ValueError(f"max_calls must be between 1 and {DEFAULT_BULK_CALL_CAP}")
 
-    api = client or APIFootballClient.from_environment()
+    api = client or APIFootballClient.from_environment(budget_consumer="legacy_manual")
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         provider_id, season_id = acquire_context_and_lock(conn, scope=scope)
         try:

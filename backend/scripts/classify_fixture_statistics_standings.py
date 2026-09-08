@@ -135,7 +135,7 @@ async def run(*, input_path: Path, output_dir: Path, pacing_seconds: float) -> d
     }
     api_calls_used = 0
 
-    async with APIFootballClient.from_environment() as client:
+    async with APIFootballClient.from_environment(budget_consumer="legacy_manual") as client:
         for index, competition in enumerate(competitions):
             request_metadata: dict[str, Any] = {
                 "endpoint": "/standings",

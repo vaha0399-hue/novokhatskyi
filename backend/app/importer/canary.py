@@ -403,7 +403,7 @@ def load_reusable_responses(conn: Connection[Any]) -> dict[str, CollectedRespons
 
 
 async def collect_responses(reusable: dict[str, CollectedResponse]) -> tuple[list[CollectedResponse], int]:
-    client = APIFootballClient.from_environment()
+    client = APIFootballClient.from_environment(budget_consumer="legacy_manual")
     collected: list[CollectedResponse] = []
     attempts = 0
     for spec in CANARY_REQUESTS:

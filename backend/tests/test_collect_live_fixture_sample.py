@@ -17,6 +17,18 @@ from scripts.collect_live_fixture_sample import (
 )
 
 
+class AllowBudget:
+    async def reserve(self, consumer: str) -> None:
+        return None
+
+    async def observe(self, status_code: int, headers: object) -> None:
+        return None
+
+
+def _client(*args: object, **kwargs: object) -> APIFootballClient:
+    return APIFootballClient(*args, budget=AllowBudget(), **kwargs)
+
+
 RAW = b'''{"get":"fixtures","parameters":{"live":"all"},"errors":[],"results":2,"paging":{"current":1,"total":1},"response":[{"fixture":{"id":1,"status":{"short":"1H","long":"First Half","elapsed":23,"extra":null}},"teams":{"home":{"name":"Home One"},"away":{"name":"Away One"}},"goals":{"home":1,"away":0},"score":{"halftime":{"home":null,"away":null},"fulltime":{"home":null,"away":null},"extratime":{"home":null,"away":null},"penalty":{"home":null,"away":null}}},{"fixture":{"id":2,"status":{"short":"HT","long":"Halftime","elapsed":45,"extra":2}},"teams":{"home":{"name":"Home Two"},"away":{"name":"Away Two"}},"goals":{"home":2,"away":2},"score":{"halftime":{"home":2,"away":2},"fulltime":{"home":null,"away":null},"extratime":{"home":null,"away":null},"penalty":{"home":null,"away":null}}}]}'''
 
 
@@ -72,7 +84,7 @@ def test_collect_writes_unmodified_raw_body_and_safe_artifacts(tmp_path) -> None
     summary = asyncio.run(
         collect(
             tmp_path,
-            client=APIFootballClient("test-secret", transport=httpx.MockTransport(handler)),
+            client=_client("test-secret", transport=httpx.MockTransport(handler)),
         )
     )
 
@@ -98,7 +110,7 @@ def test_collect_requires_an_empty_output_directory(tmp_path) -> None:
         asyncio.run(
             collect(
                 tmp_path,
-                client=APIFootballClient(
+                client=_client(
                     "test-secret",
                     transport=httpx.MockTransport(lambda request: httpx.Response(200, content=RAW)),
                 ),

@@ -206,13 +206,15 @@ run_safe_integrations() {
     ANALYTICS_TEST_DB_URL="$database_url" \
     READ_API_TEST_DB_URL="$database_url" \
     CURRENT_SEASON_STATISTICS_TEST_DB_URL="$database_url" \
+    API_FOOTBALL_BUDGET_TEST_DB_URL="$database_url" \
     LIVE_REDIS_TEST_URL="$redis_url" \
     uv run --directory "$ROOT_DIR/backend" pytest -q \
       tests/test_analytics_repository_integration.py \
       tests/test_web_read_dependencies_integration.py \
       tests/test_scanner_repository_integration.py \
       tests/test_live_store_integration.py \
-      tests/test_web_live_api_integration.py
+      tests/test_web_live_api_integration.py \
+      tests/test_api_football_budget_integration.py
   printf '%s\n' 'Skipped test_web_read_api_integration.py: the synthetic upgrade fixture has no standings snapshot and cannot satisfy that development-data contract.'
 }
 

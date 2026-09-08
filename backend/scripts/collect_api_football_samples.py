@@ -145,7 +145,7 @@ async def run(output_dir: Path, *, season: int, request_limit: int) -> None:
 
     collector = SampleCollector(
         output_dir,
-        APIFootballClient.from_environment(),
+        APIFootballClient.from_environment(budget_consumer="legacy_manual"),
         season=season,
         request_limit=request_limit,
     )

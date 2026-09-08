@@ -513,7 +513,7 @@ async def run_supervised(
 async def run_from_environment() -> None:
     """Own one reusable provider pool and reconnect backend infrastructure."""
     settings = LiveSettings.from_environment()
-    async with APIFootballClient.from_environment() as provider:
+    async with APIFootballClient.from_environment(budget_consumer="operations") as provider:
         await run_supervised(provider, settings, _database_url())
 
 

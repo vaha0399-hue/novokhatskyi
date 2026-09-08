@@ -532,7 +532,7 @@ class Worker:
 async def run_from_environment() -> Report:
     settings = Settings.from_environment()
     with PostgresRepository(settings.database_url) as repository:
-        async with APIFootballClient.from_environment() as provider:
+        async with APIFootballClient.from_environment(budget_consumer="operations") as provider:
             return await Worker(provider=provider, repository=repository, spool=RawSpool(settings.spool_dir), settings=settings).run_once()
 
 

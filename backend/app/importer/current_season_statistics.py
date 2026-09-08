@@ -943,7 +943,7 @@ async def run_current_season_statistics_backfill_async(
     must call this coroutine directly so its reusable HTTP connection pool is
     never moved across event loops.
     """
-    api = client or APIFootballClient.from_environment()
+    api = client or APIFootballClient.from_environment(budget_consumer="operations")
     owns_client = client is None
     with psycopg.connect(_database_url(), autocommit=True) as conn:
         _acquire_lock(conn, scope)

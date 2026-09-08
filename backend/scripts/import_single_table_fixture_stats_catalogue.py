@@ -557,7 +557,7 @@ async def run(
     if not database_url:
         raise CatalogueImportError("SUPABASE_DB_URL is required")
     with psycopg.connect(database_url, autocommit=True) as conn:
-        async with APIFootballClient.from_environment() as client:
+        async with APIFootballClient.from_environment(budget_consumer="legacy_manual") as client:
             for competition in competitions:
                 if (competition.league_id, competition.season) in processed:
                     continue

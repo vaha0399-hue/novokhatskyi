@@ -45,7 +45,7 @@ async def run() -> object:
         with_fixture_stats_path=_path("CUP_IMPORT_WITH_STATS", DEFAULT_WITH_STATS),
         without_fixture_stats_path=_path("CUP_IMPORT_WITHOUT_STATS", DEFAULT_WITHOUT_STATS),
     )
-    api = APIFootballClient.from_environment()
+    api = APIFootballClient.from_environment(budget_consumer="legacy_manual")
     try:
         with PostgresCupQueueRepository(database_url) as repository, Connection.connect(database_url) as write_conn:
             sink = CupCanonicalSink(write_conn)

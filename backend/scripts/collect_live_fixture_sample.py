@@ -148,7 +148,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    summary = asyncio.run(collect(args.output_dir, client=APIFootballClient.from_environment()))
+    summary = asyncio.run(collect(args.output_dir, client=APIFootballClient.from_environment(budget_consumer="legacy_manual")))
     print(
         "Saved one live-fixtures sample: "
         f"{summary['summarized_fixture_count']} fixtures, "
