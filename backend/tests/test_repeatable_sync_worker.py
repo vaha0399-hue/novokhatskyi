@@ -6,6 +6,7 @@ from app.sync.policies import PolicyDenialReason, SyncPolicyDenied
 from app.sync.repository import LeasedWorkItem
 from app.sync.worker import LeaseLost, RepeatableSyncWorker, WorkResult
 from app.sync.worker import AtomicWorkTransaction
+from app.importer.cup_canonical import CupCanonicalSink
 
 
 class _Connection:
@@ -83,6 +84,18 @@ def test_runner_heartbeat_failure_prevents_apply_after_fetch() -> None:
     worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
     with pytest.raises(LeaseLost, match="heartbeat"):
         worker.run_once(lambda *_: WorkResult({}), lambda *_: pytest.fail("apply"))
+
+
+def test_cup_canonical_sink_accepts_atomic_nested_transaction_capability() -> None:
+    connection = _Connection()
+    writer = AtomicWorkTransaction(connection)  # type: ignore[arg-type]
+    calls = []
+    def canonical(conn, *_):
+        with conn.transaction():
+            calls.append(conn.execute("canonical"))
+    sink = CupCanonicalSink(writer, write_validated_base=canonical)  # type: ignore[arg-type]
+    sink.write_cup_base(validated=None, collected=[])  # type: ignore[arg-type]
+    assert calls == [("canonical", None)]
 
 
 def test_atomic_writer_capability_rejects_commit_rollback_close_and_connection_access() -> None:
