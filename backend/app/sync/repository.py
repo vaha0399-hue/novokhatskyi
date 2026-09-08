@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 from typing import Any, Mapping
 
 from psycopg import Connection
@@ -20,6 +21,17 @@ def _part(value: object, name: str) -> str:
     if not isinstance(value, (str, int)) or not str(value).strip():
         raise ValueError(f"{name} must be a nonblank string or integer")
     return str(value)
+
+
+def _stable_key(kind: str, *components: str | int) -> str:
+    """Encode identity components without delimiter ambiguity.
+
+    The database treats this opaque value as the durable uniqueness key.  A
+    compact JSON array retains component boundaries and scalar types, unlike
+    the older colon-joined representation (where ``a:b`` and ``a``, ``b``
+    could collide).
+    """
+    return json.dumps((kind, *components), ensure_ascii=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -45,9 +57,15 @@ class PeriodicWork:
             raise ValueError("periodic window start must precede its end")
 
     def stable_key(self) -> str:
-        return ":".join(("periodic", _part(self.work_type, "work type"), _part(self.provider_id, "provider"),
-                         _part(self.season_id, "season"), _part(self.entity_key, "entity"),
-                         self.window_start.astimezone(UTC).isoformat(), self.window_end.astimezone(UTC).isoformat()))
+        return _stable_key(
+            "periodic",
+            _part(self.work_type, "work type"),
+            self.provider_id,
+            self.season_id,
+            _part(self.entity_key, "entity"),
+            self.window_start.astimezone(UTC).isoformat(),
+            self.window_end.astimezone(UTC).isoformat(),
+        )
 
 
 @dataclass(frozen=True)
@@ -64,9 +82,14 @@ class RecalculationWork:
     execution_key: str | None = None
 
     def stable_key(self) -> str:
-        return ":".join(("recalculation", _part(self.work_type, "work type"), _part(self.provider_id, "provider"),
-                         _part(self.season_id, "season"), _part(self.entity_key, "entity"),
-                         _part(self.input_version, "input version")))
+        return _stable_key(
+            "recalculation",
+            _part(self.work_type, "work type"),
+            self.provider_id,
+            self.season_id,
+            _part(self.entity_key, "entity"),
+            _part(self.input_version, "input version"),
+        )
 
 
 @dataclass(frozen=True)

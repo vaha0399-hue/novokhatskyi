@@ -13,4 +13,9 @@ BEGIN
         RAISE EXCEPTION 'blank stable key constraint missing';
     EXCEPTION WHEN check_violation THEN NULL;
     END;
+    BEGIN
+        UPDATE ops.sync_work_items SET stable_key='rewritten' WHERE scope_key='q02-legacy-scope';
+    EXCEPTION WHEN check_violation THEN
+        RAISE EXCEPTION 'legacy queue row unexpectedly became immutable';
+    END;
 END $$;

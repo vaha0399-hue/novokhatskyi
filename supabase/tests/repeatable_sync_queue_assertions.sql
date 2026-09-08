@@ -1,7 +1,7 @@
 -- Run after all migrations on an isolated database.  This deliberately uses
 -- two rows with the same execution group to prove the blocked version survives.
 DO $$
-DECLARE p smallint; r1 bigint; r2 bigint; first_id bigint; second_id bigint; claimed bigint;
+DECLARE p smallint; r1 bigint; r2 bigint; legacy_run bigint; first_id bigint; second_id bigint; legacy_id bigint; claimed bigint;
 BEGIN
     SELECT id INTO p FROM source.providers ORDER BY id LIMIT 1;
     IF p IS NULL THEN INSERT INTO source.providers(code, name) VALUES ('q02-assertion-provider', 'Q02 assertion provider') RETURNING id INTO p; END IF;
@@ -35,6 +35,36 @@ BEGIN
     END IF;
     SELECT id INTO claimed FROM ops.claim_next_repeatable_sync_work_item('q02-worker-2', interval '1 minute');
     IF claimed IS DISTINCT FROM second_id THEN RAISE EXCEPTION 'blocked version was not subsequently claimable'; END IF;
+
+    INSERT INTO ops.sync_runs(provider_id, operation) VALUES (p, 'q02-legacy-claim') RETURNING id INTO legacy_run;
+    INSERT INTO ops.sync_work_items(run_id, scope_key, scope, priority)
+    VALUES (legacy_run, 'legacy-high-priority', '{}'::jsonb, 1000000) RETURNING id INTO legacy_id;
+    IF (SELECT id FROM ops.claim_next_repeatable_sync_work_item('q02-worker-3', interval '1 minute')) = legacy_id THEN
+        RAISE EXCEPTION 'repeatable claim captured a legacy row';
+    END IF;
+    IF (SELECT id FROM ops.claim_next_sync_work_item(legacy_run, 'q02-legacy-worker', interval '1 minute')) IS DISTINCT FROM legacy_id THEN
+        RAISE EXCEPTION 'legacy row was unavailable to legacy claim';
+    END IF;
+    BEGIN
+        PERFORM ops.enqueue_repeatable_sync_work_item(r2, 'legacy-forbidden', '{}'::jsonb, 'legacy', 0, clock_timestamp(), 'key', 'entity', 'execution');
+        RAISE EXCEPTION 'repeatable enqueue accepted legacy job type';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL;
+    END;
+    BEGIN
+        PERFORM ops.enqueue_repeatable_sync_work_item(r2, 'legacy-key-forbidden', '{}'::jsonb, 'metrics', 0, clock_timestamp(), 'legacy', 'entity', 'execution');
+        RAISE EXCEPTION 'repeatable enqueue accepted bare legacy identity';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL;
+    END;
+    BEGIN
+        UPDATE ops.sync_work_items SET stable_key='changed' WHERE id=first_id;
+        RAISE EXCEPTION 'repeatable identity was mutable';
+    EXCEPTION WHEN check_violation THEN NULL;
+    END;
+    BEGIN
+        DELETE FROM ops.sync_work_items WHERE id=first_id;
+        RAISE EXCEPTION 'repeatable history was deletable';
+    EXCEPTION WHEN check_violation THEN NULL;
+    END;
 END $$;
 BEGIN;
 GRANT USAGE ON SCHEMA ops TO anon;

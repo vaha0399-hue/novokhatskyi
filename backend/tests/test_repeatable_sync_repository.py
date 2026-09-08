@@ -49,12 +49,15 @@ def _periodic() -> PeriodicWork:
 
 def test_keys_include_provider_season_window_and_input_version() -> None:
     periodic = _periodic()
-    assert periodic.stable_key() == "periodic:fixtures:7:101:fixture:42:2026-09-08T00:00:00+00:00:2026-09-08T00:05:00+00:00"
+    assert periodic.stable_key() == '["periodic","fixtures",7,101,"fixture:42","2026-09-08T00:00:00+00:00","2026-09-08T00:05:00+00:00"]'
     same_entity_other_season = PeriodicWork(7, 102, "fixtures", "fixture:42", periodic.window_start, periodic.window_end, 3, {})
     assert same_entity_other_season.stable_key() != periodic.stable_key()
     first = RecalculationWork(7, 101, "rolling_metrics", "team:9", "accepted:1", 0, {})
     second = RecalculationWork(7, 101, "rolling_metrics", "team:9", "accepted:2", 0, {})
     assert first.stable_key() != second.stable_key()
+    # Component boundaries are durable: these collided with colon joining.
+    split_differently = RecalculationWork(7, 101, "rolling_metrics", "team:9:accepted", "1", 0, {})
+    assert first.stable_key() != split_differently.stable_key()
 
 
 def test_periodic_key_requires_ordered_aware_windows_and_canonicalizes_utc() -> None:

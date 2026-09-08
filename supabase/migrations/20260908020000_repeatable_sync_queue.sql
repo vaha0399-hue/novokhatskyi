@@ -33,6 +33,31 @@ CREATE TRIGGER sync_work_items_fill_legacy_keys
 BEFORE INSERT ON ops.sync_work_items
 FOR EACH ROW EXECUTE FUNCTION ops.fill_legacy_sync_work_item_keys();
 
+-- Repeatable rows are durable execution history.  Their identity and their
+-- reservation of a completed stable key must not be mutable or removable;
+-- legacy rows intentionally retain their pre-Q02 lifecycle for old workers.
+CREATE OR REPLACE FUNCTION ops.protect_repeatable_sync_work_item_identity()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.job_type <> 'legacy' THEN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'repeatable sync work items are durable history' USING ERRCODE = '23514';
+        END IF;
+        IF NEW.job_type IS DISTINCT FROM OLD.job_type
+           OR NEW.stable_key IS DISTINCT FROM OLD.stable_key
+           OR NEW.entity_key IS DISTINCT FROM OLD.entity_key
+           OR NEW.execution_key IS DISTINCT FROM OLD.execution_key THEN
+            RAISE EXCEPTION 'repeatable sync work item identity is immutable' USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER sync_work_items_protect_repeatable_identity
+BEFORE UPDATE OR DELETE ON ops.sync_work_items
+FOR EACH ROW EXECUTE FUNCTION ops.protect_repeatable_sync_work_item_identity();
+
 ALTER TABLE ops.sync_work_items
     ALTER COLUMN stable_key SET NOT NULL,
     ALTER COLUMN entity_key SET NOT NULL,
@@ -77,6 +102,12 @@ BEGIN
        OR p_available_at IS NULL THEN
         RAISE EXCEPTION 'repeatable work item requires nonblank keys, due time, and object scope' USING ERRCODE = '22023';
     END IF;
+    IF p_job_type = 'legacy'
+       OR p_stable_key = 'legacy' OR p_stable_key LIKE 'legacy:%'
+       OR p_entity_key = 'legacy' OR p_entity_key LIKE 'legacy:%'
+       OR p_execution_key = 'legacy' OR p_execution_key LIKE 'legacy:%' THEN
+        RAISE EXCEPTION 'legacy queue identities are reserved for legacy producers' USING ERRCODE = '22023';
+    END IF;
 
     INSERT INTO ops.sync_work_items
         (run_id, scope_key, scope, job_type, priority, available_at, stable_key, entity_key, execution_key)
@@ -114,6 +145,10 @@ BEGIN
         SELECT item.id
         FROM ops.sync_work_items AS item
         WHERE item.status = 'pending'
+          AND item.job_type <> 'legacy'
+          AND item.stable_key <> 'legacy' AND item.stable_key NOT LIKE 'legacy:%'
+          AND item.entity_key <> 'legacy' AND item.entity_key NOT LIKE 'legacy:%'
+          AND item.execution_key <> 'legacy' AND item.execution_key NOT LIKE 'legacy:%'
           AND item.available_at <= clock_timestamp()
           AND NOT EXISTS (
               SELECT 1 FROM ops.sync_work_items AS running

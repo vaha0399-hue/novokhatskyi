@@ -14,7 +14,7 @@ from app.importer.cup_queue import OPERATION as CUP_OPERATION, POLICY_VERSION as
 from app.importer.cup_queue_repository import PostgresCupQueueRepository
 from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
-from app.sync.repository import PeriodicWork, PostgresSyncRepository
+from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
 
 TEST_DB_URL = os.environ.get("REPEATABLE_SYNC_QUEUE_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="REPEATABLE_SYNC_QUEUE_TEST_DB_URL is not configured")
@@ -63,6 +63,68 @@ def test_repeatable_queue_uses_real_concurrent_connections_and_preserves_version
         assert _enqueue(connection, run_b, stable) == (item_id, False)
         newer_id, created = _enqueue(connection, run_b, stable + ":v2")
         assert created and newer_id != item_id
+
+
+def test_canonical_component_keys_persist_independently_and_each_deduplicates() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider = connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q02-canonical-{suffix}", "Q02 canonical key test")).fetchone()
+        assert provider is not None
+        first_run = _run(connection, int(provider[0]), f"q02-canonical-first-{suffix}")
+        second_run = _run(connection, int(provider[0]), f"q02-canonical-second-{suffix}")
+        first = RecalculationWork(int(provider[0]), 1, "metrics", "team:9", "accepted:1", 0, {})
+        second = RecalculationWork(int(provider[0]), 1, "metrics", "team:9:accepted", "1", 0, {})
+        assert first.stable_key() != second.stable_key()
+        first_id, first_created = _enqueue(connection, first_run, first.stable_key(), execution_key=f"canonical-first:{suffix}")
+        second_id, second_created = _enqueue(connection, second_run, second.stable_key(), execution_key=f"canonical-second:{suffix}")
+        assert first_created and second_created and first_id != second_id
+        assert _enqueue(connection, second_run, first.stable_key(), execution_key=f"canonical-first:{suffix}") == (first_id, False)
+        assert _enqueue(connection, first_run, second.stable_key(), execution_key=f"canonical-second:{suffix}") == (second_id, False)
+
+
+def test_repeatable_claim_reserves_legacy_rows_for_old_workers() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider = connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q02-legacy-claim-{suffix}", "Q02 legacy claim test")).fetchone()
+        assert provider is not None
+        legacy_run = _run(connection, int(provider[0]), f"q02-legacy-old-{suffix}")
+        repeatable_run = _run(connection, int(provider[0]), f"q02-legacy-new-{suffix}")
+        legacy_id = int(connection.execute(
+            "INSERT INTO ops.sync_work_items(run_id,scope_key,scope,priority) VALUES(%s,%s,%s,%s) RETURNING id",
+            (legacy_run, f"legacy-{suffix}", Jsonb({}), 1_000_000),
+        ).fetchone()[0])
+        repeatable_id, _ = _enqueue(connection, repeatable_run, f"repeatable-{suffix}", priority=2_000_000, execution_key=f"repeatable:{suffix}")
+        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"new-{suffix}", "1 minute")).fetchone()
+        assert claimed is not None and int(claimed[0]) == repeatable_id
+        old_claimed = connection.execute("SELECT id FROM ops.claim_next_sync_work_item(%s,%s,%s)", (legacy_run, f"old-{suffix}", "1 minute")).fetchone()
+        assert old_claimed is not None and int(old_claimed[0]) == legacy_id
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="reserved"):
+            _enqueue(connection, repeatable_run, "legacy:forbidden")
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="reserved"):
+            _enqueue(connection, repeatable_run, "legacy")
+        connection.execute("UPDATE ops.sync_work_items SET stable_key=%s WHERE id=%s", (f"legacy-rewritten-{suffix}", legacy_id))
+        connection.execute("DELETE FROM ops.sync_work_items WHERE id=%s", (legacy_id,))
+
+
+def test_repeatable_identity_cannot_be_changed_or_deleted_after_completion() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider = connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q02-immutable-{suffix}", "Q02 immutable identity test")).fetchone()
+        assert provider is not None
+        run_id = _run(connection, int(provider[0]), f"q02-immutable-{suffix}")
+        stable = f"immutable-{suffix}"
+        item_id, _ = _enqueue(connection, run_id, stable, priority=3_000_000, execution_key=f"immutable:{suffix}")
+        with pytest.raises(psycopg.errors.CheckViolation, match="immutable"):
+            connection.execute("UPDATE ops.sync_work_items SET stable_key=%s WHERE id=%s", (f"changed-{suffix}", item_id))
+        with pytest.raises(psycopg.errors.CheckViolation, match="durable history"):
+            connection.execute("DELETE FROM ops.sync_work_items WHERE id=%s", (item_id,))
+        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"immutable-{suffix}", "1 minute")).fetchone()
+        assert claimed is not None and int(claimed[0]) == item_id
+        assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, f"immutable-{suffix}", Jsonb({}))).fetchone()[0] is True
+        assert _enqueue(connection, run_id, stable) == (item_id, False)
 
 
 def test_repeatable_claim_respects_due_time_ages_priorities_and_retains_conflicts() -> None:
