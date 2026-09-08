@@ -117,6 +117,27 @@ def test_budget_reset_and_cooldown_are_shared_and_headers_never_credit_capacity(
         assert retry_at is not None and retry_at >= datetime.now(UTC) + timedelta(seconds=100)
 
 
+def test_provider_headers_only_reduce_shared_capacity_and_reject_invalid_inputs() -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as first:
+        _reset(first, daily=4, minute=4, operations=4, history=0, manual=0, reserve=0)
+        assert _reserve(first, "operations")[:2] == (True, "reserved")
+        # A contradictory header cannot make capacity appear or trigger an
+        # arbitrary reset; normal reservations retain their local accounting.
+        first.execute("SELECT ops.observe_api_football_budget(%s,%s::jsonb)", (200, '{"X-RateLimit-Limit":"2","X-RateLimit-Remaining":"3"}'))
+        assert _reserve(first, "operations")[:2] == (True, "reserved")
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            first.execute("SELECT ops.observe_api_football_budget(NULL, '{}'::jsonb)")
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            first.execute("SELECT ops.observe_api_football_budget(200, NULL)")
+        first.execute("SELECT ops.observe_api_football_budget(%s,%s::jsonb)", (200, '{"X-RateLimit-Requests-Limit":"7500","X-RateLimit-Requests-Remaining":"0"}'))
+    # A second real connection sees provider exhaustion; no normal header or
+    # UTC reset may credit it back without an independently trusted reset.
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as second:
+        second.execute("UPDATE ops.api_football_budget_state SET daily_window=(clock_timestamp() AT TIME ZONE 'UTC')::date - 1")
+        assert _reserve(second, "operations")[:2] == (False, "provider_daily_exhausted")
+
+
 def test_live_and_sync_clients_share_budget_before_http_without_a_held_budget_lock() -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
