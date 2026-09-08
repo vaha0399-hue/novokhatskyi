@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import Event, Thread
-from time import sleep
 from typing import Any, Protocol
 
 from psycopg import Connection
@@ -19,6 +18,49 @@ class LeaseLost(RuntimeError):
     """The result must not be applied because its fence is no longer current."""
 
 
+class _AtomicCursor:
+    """Cursor facade which deliberately cannot lead back to a connection."""
+    __slots__ = ("_cursor",)
+
+    def __init__(self, cursor: Any) -> None:
+        object.__setattr__(self, "_cursor", cursor)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"connection", "_cursor"}:
+            raise AttributeError("raw database connection is not exposed")
+        return object.__getattribute__(self, name)
+
+    def fetchone(self) -> Any:
+        return object.__getattribute__(self, "_cursor").fetchone()
+
+    def fetchall(self) -> Any:
+        return object.__getattribute__(self, "_cursor").fetchall()
+
+    @property
+    def rowcount(self) -> int:
+        return object.__getattribute__(self, "_cursor").rowcount
+
+
+class _AtomicSavepoint:
+    """Nested transaction facade which cannot expose psycopg's connection."""
+    __slots__ = ("_context",)
+
+    def __init__(self, context: Any) -> None:
+        object.__setattr__(self, "_context", context)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"connection", "_context"}:
+            raise AttributeError("raw database connection is not exposed")
+        return object.__getattribute__(self, name)
+
+    def __enter__(self) -> "_AtomicSavepoint":
+        object.__getattribute__(self, "_context").__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return object.__getattribute__(self, "_context").__exit__(*args)
+
+
 class AtomicWorkTransaction:
     """Restricted writer capability: no commit and no connection factory."""
     __slots__ = ("_execute", "_transaction")
@@ -30,12 +72,165 @@ class AtomicWorkTransaction:
             raise AttributeError("raw database connection is not exposed")
         return object.__getattribute__(self, name)
 
-    def execute(self, query: str, params: Any = None) -> Any:
-        return object.__getattribute__(self, "_execute")(query, params)
+    def execute(self, query: str, params: Any = None) -> _AtomicCursor:
+        self._validate_single_sql_statement(query)
+        return _AtomicCursor(object.__getattribute__(self, "_execute")(query, params))
 
-    def transaction(self) -> Any:
+    def _validate_single_sql_statement(self, query: object) -> None:
+        """Accept one SQL command without interpreting comments inside literals.
+
+        This is deliberately a narrow lexer, not a SQL rewriter: statements are
+        passed to PostgreSQL unchanged only after their lexical boundaries have
+        been checked.  PostgreSQL treats comments as whitespace, while quoted
+        and dollar-quoted constants may legitimately contain comment markers or
+        semicolons.
+        """
+        if not isinstance(query, str):
+            raise TypeError("atomic work writers accept only text SQL")
+
+        first_keyword: str | None = None
+        has_statement = False
+        terminated = False
+        index = 0
+        length = len(query)
+
+        while index < length:
+            character = query[index]
+            if character.isspace():
+                index += 1
+                continue
+            if query.startswith("--", index):
+                newline = query.find("\n", index + 2)
+                index = length if newline == -1 else newline + 1
+                continue
+            if query.startswith("/*", index):
+                index = AtomicWorkTransaction._skip_block_comment(query, index)
+                continue
+            if terminated:
+                raise RuntimeError("atomic work writers accept exactly one SQL statement")
+            if character == "'":
+                index = AtomicWorkTransaction._skip_string_literal(
+                    query, index, self._string_uses_backslash_escapes(query, index),
+                )
+                continue
+            if character == '"':
+                index = AtomicWorkTransaction._skip_quoted_identifier(query, index)
+                continue
+            if character == "$":
+                delimiter = AtomicWorkTransaction._dollar_quote_delimiter(query, index)
+                if delimiter is not None:
+                    closing = query.find(delimiter, index + len(delimiter))
+                    if closing == -1:
+                        raise RuntimeError("atomic work SQL contains an unterminated dollar-quoted literal")
+                    index = closing + len(delimiter)
+                    continue
+            if character == ";":
+                if not has_statement or terminated:
+                    raise RuntimeError("atomic work writers accept exactly one SQL statement")
+                terminated = True
+                index += 1
+                continue
+            has_statement = True
+            if AtomicWorkTransaction._is_identifier_start(character):
+                start = index
+                index += 1
+                while index < length and AtomicWorkTransaction._is_identifier_continue(query[index]):
+                    index += 1
+                if first_keyword is None:
+                    first_keyword = query[start:index].casefold()
+                continue
+            index += 1
+
+        if not has_statement:
+            raise RuntimeError("atomic work writers require one SQL statement")
+        if first_keyword in {
+            "abort", "begin", "call", "commit", "do", "end", "execute", "prepare", "release", "rollback",
+            "savepoint", "set", "start",
+        }:
+            raise RuntimeError("atomic work writers cannot control the outer transaction")
+
+    @staticmethod
+    def _skip_block_comment(query: str, index: int) -> int:
+        depth = 1
+        index += 2
+        while index < len(query):
+            if query.startswith("/*", index):
+                depth += 1
+                index += 2
+            elif query.startswith("*/", index):
+                depth -= 1
+                index += 2
+                if depth == 0:
+                    return index
+            else:
+                index += 1
+        raise RuntimeError("atomic work SQL contains an unterminated block comment")
+
+    @staticmethod
+    def _string_uses_backslash_escapes(query: str, index: int) -> bool:
+        previous = query[index - 1] if index else ""
+        before_previous = query[index - 2] if index > 1 else ""
+        if previous in {"e", "E"} and (index == 1 or not AtomicWorkTransaction._is_identifier_continue(before_previous)):
+            return True
+        return False
+
+    @staticmethod
+    def _skip_string_literal(query: str, index: int, backslash_escapes: bool) -> int:
+        index += 1
+        while index < len(query):
+            if query[index] == "'":
+                if index + 1 < len(query) and query[index + 1] == "'":
+                    index += 2
+                    continue
+                return index + 1
+            if query[index] == "\\":
+                if not backslash_escapes:
+                    raise RuntimeError("atomic work SQL requires E strings for backslash escapes")
+                index += 2
+            else:
+                index += 1
+        raise RuntimeError("atomic work SQL contains an unterminated string literal")
+
+    @staticmethod
+    def _skip_quoted_identifier(query: str, index: int) -> int:
+        index += 1
+        while index < len(query):
+            if query[index] == '"':
+                if index + 1 < len(query) and query[index + 1] == '"':
+                    index += 2
+                    continue
+                return index + 1
+            index += 1
+        raise RuntimeError("atomic work SQL contains an unterminated quoted identifier")
+
+    @staticmethod
+    def _dollar_quote_delimiter(query: str, index: int) -> str | None:
+        if index and AtomicWorkTransaction._is_identifier_continue(query[index - 1]):
+            return None
+        end = index + 1
+        if end < len(query) and AtomicWorkTransaction._is_identifier_start(query[end]):
+            end += 1
+            # PostgreSQL dollar-quote tags follow identifier rules except they
+            # cannot themselves contain a dollar sign.
+            while end < len(query) and (
+                AtomicWorkTransaction._is_identifier_start(query[end]) or query[end].isdigit()
+            ):
+                end += 1
+        if end < len(query) and query[end] == "$":
+            return query[index:end + 1]
+        return None
+
+    @staticmethod
+    def _is_identifier_start(character: str) -> bool:
+        return character == "_" or character.isalpha()
+
+    @staticmethod
+    def _is_identifier_continue(character: str) -> bool:
+        return AtomicWorkTransaction._is_identifier_start(character) or character.isdigit() or character == "$"
+
+    def transaction(self) -> _AtomicSavepoint:
         """Permit canonical writers' nested savepoints, never a top-level commit."""
-        return object.__getattribute__(self, "_transaction")()
+        return _AtomicSavepoint(object.__getattribute__(self, "_transaction")())
 
 
 @dataclass(frozen=True)
@@ -55,10 +250,13 @@ class RepeatableSyncWorker:
     commit or open another connection; this is the integration boundary for
     canonical writers until those writers are adapted for Q03.
     """
-    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str, heartbeat: Callable[[LeasedWorkItem], bool] | None = None, heartbeat_connection_factory: Callable[[], Connection[Any]] | None = None, heartbeat_interval: float = 30.0) -> None:
+    def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str,
+                 heartbeat_connection_factory: Callable[[], Connection[Any]] | None = None,
+                 heartbeat_interval: float = 30.0) -> None:
+        if heartbeat_connection_factory is None:
+            raise ValueError("repeatable worker requires a separate heartbeat connection factory")
         self._connection, self._gate, self._owner = connection, policy_gate, owner
         self.repository = PostgresSyncRepository(connection, policy_gate)
-        self._heartbeat = heartbeat
         self._heartbeat_connection_factory = heartbeat_connection_factory
         self._heartbeat_interval = heartbeat_interval
 
@@ -66,6 +264,9 @@ class RepeatableSyncWorker:
         # Claim and policy recheck are a short transaction, deliberately
         # committed before any network wait.  Quarantine inside this block so
         # the token-bearing claim is committed with its state transition.
+        transaction_status = getattr(getattr(self._connection, "info", None), "transaction_status", None)
+        if transaction_status is not None and getattr(transaction_status, "name", str(transaction_status)) != "IDLE":
+            raise RuntimeError("repeatable worker requires an IDLE main connection before claim")
         with self._connection.transaction():
             try:
                 item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
@@ -80,21 +281,26 @@ class RepeatableSyncWorker:
         stop = Event()
         def beat() -> None:
             while not stop.wait(self._heartbeat_interval):
-                if not self._send_heartbeat(item):
+                try:
+                    if not self._send_heartbeat(item):
+                        failed.set(); return
+                except Exception:
+                    # A broken factory, connection, or heartbeat SQL is as
+                    # fatal as a false fence response: never apply stale work.
                     failed.set(); return
-        thread = Thread(target=beat, daemon=True) if self._heartbeat_connection_factory is not None else None
-        if thread is not None: thread.start()
+        thread = Thread(target=beat, daemon=True)
+        thread.start()
         try:
             result = fetch(item, authorization)
         except Exception as exc:
             stop.set()
-            if thread is not None: thread.join()
+            thread.join()
             with self._connection.transaction():
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
             return True
         stop.set()
-        if thread is not None: thread.join()
-        if failed.is_set() or (thread is None and not self._send_heartbeat(item)):
+        thread.join()
+        if failed.is_set():
             raise LeaseLost("repeatable work-item heartbeat failed")
         with self._connection.transaction():
             guarded = self._connection.execute(
@@ -116,12 +322,10 @@ class RepeatableSyncWorker:
         return True
 
     def _send_heartbeat(self, item: LeasedWorkItem) -> bool:
-        if self._heartbeat_connection_factory is not None:
-            with self._heartbeat_connection_factory() as heartbeat_connection:
-                with heartbeat_connection.transaction():
-                    row = heartbeat_connection.execute("SELECT ops.heartbeat_repeatable_sync_work_item(%s,%s,%s,%s::interval)", (item.id, self._owner, item.lease_token, "5 minutes")).fetchone()
-                    return row is not None and row[0] is True
-        return self._heartbeat(item) if self._heartbeat is not None else True
+        with self._heartbeat_connection_factory() as heartbeat_connection:
+            with heartbeat_connection.transaction():
+                row = heartbeat_connection.execute("SELECT ops.heartbeat_repeatable_sync_work_item(%s,%s,%s,%s::interval)", (item.id, self._owner, item.lease_token, "5 minutes")).fetchone()
+                return row is not None and row[0] is True
 
     def _authorization(self, item: LeasedWorkItem) -> AuthorizedSyncWork:
         policy = item.scope.get("_sync_policy")

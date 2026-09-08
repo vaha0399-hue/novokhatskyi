@@ -8,12 +8,15 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from app.importer.cup_bootstrap import CupCompetition
 from app.importer.cup_queue import OPERATION as CUP_OPERATION, POLICY_VERSION as CUP_POLICY_VERSION
 from app.importer.cup_queue_repository import PostgresCupQueueRepository
-from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy
+from app.importer.cup_queue import CupQueueError, CupWorkItem
+from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy, SeasonalSyncError, SeasonalWorkItem
+from app.importer.catalogue_bootstrap import CatalogueBootstrapError, PostgresRepository as CatalogueRepository, WorkItem
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
 from app.sync.worker import RepeatableSyncWorker, WorkResult
@@ -277,6 +280,9 @@ def test_q03_real_sessions_fence_old_owner_and_quarantine_attempt_limit() -> Non
         quarantined_token = int(row[1])
         assert second.execute("SELECT ops.retry_quarantined_repeatable_sync_work_item(%s)", (item_id,)).fetchone()[0] is True
         assert int(second.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]) > quarantined_token
+        retry_claim = second.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"retry-{suffix}", "1 minute", 2)).fetchone()
+        assert retry_claim is not None and int(retry_claim[0]) == item_id
+        assert int(retry_claim[-1]) > quarantined_token
 
 
 def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_completion() -> None:
@@ -306,6 +312,56 @@ def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_complet
         assert connection.execute("SELECT count(*) FROM q03_atomic_marker").fetchone()[0] == 2
 
 
+@pytest.mark.parametrize("attack", ("non_text", "compound", "comment_in_literal", "mutable_string_mode"))
+def test_q03_runner_rejects_untrusted_sql_before_atomic_apply(attack: str) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = int(setup.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-escape-{suffix}", "Q03 escape")).fetchone()[0])
+        run_id = _run(setup, provider, f"q03-escape-{suffix}")
+        item_id, _ = _enqueue(setup, run_id, f"q03-escape:{suffix}", priority=11_500_000, execution_key=f"q03-escape:{suffix}")
+        setup.execute("UPDATE ops.sync_work_items SET scope=%s WHERE id=%s", (Jsonb({"_sync_policy": {"provider_id": provider, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}), item_id))
+        setup.execute("CREATE TABLE ops.q03_escape_marker_" + suffix + "(value text PRIMARY KEY)")
+    class Gate:
+        def before_enqueue(self, request): return type("A", (), {"coverage": None, "refresh_interval": None})()
+        def before_execution(self, authorization): return authorization
+    table = "ops.q03_escape_marker_" + suffix
+    with psycopg.connect(TEST_DB_URL) as connection:
+        # A caller-owned INTRANS connection is refused without changing it.
+        connection.execute("SELECT 1")
+        assert connection.info.transaction_status.name == "INTRANS"
+        worker = RepeatableSyncWorker(connection, Gate(), f"escape-{suffix}", heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL))  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match="IDLE"):
+            worker.run_once(lambda *_: pytest.fail("fetch"), lambda *_: pytest.fail("apply"))
+        assert connection.info.transaction_status.name == "INTRANS"
+        connection.rollback()
+        if attack == "mutable_string_mode":
+            connection.execute("SET standard_conforming_strings=off")
+            connection.commit()
+        if attack == "non_text":
+            query, error = sql.SQL(f"INSERT INTO {table} VALUES('result')"), TypeError
+        elif attack == "compound":
+            query, error = f"INSERT INTO {table} VALUES('result'); SELECT 1", RuntimeError
+        elif attack == "mutable_string_mode":
+            query, error = f"INSERT INTO {table} VALUES ('-- literal\\'); COMMIT; -- '", RuntimeError
+        else:
+            # The old regex treated this literal's ``--`` as a comment and
+            # passed the following COMMIT through to PostgreSQL.
+            query, error = f"INSERT INTO {table} VALUES('-- literal'); COMMIT", RuntimeError
+        def apply(writer, *_args):
+            if attack == "mutable_string_mode":
+                writer.execute("SELECT set_config('standard_conforming_strings', 'on', false)")
+            writer.execute(query)
+        with pytest.raises(error):
+            worker.run_once(
+                lambda *_: WorkResult({"completed": attack}, (lambda writer: writer.execute(f"INSERT INTO {table} VALUES('dependent')"),)),
+                apply,
+            )
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+        assert verify.execute("SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone() == ("running", {})
+
+
 def test_q03_legacy_apis_cannot_claim_or_mutate_repeatable_work() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
@@ -317,6 +373,40 @@ def test_q03_legacy_apis_cannot_claim_or_mutate_repeatable_work() -> None:
         claimed = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", ("new", "1 minute", 3)).fetchone()
         assert claimed is not None and int(claimed[0]) == item_id
         assert connection.execute("SELECT ops.complete_sync_work_item(%s,%s,%s)", (item_id, "new", Jsonb({}))).fetchone()[0] is None
+
+
+def test_q03_direct_legacy_requeues_cannot_mutate_repeatable_work() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider = int(connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-direct-{suffix}", "Q03 direct legacy")).fetchone()[0])
+        run_id = _run(connection, provider, f"q03-direct-{suffix}")
+        repeatable_id, _ = _enqueue(connection, run_id, f"q03-direct:{suffix}", priority=12_500_000, execution_key=f"q03-direct:{suffix}")
+        claim = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (f"owner-{suffix}", "1 minute")).fetchone()
+        assert claim is not None and int(claim[0]) == repeatable_id
+        cup = PostgresCupQueueRepository("unused", lease_owner=f"owner-{suffix}"); cup._conn_value = connection
+        season = PostgresSeasonalSyncRepository("unused", lease_owner=f"owner-{suffix}"); season._connection = connection
+        catalogue = CatalogueRepository("unused", lease_owner=f"owner-{suffix}"); catalogue._conn_value = connection
+        with pytest.raises(CupQueueError):
+            cup.requeue(CupWorkItem(repeatable_id, None, 1, {}), checkpoint={}, error="old", delay_seconds=0)  # type: ignore[arg-type]
+        with pytest.raises(SeasonalSyncError):
+            season.fail(SeasonalWorkItem(repeatable_id, None), checkpoint={}, error="old")  # type: ignore[arg-type]
+        with pytest.raises(CatalogueBootstrapError):
+            catalogue.requeue(WorkItem(repeatable_id, None, 1, {}), checkpoint={}, error="old", delay_seconds=0)  # type: ignore[arg-type]
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (repeatable_id,)).fetchone()[0] == "running"
+        legacy_id = int(connection.execute("INSERT INTO ops.sync_work_items(run_id,scope_key,scope) VALUES(%s,%s,%s) RETURNING id", (run_id, f"legacy-direct-{suffix}", Jsonb({}))).fetchone()[0])
+        assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, f"owner-{suffix}", "1 minute")).fetchone() is not None
+        cup.requeue(CupWorkItem(legacy_id, None, 1, {}), checkpoint={}, error="legacy", delay_seconds=0)  # type: ignore[arg-type]
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (legacy_id,)).fetchone()[0] == "pending"
+        connection.execute("UPDATE ops.sync_work_items SET status='succeeded' WHERE id=%s", (legacy_id,))
+        season_legacy = int(connection.execute("INSERT INTO ops.sync_work_items(run_id,scope_key,scope) VALUES(%s,%s,%s) RETURNING id", (run_id, f"legacy-season-{suffix}", Jsonb({}))).fetchone()[0])
+        assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, f"owner-{suffix}", "1 minute")).fetchone() is not None
+        season.fail(SeasonalWorkItem(season_legacy, None), checkpoint={}, error="legacy")  # type: ignore[arg-type]
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (season_legacy,)).fetchone()[0] == "failed"
+        catalogue_legacy = int(connection.execute("INSERT INTO ops.sync_work_items(run_id,scope_key,scope) VALUES(%s,%s,%s) RETURNING id", (run_id, f"legacy-catalogue-{suffix}", Jsonb({}))).fetchone()[0])
+        assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, f"owner-{suffix}", "1 minute")).fetchone() is not None
+        catalogue.requeue(WorkItem(catalogue_legacy, None, 1, {}), checkpoint={}, error="legacy", delay_seconds=0)  # type: ignore[arg-type]
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (catalogue_legacy,)).fetchone()[0] == "pending"
 
 
 def test_q03_runner_commits_before_fetch_and_heartbeats_on_separate_connection() -> None:
@@ -338,8 +428,13 @@ def test_q03_runner_commits_before_fetch_and_heartbeats_on_separate_connection()
         worker = RepeatableSyncWorker(connection, Gate(), f"runner-{suffix}", heartbeat_connection_factory=heartbeat_connection, heartbeat_interval=0.01)  # type: ignore[arg-type]
         def fetch(*_args):
             assert connection.info.transaction_status.name == "IDLE"
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                first_expiry = observer.execute("SELECT lease_expires_at FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
             time.sleep(0.05)
             assert heartbeat_connections
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                renewed_expiry = observer.execute("SELECT lease_expires_at FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
+            assert renewed_expiry > first_expiry
             return WorkResult({"done": True})
         worker.run_once(fetch, lambda writer, *_: writer.execute("CREATE TEMP TABLE q03_runner_persist(value text)"))
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE stable_key=%s", (f"q03-runner:{suffix}",)).fetchone()[0] == "succeeded"
@@ -367,7 +462,7 @@ def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
         writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')")
         raise RuntimeError("dependent")
     with psycopg.connect(TEST_DB_URL) as connection:
-        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
+        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}", heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL))  # type: ignore[arg-type]
         with pytest.raises(RuntimeError):
             worker.run_once(lambda *_: WorkResult({}, (dependent_then_fail,)), apply)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
@@ -376,7 +471,7 @@ def test_q03_runner_canonical_sink_nested_transaction_is_atomic() -> None:
         token = verify.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
         verify.execute("SELECT ops.requeue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s)", (item_id, f"canon-{suffix}", token, Jsonb({}), "retry", "0 seconds", False))
     with psycopg.connect(TEST_DB_URL) as connection:
-        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}")  # type: ignore[arg-type]
+        worker = RepeatableSyncWorker(connection, Gate(), f"canon-{suffix}", heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL))  # type: ignore[arg-type]
         worker.run_once(lambda *_: WorkResult({}, (lambda writer: writer.execute(f"INSERT INTO ops.{table} VALUES('dependent')"),)), apply)
         connection.commit()
         connection.execute("UPDATE ops.sync_work_items SET available_at=clock_timestamp()+interval '1 hour' WHERE status='pending' AND id<>%s", (item_id,))

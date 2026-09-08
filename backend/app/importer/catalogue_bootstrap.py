@@ -275,7 +275,7 @@ class PostgresRepository:
     complete = _terminal
 
     def requeue(self, item: WorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None:
-        changed = self._conn.execute("UPDATE ops.sync_work_items SET status='pending',checkpoint=%s,last_error=%s,available_at=clock_timestamp()+make_interval(secs=>%s),lease_owner=NULL,lease_expires_at=NULL WHERE id=%s AND status='running' AND lease_owner=%s AND lease_expires_at>=clock_timestamp()", (Jsonb(dict(checkpoint)), error[:500], delay_seconds, item.id, self._owner)).rowcount
+        changed = self._conn.execute("UPDATE ops.sync_work_items SET status='pending',checkpoint=%s,last_error=%s,available_at=clock_timestamp()+make_interval(secs=>%s),lease_owner=NULL,lease_expires_at=NULL WHERE id=%s AND status='running' AND lease_owner=%s AND lease_expires_at>=clock_timestamp() AND job_type='legacy'", (Jsonb(dict(checkpoint)), error[:500], delay_seconds, item.id, self._owner)).rowcount
         if changed != 1:
             raise CatalogueBootstrapError("lost work-item lease")
 

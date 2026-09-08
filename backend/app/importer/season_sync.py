@@ -289,7 +289,7 @@ class PostgresSeasonalSyncRepository:
                SET status='failed', checkpoint=%s, last_error=%s, finished_at=clock_timestamp(),
                    lease_owner=NULL, lease_expires_at=NULL
                WHERE id=%s AND status='running' AND lease_owner=%s
-                 AND lease_expires_at >= clock_timestamp()""",
+                 AND lease_expires_at >= clock_timestamp() AND job_type='legacy'""",
             (Jsonb(dict(checkpoint)), error[:500], item.id, self._lease_owner),
         )
         if cursor.rowcount != 1:
