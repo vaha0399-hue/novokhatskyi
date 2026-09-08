@@ -123,6 +123,14 @@ BEGIN
  lease_expires_at=clock_timestamp()+p_lease_duration,started_at=coalesce(item.started_at,clock_timestamp()),last_error=NULL
  FROM candidate WHERE item.id=candidate.id RETURNING item.id,item.scope_key,item.scope,item.checkpoint,item.attempts;
 END; $$;
+-- The former Q02 repeatable claim has no token in its return contract.  It is
+-- retained only as a harmless compatibility stub; Q03 callers must use the
+-- fenced `...with_lease` function.
+CREATE OR REPLACE FUNCTION ops.claim_next_repeatable_sync_work_item(p_lease_owner text,p_lease_duration interval DEFAULT interval '5 minutes')
+RETURNS TABLE (id bigint,run_id bigint,scope_key text,scope jsonb,checkpoint jsonb,attempts integer,job_type text,priority integer,stable_key text,entity_key text,execution_key text)
+LANGUAGE plpgsql AS $$ BEGIN
+ RAISE EXCEPTION 'tokenless repeatable claim is disabled; use claim_next_repeatable_sync_work_item_with_lease' USING ERRCODE='55000';
+END; $$;
 CREATE OR REPLACE FUNCTION ops.renew_sync_work_item(p_item_id bigint,p_lease_owner text,p_lease_duration interval DEFAULT interval '5 minutes') RETURNS boolean LANGUAGE sql AS $$
  UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()+p_lease_duration WHERE id=p_item_id AND job_type='legacy'
  AND status='running' AND lease_owner=p_lease_owner AND lease_expires_at>=clock_timestamp() RETURNING true;

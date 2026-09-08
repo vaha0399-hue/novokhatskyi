@@ -56,7 +56,7 @@ def test_repeatable_queue_uses_real_concurrent_connections_and_preserves_version
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (stable,)).fetchone()[0] == 1
         item_id = results[0][0]
-        assert connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"q02-{suffix}", "1 minute")).fetchone()[0] == item_id
+        assert connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (f"q02-{suffix}", "1 minute")).fetchone()[0] == item_id
         token = connection.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
         assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"q02-{suffix}", token, Jsonb({}))).fetchone()[0] is True
         owning_run = connection.execute("SELECT run_id FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
@@ -98,7 +98,7 @@ def test_repeatable_claim_reserves_legacy_rows_for_old_workers() -> None:
             (legacy_run, f"legacy-{suffix}", Jsonb({}), 1_000_000),
         ).fetchone()[0])
         repeatable_id, _ = _enqueue(connection, repeatable_run, f"repeatable-{suffix}", priority=2_000_000, execution_key=f"repeatable:{suffix}")
-        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"new-{suffix}", "1 minute")).fetchone()
+        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (f"new-{suffix}", "1 minute")).fetchone()
         assert claimed is not None and int(claimed[0]) == repeatable_id
         old_claimed = connection.execute("SELECT id FROM ops.claim_next_sync_work_item(%s,%s,%s)", (legacy_run, f"old-{suffix}", "1 minute")).fetchone()
         assert old_claimed is not None and int(old_claimed[0]) == legacy_id
@@ -129,7 +129,7 @@ def test_repeatable_identity_cannot_be_changed_or_deleted_after_completion() -> 
             connection.execute("UPDATE ops.sync_work_items SET stable_key=%s WHERE id=%s", (f"changed-{suffix}", item_id))
         with pytest.raises(psycopg.errors.CheckViolation, match="durable history"):
             connection.execute("DELETE FROM ops.sync_work_items WHERE id=%s", (item_id,))
-        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"immutable-{suffix}", "1 minute")).fetchone()
+        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (f"immutable-{suffix}", "1 minute")).fetchone()
         assert claimed is not None and int(claimed[0]) == item_id
         token = connection.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]
         assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"immutable-{suffix}", token, Jsonb({}))).fetchone()[0] is True
@@ -146,7 +146,7 @@ def test_repeatable_claim_respects_due_time_ages_priorities_and_retains_conflict
         future_id, _ = _enqueue(connection, run_id, f"future:{suffix}", priority=10000, available_at=datetime.now(UTC) + timedelta(hours=1), execution_key=f"future:{suffix}")
         old_id, _ = _enqueue(connection, run_id, f"old:{suffix}", available_at=datetime.now(UTC) - timedelta(minutes=61), execution_key=f"old:{suffix}")
         high_id, _ = _enqueue(connection, run_id, f"high:{suffix}", priority=60, execution_key=f"high:{suffix}")
-        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (f"order-{suffix}", "1 minute")).fetchone()
+        claimed = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (f"order-{suffix}", "1 minute")).fetchone()
         assert claimed is not None and int(claimed[0]) == old_id
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (future_id,)).fetchone()[0] == "pending"
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (high_id,)).fetchone()[0] == "pending"
@@ -167,7 +167,7 @@ def test_conflicting_claims_from_real_connections_leave_one_version_pending() ->
         assert TEST_DB_URL is not None
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
             barrier.wait()
-            row = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item(%s,%s)", (owner, "1 minute")).fetchone()
+            row = connection.execute("SELECT id FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s)", (owner, "1 minute")).fetchone()
             claimed.append(None if row is None else int(row[0]))
 
     left, right = threading.Thread(target=claim, args=(f"conflict-a-{suffix}",)), threading.Thread(target=claim, args=(f"conflict-b-{suffix}",))

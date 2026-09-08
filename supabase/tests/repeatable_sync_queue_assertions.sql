@@ -19,7 +19,7 @@ BEGIN
     SELECT work_item_id INTO second_id FROM ops.enqueue_repeatable_sync_work_item(
         r2, 'scope-b', '{}'::jsonb, 'metrics', 99999, clock_timestamp(),
         'recalculation:metrics:' || p || ':1:team:1:v2', 'team:1', 'entity:team:1');
-    SELECT id INTO claimed FROM ops.claim_next_repeatable_sync_work_item('q02-worker', interval '1 minute');
+    SELECT id INTO claimed FROM ops.claim_next_repeatable_sync_work_item_with_lease('q02-worker', interval '1 minute');
     IF claimed IS DISTINCT FROM first_id THEN RAISE EXCEPTION 'expected first item claim'; END IF;
     IF NOT EXISTS (SELECT 1 FROM ops.sync_work_items WHERE id=second_id AND status='pending') THEN
         RAISE EXCEPTION 'blocked input version was lost';
@@ -34,13 +34,13 @@ BEGIN
         'recalculation:metrics:' || p || ':1:team:1:v1', 'team:1', 'entity:team:1')) THEN
         RAISE EXCEPTION 'completed durable key was re-enqueued';
     END IF;
-    SELECT id INTO claimed FROM ops.claim_next_repeatable_sync_work_item('q02-worker-2', interval '1 minute');
+    SELECT id INTO claimed FROM ops.claim_next_repeatable_sync_work_item_with_lease('q02-worker-2', interval '1 minute');
     IF claimed IS DISTINCT FROM second_id THEN RAISE EXCEPTION 'blocked version was not subsequently claimable'; END IF;
 
     INSERT INTO ops.sync_runs(provider_id, operation) VALUES (p, 'q02-legacy-claim') RETURNING id INTO legacy_run;
     INSERT INTO ops.sync_work_items(run_id, scope_key, scope, priority)
     VALUES (legacy_run, 'legacy-high-priority', '{}'::jsonb, 1000000) RETURNING id INTO legacy_id;
-    IF (SELECT id FROM ops.claim_next_repeatable_sync_work_item('q02-worker-3', interval '1 minute')) = legacy_id THEN
+    IF (SELECT id FROM ops.claim_next_repeatable_sync_work_item_with_lease('q02-worker-3', interval '1 minute')) = legacy_id THEN
         RAISE EXCEPTION 'repeatable claim captured a legacy row';
     END IF;
     IF (SELECT id FROM ops.claim_next_sync_work_item(legacy_run, 'q02-legacy-worker', interval '1 minute')) IS DISTINCT FROM legacy_id THEN

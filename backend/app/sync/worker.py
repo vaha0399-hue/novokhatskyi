@@ -55,22 +55,18 @@ class RepeatableSyncWorker:
         self._heartbeat_connection_factory = heartbeat_connection_factory
 
     def run_once(self, fetch: FetchExecutor, apply_result: Callable[[AtomicWorkTransaction, LeasedWorkItem, WorkResult], None], *, max_attempts: int = 5) -> bool:
-        try:
-            # Claim and policy recheck are a short transaction, deliberately
-            # committed before any network wait.
-            with self._connection.transaction():
+        # Claim and policy recheck are a short transaction, deliberately
+        # committed before any network wait.  Quarantine inside this block so
+        # the token-bearing claim is committed with its state transition.
+        with self._connection.transaction():
+            try:
                 item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
                 if item is None:
                     return False
                 authorization = self._authorization(item)
-        except SyncPolicyDenied as exc:
-            with self._connection.transaction():
+            except (SyncPolicyDenied, ValueError) as exc:
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
-            return True
-        except ValueError as exc:
-            with self._connection.transaction():
-                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
-            return True
+                return True
         # Fetchers may wait on HTTP; no transaction is active here.
         try:
             result = fetch(item, authorization)
