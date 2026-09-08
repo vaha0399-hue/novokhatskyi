@@ -1221,7 +1221,9 @@ def run_backfill(
     scope: SeasonBackfillScope = DEFAULT_SCOPE,
 ) -> dict[str, Any]:
     database_url = _database_url()
-    api_client = client or APIFootballClient.from_environment(budget_consumer="history")
+    # This endpoint discovers fixture metadata.  P04 reserves the history
+    # share for actual fixture-statistics calls, not metadata or its retries.
+    api_client = client or APIFootballClient.from_environment(budget_consumer="operations")
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute("SET statement_timeout = '30s'")
         context = acquire_context_and_lock(conn, scope=scope)

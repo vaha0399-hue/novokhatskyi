@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 import asyncio
 from datetime import UTC, datetime, timedelta
 
@@ -58,8 +57,8 @@ def test_budget_is_atomic_across_real_connections_and_enforces_each_share() -> N
         assert _reserve(connection, "legacy_manual")[:2] == (False, "daily_limit")
 
 
-def test_waiter_uses_utc_window_after_the_real_state_lock_is_released() -> None:
-    """A blocked reservation must not debit the minute that existed before it waited."""
+def test_waiter_resets_at_the_shared_window_boundary_after_a_real_state_lock() -> None:
+    """A waiter observes the committed window transition after row-lock release."""
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
         _reset(setup, daily=10, minute=1, operations=10, history=0, manual=0, reserve=0)
@@ -77,6 +76,9 @@ def test_waiter_uses_utc_window_after_the_real_state_lock_is_released() -> None:
             connection.execute("SELECT * FROM ops.api_football_budget_state WHERE singleton FOR UPDATE")
             locked.set()
             assert release.wait(timeout=70)
+            # Simulate the shared minute transition while the next reserver is
+            # blocked on this real PostgreSQL row lock.
+            connection.execute("UPDATE ops.api_football_budget_state SET minute_window=minute_window - interval '1 minute'")
             connection.commit()
 
     def reserve_after_wait() -> None:
@@ -88,8 +90,6 @@ def test_waiter_uses_utc_window_after_the_real_state_lock_is_released() -> None:
     holder.start(); assert locked.wait(timeout=5)
     waiter = threading.Thread(target=reserve_after_wait)
     waiter.start()
-    seconds_to_next_minute = 61 - (datetime.now(UTC).second + datetime.now(UTC).microsecond / 1_000_000)
-    time.sleep(max(0.1, seconds_to_next_minute))
     release.set(); holder.join(timeout=5); waiter.join(timeout=5)
     assert result and result[0][:2] == (True, "reserved")
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
@@ -170,3 +170,38 @@ def test_live_and_sync_clients_share_budget_before_http_without_a_held_budget_lo
 
     asyncio.run(exercise())
     assert calls == 1
+
+
+def test_every_internal_retry_is_debited_to_its_shared_consumer_share() -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        _reset(setup, daily=4, minute=10, operations=2, history=2, manual=0, reserve=0)
+    calls: dict[str, int] = {"operations": 0, "history": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        consumer = "history" if request.url.path == "/fixtures/statistics" else "operations"
+        calls[consumer] += 1
+        return httpx.Response(503 if calls[consumer] == 1 else 200, json={"errors": {}, "response": []})
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    async def exercise() -> None:
+        transport = httpx.MockTransport(handler)
+        operations = APIFootballClient("test-secret", transport=transport, budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations", max_5xx_retries=1)
+        history = APIFootballClient("test-secret", transport=transport, budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="history", max_5xx_retries=1)
+        await operations.get("/fixtures")
+        await history.get("/fixtures/statistics")
+        await operations.aclose(); await history.aclose()
+
+    import app.api_football.client as client_module
+    original_sleep = client_module.asyncio.sleep
+    client_module.asyncio.sleep = no_wait
+    try:
+        asyncio.run(exercise())
+    finally:
+        client_module.asyncio.sleep = original_sleep
+    assert calls == {"operations": 2, "history": 2}
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute("SELECT daily_used,operations_used,history_used FROM ops.api_football_budget_state").fetchone() == (4, 2, 2)
+        assert _reserve(verify, "operations")[:2] == (False, "daily_limit")
