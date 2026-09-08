@@ -99,6 +99,23 @@ class EnqueueResult:
     authorization: AuthorizedSyncWork
 
 
+@dataclass(frozen=True)
+class LeasedWorkItem:
+    """A fenced Q03 lease; its token is required for every mutation."""
+    id: int
+    run_id: int
+    scope_key: str
+    scope: Mapping[str, Any]
+    checkpoint: Mapping[str, Any]
+    attempts: int
+    job_type: str
+    priority: int
+    stable_key: str
+    entity_key: str
+    execution_key: str
+    lease_token: int
+
+
 class PostgresSyncRepository:
     """Policy-gated enqueue facade over the existing control-plane queue."""
 
@@ -123,11 +140,42 @@ class PostgresSyncRepository:
         # Conservative default: any writer for an entity is mutually exclusive.
         # Callers may name a narrower reviewed conflict domain explicitly.
         execution_key = work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{entity_key}"
+        scope = dict(work.scope)
+        # Stored authorization is intentionally internal metadata: the worker
+        # rereads and version-checks it before it invokes an executor.
+        scope["_sync_policy"] = {"provider_id": work.provider_id, "season_id": work.season_id,
+                                 "work_type": work.work_type, "instance_id": authorization.policy_instance_id,
+                                 "version": authorization.policy_version}
         row = self._connection.execute(
             "SELECT * FROM ops.enqueue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (run_id, stable_key, Jsonb(dict(work.scope)), work.work_type, work.priority, available_at,
+            (run_id, stable_key, Jsonb(scope), work.work_type, work.priority, available_at,
              stable_key, entity_key, execution_key),
         ).fetchone()
         if row is None:
             raise RuntimeError("repeatable queue enqueue did not return a result")
         return EnqueueResult(int(row[0]), bool(row[1]), authorization)
+
+    def claim_next(self, owner: str, *, lease_duration: str = "5 minutes", max_attempts: int = 5) -> LeasedWorkItem | None:
+        row = self._connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s::interval,%s)",
+            (owner, lease_duration, max_attempts)).fetchone()
+        if row is None:
+            return None
+        return LeasedWorkItem(int(row[0]), int(row[1]), str(row[2]), dict(row[3]), dict(row[4]), int(row[5]),
+            str(row[6]), int(row[7]), str(row[8]), str(row[9]), str(row[10]), int(row[11]))
+
+    def heartbeat(self, item: LeasedWorkItem, owner: str, *, lease_duration: str = "5 minutes") -> bool:
+        return self._mutates("heartbeat_repeatable_sync_work_item", (item.id, owner, item.lease_token, lease_duration))
+
+    def checkpoint(self, item: LeasedWorkItem, owner: str, checkpoint: Mapping[str, Any]) -> bool:
+        return self._mutates("checkpoint_repeatable_sync_work_item", (item.id, owner, item.lease_token, Jsonb(dict(checkpoint))))
+
+    def requeue(self, item: LeasedWorkItem, owner: str, checkpoint: Mapping[str, Any], error: str, *, delay: str = "0 seconds", contract_error: bool = False) -> bool:
+        return self._mutates("requeue_repeatable_sync_work_item", (item.id, owner, item.lease_token, Jsonb(dict(checkpoint)), error, delay, contract_error))
+
+    def retry_quarantined(self, item_id: int) -> bool:
+        return self._mutates("retry_quarantined_repeatable_sync_work_item", (item_id,))
+
+    def _mutates(self, function: str, args: tuple[Any, ...]) -> bool:
+        placeholders = ",".join("%s" for _ in args)
+        row = self._connection.execute(f"SELECT ops.{function}({placeholders})", args).fetchone()
+        return row is not None and row[0] is True

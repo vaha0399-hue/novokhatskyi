@@ -28,3 +28,15 @@ ID.  Future work is never claimed.  This aging prevents a continuous stream of
 higher-priority work from starving an old ready item.  Scheduling missed time
 windows is intentionally Q05's responsibility; Q02 only deduplicates windows
 given to it and does not generate per-second catch-up work.
+
+## Q03 leases
+
+The opt-in repeatable worker receives a globally increasing `lease_token` on
+every claim. Heartbeat, checkpoint, requeue and completion require the same
+owner, token, running status and unexpired lease. Expired work becomes pending;
+attempt exhaustion and contract errors are quarantined, and explicit retry
+issues a new token. Fetch/HTTP occurs outside a transaction. Result writes,
+dependent enqueue calls and completion use one connection and one transaction:
+the lease guard locks and validates the token before the first domain write.
+Canonical writers used there must accept that connection and must not commit or
+open a separate connection.

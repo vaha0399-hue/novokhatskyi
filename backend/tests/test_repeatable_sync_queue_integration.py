@@ -210,3 +210,27 @@ def test_q01_denial_prevents_postgres_repository_enqueue() -> None:
         with pytest.raises(SyncPolicyDenied, match="disabled"):
             repository.enqueue_periodic(run_id, work, available_at=datetime.now(UTC))
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (work.stable_key(),)).fetchone()[0] == 0
+
+
+def test_q03_fenced_lease_expiry_quarantine_and_conflicting_recovery() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-{suffix}", "Q03 test")).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-{suffix}")
+        first, _ = _enqueue(connection, run_id, f"q03-first:{suffix}", priority=9_000_000, execution_key=f"q03-group:{suffix}")
+        second, _ = _enqueue(connection, run_id, f"q03-second:{suffix}", priority=8_999_999, execution_key=f"q03-group:{suffix}")
+        claimed = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"one-{suffix}", "1 millisecond", 2)).fetchone()
+        assert claimed is not None and int(claimed[0]) == first
+        token = int(claimed[-1])
+        # Reclaiming after expiry invalidates the old fence, and releases a Q02 conflict group.
+        connection.execute("SELECT pg_sleep(0.01)")
+        reclaimed = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"two-{suffix}", "1 minute", 2)).fetchone()
+        assert reclaimed is not None and int(reclaimed[-1]) != token
+        assert connection.execute("SELECT ops.checkpoint_repeatable_sync_work_item(%s,%s,%s,%s)", (first, f"one-{suffix}", token, Jsonb({"stale": True}))).fetchone()[0] is None
+        new_token = int(reclaimed[-1])
+        assert connection.execute("SELECT ops.requeue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s)", (first, f"two-{suffix}", new_token, Jsonb({}), "contract", "0 seconds", True)).fetchone()[0] is True
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (first,)).fetchone()[0] == "quarantined"
+        assert connection.execute("SELECT ops.retry_quarantined_repeatable_sync_work_item(%s)", (first,)).fetchone()[0] is True
+        # A recovered version stays in history and remains executable; its sibling was never lost.
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE id IN (%s,%s)", (first, second)).fetchone()[0] == 2
