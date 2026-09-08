@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import asyncio
 from datetime import UTC, datetime, timedelta
 
@@ -55,6 +56,45 @@ def test_budget_is_atomic_across_real_connections_and_enforces_each_share() -> N
         assert _reserve(connection, "operations")[:2] == (False, "operations_limit")
         assert _reserve(connection, "legacy_manual")[:2] == (True, "reserved")
         assert _reserve(connection, "legacy_manual")[:2] == (False, "daily_limit")
+
+
+def test_waiter_uses_utc_window_after_the_real_state_lock_is_released() -> None:
+    """A blocked reservation must not debit the minute that existed before it waited."""
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        _reset(setup, daily=10, minute=1, operations=10, history=0, manual=0, reserve=0)
+        setup.execute(
+            "INSERT INTO ops.api_football_budget_state(singleton,daily_window,minute_window,daily_used,minute_used,operations_used) "
+            "VALUES(true,(clock_timestamp() AT TIME ZONE 'UTC')::date,date_trunc('minute',clock_timestamp() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',1,1,1)"
+        )
+    locked = threading.Event()
+    release = threading.Event()
+    result: list[tuple[bool, str, datetime | None]] = []
+
+    def hold_state_lock() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL) as connection:
+            connection.execute("SELECT * FROM ops.api_football_budget_state WHERE singleton FOR UPDATE")
+            locked.set()
+            assert release.wait(timeout=70)
+            connection.commit()
+
+    def reserve_after_wait() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            result.append(_reserve(connection, "operations"))
+
+    holder = threading.Thread(target=hold_state_lock)
+    holder.start(); assert locked.wait(timeout=5)
+    waiter = threading.Thread(target=reserve_after_wait)
+    waiter.start()
+    seconds_to_next_minute = 61 - (datetime.now(UTC).second + datetime.now(UTC).microsecond / 1_000_000)
+    time.sleep(max(0.1, seconds_to_next_minute))
+    release.set(); holder.join(timeout=5); waiter.join(timeout=5)
+    assert result and result[0][:2] == (True, "reserved")
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        row = verify.execute("SELECT minute_window,minute_used FROM ops.api_football_budget_state").fetchone()
+        assert row is not None and row[0] == datetime.now(UTC).replace(second=0, microsecond=0) and row[1] == 1
 
 
 def test_budget_reset_and_cooldown_are_shared_and_headers_never_credit_capacity() -> None:
