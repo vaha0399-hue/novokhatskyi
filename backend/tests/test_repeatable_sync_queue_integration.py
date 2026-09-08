@@ -312,7 +312,10 @@ def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_complet
         assert connection.execute("SELECT count(*) FROM q03_atomic_marker").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("attack", ("non_text", "compound", "comment_in_literal", "mutable_string_mode"))
+@pytest.mark.parametrize(
+    "attack",
+    ("non_text", "compound", "comment_in_literal", "line_comment_lf", "line_comment_cr", "line_comment_crlf", "mutable_string_mode"),
+)
 def test_q03_runner_rejects_untrusted_sql_before_atomic_apply(attack: str) -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
@@ -344,6 +347,15 @@ def test_q03_runner_rejects_untrusted_sql_before_atomic_apply(attack: str) -> No
             query, error = f"INSERT INTO {table} VALUES('result'); SELECT 1", RuntimeError
         elif attack == "mutable_string_mode":
             query, error = f"INSERT INTO {table} VALUES ('-- literal\\'); COMMIT; -- '", RuntimeError
+        elif attack.startswith("line_comment_"):
+            # PostgreSQL ends -- comments at LF, CR, and CRLF.  The statement
+            # before each comment must remain inside the guarded transaction.
+            ending = {
+                "line_comment_lf": "\n",
+                "line_comment_cr": "\r",
+                "line_comment_crlf": "\r\n",
+            }[attack]
+            query, error = f"INSERT INTO {table} VALUES('result') -- comment{ending}; COMMIT", RuntimeError
         else:
             # The old regex treated this literal's ``--`` as a comment and
             # passed the following COMMIT through to PostgreSQL.

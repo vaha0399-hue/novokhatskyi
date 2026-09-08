@@ -144,6 +144,9 @@ def test_atomic_writer_lexes_literals_and_comments_without_rewriting_sql() -> No
         "SELECT $tag$-- literal; COMMIT$tag$; COMMIT",
         "SELECT /* outer /* nested */ comment */ 1; COMMIT",
         "SELECT 1 AS alias$tag$; COMMIT; $tag$",
+        "SELECT 1 -- LF comment\n; COMMIT",
+        "SELECT 1 -- CR comment\r; COMMIT",
+        "SELECT 1 -- CRLF comment\r\n; COMMIT",
     ):
         with pytest.raises(RuntimeError, match="exactly one"):
             writer.execute(statement)

@@ -100,8 +100,7 @@ class AtomicWorkTransaction:
                 index += 1
                 continue
             if query.startswith("--", index):
-                newline = query.find("\n", index + 2)
-                index = length if newline == -1 else newline + 1
+                index = AtomicWorkTransaction._skip_line_comment(query, index)
                 continue
             if query.startswith("/*", index):
                 index = AtomicWorkTransaction._skip_block_comment(query, index)
@@ -148,6 +147,24 @@ class AtomicWorkTransaction:
             "savepoint", "set", "start",
         }:
             raise RuntimeError("atomic work writers cannot control the outer transaction")
+
+    @staticmethod
+    def _skip_line_comment(query: str, index: int) -> int:
+        """Return the position after a PostgreSQL line-comment terminator.
+
+        PostgreSQL accepts LF, CR, and CRLF as line endings.  This must match
+        the server's lexical boundary: otherwise a CR can hide a following
+        semicolon and transaction-control statement from the capability check.
+        """
+        index += 2
+        while index < len(query) and query[index] not in {"\r", "\n"}:
+            index += 1
+        if index < len(query) and query[index] == "\r":
+            index += 1
+            if index < len(query) and query[index] == "\n":
+                index += 1
+            return index
+        return index + 1 if index < len(query) else index
 
     @staticmethod
     def _skip_block_comment(query: str, index: int) -> int:
