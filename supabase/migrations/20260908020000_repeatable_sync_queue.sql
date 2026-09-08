@@ -50,6 +50,9 @@ BEGIN
             RAISE EXCEPTION 'repeatable sync work item identity is immutable' USING ERRCODE = '23514';
         END IF;
     END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
     RETURN NEW;
 END;
 $$;

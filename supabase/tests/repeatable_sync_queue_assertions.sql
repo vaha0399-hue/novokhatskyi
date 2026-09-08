@@ -1,7 +1,7 @@
 -- Run after all migrations on an isolated database.  This deliberately uses
 -- two rows with the same execution group to prove the blocked version survives.
 DO $$
-DECLARE p smallint; r1 bigint; r2 bigint; legacy_run bigint; first_id bigint; second_id bigint; legacy_id bigint; claimed bigint;
+DECLARE p smallint; r1 bigint; r2 bigint; legacy_run bigint; first_id bigint; second_id bigint; legacy_id bigint; deleted_legacy_id bigint; claimed bigint;
 BEGIN
     SELECT id INTO p FROM source.providers ORDER BY id LIMIT 1;
     IF p IS NULL THEN INSERT INTO source.providers(code, name) VALUES ('q02-assertion-provider', 'Q02 assertion provider') RETURNING id INTO p; END IF;
@@ -65,6 +65,11 @@ BEGIN
         RAISE EXCEPTION 'repeatable history was deletable';
     EXCEPTION WHEN check_violation THEN NULL;
     END;
+    DELETE FROM ops.sync_work_items WHERE id=legacy_id RETURNING id INTO deleted_legacy_id;
+    IF deleted_legacy_id IS DISTINCT FROM legacy_id
+       OR EXISTS (SELECT 1 FROM ops.sync_work_items WHERE id=legacy_id) THEN
+        RAISE EXCEPTION 'legacy row was not deleted by DELETE RETURNING';
+    END IF;
 END $$;
 BEGIN;
 GRANT USAGE ON SCHEMA ops TO anon;

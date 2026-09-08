@@ -105,7 +105,13 @@ def test_repeatable_claim_reserves_legacy_rows_for_old_workers() -> None:
         with pytest.raises(psycopg.errors.InvalidParameterValue, match="reserved"):
             _enqueue(connection, repeatable_run, "legacy")
         connection.execute("UPDATE ops.sync_work_items SET stable_key=%s WHERE id=%s", (f"legacy-rewritten-{suffix}", legacy_id))
-        connection.execute("DELETE FROM ops.sync_work_items WHERE id=%s", (legacy_id,))
+        deleted = connection.execute(
+            "DELETE FROM ops.sync_work_items WHERE id=%s RETURNING id", (legacy_id,)
+        ).fetchone()
+        assert deleted is not None and int(deleted[0]) == legacy_id
+        assert connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM ops.sync_work_items WHERE id=%s)", (legacy_id,)
+        ).fetchone()[0] is False
 
 
 def test_repeatable_identity_cannot_be_changed_or_deleted_after_completion() -> None:
