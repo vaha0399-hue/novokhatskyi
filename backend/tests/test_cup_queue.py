@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.api_football import APIFootballResponse
+from app.api_football import APIFootballBudgetDenied, APIFootballResponse
 from app.importer.cup_bootstrap import CupCompetition
 from app.importer.cup_queue import OPERATION, CupQueueSettings, CupWorkItem, Worker
 from app.importer.raw_spool import RawSpool
@@ -113,3 +113,18 @@ def test_queue_pauses_before_request_when_run_quota_is_exhausted(tmp_path: Path)
     assert len(repository.requeues) == 1
     assert repository.requeues[0]["outcome"] == "retry_pending"
     assert repository.checkpoints[-1]["stopped_reason"] == "CupQueueQuotaExhausted"
+
+
+def test_queue_defers_budget_denial_without_completing_the_durable_item(tmp_path: Path) -> None:
+    class DeniedProvider(_Provider):
+        async def get(self, endpoint: str, *, params=None):
+            self.calls.append(endpoint)
+            raise APIFootballBudgetDenied("cooldown")
+
+    repository = _Repository()
+    report = asyncio.run(Worker(provider=DeniedProvider(_base_payloads()), repository=repository, spool=RawSpool(tmp_path / "spool"), settings=_settings(tmp_path), canonical_sink=_Sink()).run_once())
+
+    assert report.status == "paused_budget"
+    assert repository.complete_calls == []
+    assert repository.requeues and repository.requeues[0]["outcome"] == "budget_pending"
+    assert repository.checkpoints[-1]["stopped_reason"] == "APIFootballBudgetDenied"

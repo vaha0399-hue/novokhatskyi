@@ -23,7 +23,7 @@ from typing import Any, Protocol
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.api_football import APIFootballClient, APIFootballResponse
+from app.api_football import APIFootballBudgetError, APIFootballClient, APIFootballResponse, budget_retry_delay_seconds
 from app.api_football.client import safe_rate_limit_headers
 from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.active_season import (
@@ -154,6 +154,8 @@ class SeasonalSyncRepository(Protocol):
     def complete(self, item: SeasonalWorkItem, checkpoint: Mapping[str, Any]) -> None: ...
 
     def fail(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str) -> None: ...
+
+    def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None: ...
 
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None: ...
 
@@ -294,6 +296,19 @@ class PostgresSeasonalSyncRepository:
         )
         if cursor.rowcount != 1:
             raise SeasonalSyncError("seasonal work item lease was lost before failure recording")
+
+    def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None:
+        if delay_seconds < 0:
+            raise SeasonalSyncError("seasonal budget delay must be non-negative")
+        cursor = self._conn.execute(
+            """UPDATE ops.sync_work_items SET status='pending', checkpoint=%s, last_error=%s,
+                   available_at=clock_timestamp()+make_interval(secs=>%s), lease_owner=NULL, lease_expires_at=NULL
+               WHERE id=%s AND status='running' AND lease_owner=%s AND lease_expires_at >= clock_timestamp()
+                 AND job_type='legacy'""",
+            (Jsonb(dict(checkpoint)), error[:500], delay_seconds, item.id, self._lease_owner),
+        )
+        if cursor.rowcount != 1:
+            raise SeasonalSyncError("seasonal work item lease was lost before budget deferral")
 
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
         cursor = self._conn.execute(
@@ -474,6 +489,11 @@ class SeasonalSyncWorker:
                     terminal_status = "failed"
                     self._repository.fail(item, checkpoint={"outcome": "quota_stopped"}, error=type(error).__name__)
                     raise
+                except APIFootballBudgetError as error:
+                    self._repository.defer(item, checkpoint={"outcome": "budget_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=budget_retry_delay_seconds(error))
+                    reports.append(SeasonalLeagueReport(item.policy.code, item.policy.league_external_id, "budget_pending", detail=type(error).__name__))
+                    terminal_status = "failed"
+                    break
                 except (APIFootballHTTPError, APIFootballAPIError, ActiveSeasonImportError, SeasonalSyncError) as error:
                     terminal_status = "failed"
                     self._repository.fail(item, checkpoint={"outcome": "failed"}, error=type(error).__name__)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from psycopg import AsyncConnection
@@ -89,3 +89,10 @@ class UnavailableAPIFootballBudget:
 
     async def observe(self, status_code: int, headers: Mapping[str, str]) -> None:
         raise APIFootballBudgetError("a shared API-Football budget adapter is required")
+
+
+def budget_retry_delay_seconds(error: APIFootballBudgetError, *, default_seconds: float = 60.0) -> float:
+    """Return a safe defer delay without turning budget loss into a job failure."""
+    if isinstance(error, APIFootballBudgetDenied) and error.retry_at is not None:
+        return max(1.0, (error.retry_at - datetime.now(UTC)).total_seconds())
+    return default_seconds

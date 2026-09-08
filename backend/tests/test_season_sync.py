@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import pytest
 
-from app.api_football import APIFootballResponse
+from app.api_football import APIFootballBudgetDenied, APIFootballResponse
 from app.api_football.errors import APIFootballHTTPError
 from app.importer.active_season import ActiveSeasonScope
 from app.importer.season_bootstrap import CollectedBaseResponse
@@ -63,6 +63,7 @@ class FakeRepository:
     imported: list[ActiveSeasonScope] = field(default_factory=list)
     complete_checkpoints: list[dict[str, Any]] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    deferred: list[dict[str, Any]] = field(default_factory=list)
     finished: tuple[str, dict[str, Any]] | None = None
     rate_headers: list[dict[str, str]] = field(default_factory=list)
     _next: int = 0
@@ -95,6 +96,9 @@ class FakeRepository:
 
     def fail(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str) -> None:
         self.failed.append(error)
+
+    def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None:
+        self.deferred.append({"id": item.id, "checkpoint": dict(checkpoint), "error": error, "delay_seconds": delay_seconds})
 
     def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
         self.finished = (status, dict(checkpoint))
@@ -177,4 +181,19 @@ def test_rate_limit_stops_remaining_policies() -> None:
     assert report.status == "failed"
     assert len(provider.calls) == 1
     assert repository.failed == ["ProviderQuotaExhausted"]
+    assert repository.finished is not None and repository.finished[0] == "failed"
+
+
+def test_budget_denial_defers_durable_work_without_marking_it_failed_or_succeeded() -> None:
+    policy = SeasonalLeaguePolicy("first", 39, 20)
+    provider = FakeProvider([APIFootballBudgetDenied("cooldown")])
+    repository = FakeRepository([policy])
+
+    report = asyncio.run(SeasonalSyncWorker(provider=provider, repository=repository, policies=[policy]).run_once())
+
+    assert report.status == "failed"
+    assert report.leagues[0].outcome == "budget_pending"
+    assert repository.failed == []
+    assert repository.complete_checkpoints == []
+    assert repository.deferred and repository.deferred[0]["checkpoint"]["outcome"] == "budget_pending"
     assert repository.finished is not None and repository.finished[0] == "failed"

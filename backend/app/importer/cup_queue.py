@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 import psycopg
 
+from app.api_football import APIFootballBudgetError, budget_retry_delay_seconds
 from app.importer.cup_bootstrap import (
     CupBaseSink,
     CupBootstrapError,
@@ -242,6 +243,10 @@ class Worker:
                 return CupQueueReport(run_id, "waiting_retry", tuple(entries), self._requests)
             try:
                 entries.append(await self._process(run_id, item))
+            except APIFootballBudgetError as error:
+                self._repository.requeue(item, checkpoint={**item.checkpoint, "outcome": "budget_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=budget_retry_delay_seconds(error))
+                self._repository.checkpoint_run(run_id, self._checkpoint(entries, type(error).__name__))
+                return CupQueueReport(run_id, "paused_budget", tuple(entries), self._requests)
             except CupQueueQuotaExhausted as error:
                 self._repository.requeue(item, checkpoint={**item.checkpoint, "outcome": "retry_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=0)
                 self._repository.checkpoint_run(run_id, self._checkpoint(entries, type(error).__name__))

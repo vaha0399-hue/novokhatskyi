@@ -9,7 +9,7 @@ import pytest
 from psycopg import OperationalError
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from app.api_football import APIFootballResponse
+from app.api_football import APIFootballBudgetDenied, APIFootballResponse
 from app.api_football.errors import APIFootballHTTPError
 from app.live import (
     CanonicalFixtureReference,
@@ -558,6 +558,28 @@ def test_provider_failure_retries_after_configured_25_seconds() -> None:
         asyncio.run(worker.run_forever())
 
     assert delays == [25]
+
+
+def test_live_budget_denial_defers_without_publishing_or_retrying_the_provider() -> None:
+    class StopLoop(Exception):
+        pass
+
+    delays: list[float] = []
+
+    async def stop_after_delay(delay: float) -> None:
+        delays.append(delay)
+        raise StopLoop
+
+    provider = FakeProvider([APIFootballBudgetDenied("cooldown")])
+    store = FakeStore()
+    worker = LiveWorker(provider=provider, repository=FakeRepository(), store=store, settings=_settings(39), clock=lambda: NOW, sleep=stop_after_delay, monotonic_clock=lambda: 0.0)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(worker.run_forever())
+
+    assert len(provider.calls) == 1
+    assert delays == [60.0]
+    assert store.applied == []
 
 
 def test_poll_cadence_subtracts_cycle_processing_time() -> None:

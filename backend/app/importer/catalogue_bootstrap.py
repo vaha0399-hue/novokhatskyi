@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.api_football import APIFootballClient, APIFootballResponse
+from app.api_football import APIFootballBudgetError, APIFootballClient, APIFootballResponse, budget_retry_delay_seconds
 from app.api_football.client import safe_rate_limit_headers
 from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 from app.importer.active_season import ActiveSeasonImportError, ActiveSeasonScope, base_requests, import_active_base, validate_base_responses, verify_active_season
@@ -519,6 +519,10 @@ class Worker:
                     self._repository.finish_run(run_id, checkpoint=self._checkpoint(reports)); return Report(run_id, "succeeded", tuple(reports), self._requests)
                 self._repository.checkpoint_run(run_id, self._checkpoint(reports, "waiting_retry")); return Report(run_id, "waiting_retry", tuple(reports), self._requests)
             try: reports.append(await self._process(run_id, item))
+            except APIFootballBudgetError as error:
+                delay = budget_retry_delay_seconds(error)
+                self._repository.requeue(item, checkpoint={**item.checkpoint, "outcome": "budget_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=delay)
+                self._repository.checkpoint_run(run_id, self._checkpoint(reports, type(error).__name__)); return Report(run_id, "paused_budget", tuple(reports), self._requests)
             except ProviderQuotaExhausted as error:
                 self._repository.requeue(item, checkpoint={**item.checkpoint, "outcome": "retry_pending", "reason": type(error).__name__}, error=type(error).__name__, delay_seconds=0)
                 self._repository.checkpoint_run(run_id, self._checkpoint(reports, type(error).__name__)); return Report(run_id, "paused_quota", tuple(reports), self._requests)

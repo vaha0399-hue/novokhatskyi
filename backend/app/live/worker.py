@@ -15,7 +15,7 @@ from psycopg import AsyncConnection, InterfaceError, OperationalError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from app.api_football import APIFootballClient, APIFootballResponse
+from app.api_football import APIFootballBudgetDenied, APIFootballBudgetError, APIFootballClient, APIFootballResponse, budget_retry_delay_seconds
 from app.api_football.errors import APIFootballAPIError, APIFootballHTTPError
 
 from .config import LiveConfigurationError, LiveSettings, managed_redis_client
@@ -456,6 +456,15 @@ class LiveWorker:
                     "live provider poll failed (%s); retrying on the next cycle",
                     type(error).__name__,
                 )
+            except APIFootballBudgetDenied as error:
+                delay = budget_retry_delay_seconds(error)
+                LOGGER.info("live provider poll deferred by shared budget (%s)", error.reason)
+                await self._sleep(max(delay, self._settings.poll_interval_seconds))
+                continue
+            except APIFootballBudgetError as error:
+                LOGGER.warning("live provider poll deferred because shared budget is unavailable (%s)", type(error).__name__)
+                await self._sleep(max(budget_retry_delay_seconds(error), self._settings.poll_interval_seconds))
+                continue
             elapsed = max(0.0, self._monotonic() - cycle_started)
             await self._sleep(
                 max(0.0, self._settings.poll_interval_seconds - elapsed)
