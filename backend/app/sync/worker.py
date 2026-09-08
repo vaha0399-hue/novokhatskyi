@@ -25,12 +25,17 @@ class AtomicWorkTransaction:
     def __init__(self, connection: Connection[Any]) -> None:
         self._execute, self._transaction = connection.execute, connection.transaction
 
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"_execute", "_transaction", "_connection"}:
+            raise AttributeError("raw database connection is not exposed")
+        return object.__getattribute__(self, name)
+
     def execute(self, query: str, params: Any = None) -> Any:
-        return self._execute(query, params)
+        return object.__getattribute__(self, "_execute")(query, params)
 
     def transaction(self) -> Any:
         """Permit canonical writers' nested savepoints, never a top-level commit."""
-        return self._transaction()
+        return object.__getattribute__(self, "_transaction")()
 
 
 @dataclass(frozen=True)
