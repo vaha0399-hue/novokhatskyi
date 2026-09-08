@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_db_policy_change_between_enqueue_and_execution_stops_callbacks() -> None:
+def test_db_policy_recreation_rejects_stale_authorization_before_callback() -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
         provider_id = connection.execute(
@@ -52,9 +52,9 @@ def test_db_policy_change_between_enqueue_and_execution_stops_callbacks() -> Non
         connection.execute(
             """INSERT INTO ops.competition_sync_policies(
                    provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals
-                 ) VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s)""",
+                 ) VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s) RETURNING policy_instance_id""",
             (provider_id, season_id, Jsonb({}), Jsonb({"coverage_refresh": {"value": 1, "unit": "hour"}})),
-        )
+        ).fetchone()[0]
         gate = SyncPolicyGate(
             PostgresCompetitionSyncPolicyReader(connection),
             now=lambda: datetime.now(UTC),
@@ -63,13 +63,21 @@ def test_db_policy_change_between_enqueue_and_execution_stops_callbacks() -> Non
         enqueued: list[object] = []
         authorization = PolicyCheckedEnqueuer(gate).enqueue(request, lambda value: (enqueued.append(value), value)[1])
         connection.execute(
-            "UPDATE ops.competition_sync_policies SET priority=10 WHERE provider_id=%s AND season_id=%s",
+            "DELETE FROM ops.competition_sync_policies WHERE provider_id=%s AND season_id=%s",
             (provider_id, season_id),
+        )
+        connection.execute(
+            """INSERT INTO ops.competition_sync_policies(
+                   provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals
+                 ) VALUES(%s,%s,true,ARRAY['coverage_refresh'],%s,%s)""",
+            (provider_id, season_id, Jsonb({}), Jsonb({"coverage_refresh": {"value": 25, "unit": "second"}})),
         )
         executed: list[object] = []
 
-        with pytest.raises(SyncPolicyDenied, match="version_changed"):
+        with pytest.raises(SyncPolicyDenied, match="instance_changed"):
             PolicyCheckedExecutor(gate).execute(authorization, lambda value: executed.append(value))
+        new_authorization = PolicyCheckedEnqueuer(gate).enqueue(request, lambda value: value)
+        assert PolicyCheckedExecutor(gate).execute(new_authorization, lambda value: value.refresh_interval.unit) == "second"
 
     assert len(enqueued) == 1
     assert executed == []

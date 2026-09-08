@@ -22,6 +22,7 @@ STRICT
 AS $$
 DECLARE
     entry record;
+    observed_on date;
 BEGIN
     IF jsonb_typeof(p_coverage) <> 'object' THEN
         RETURN false;
@@ -29,15 +30,22 @@ BEGIN
     FOR entry IN SELECT key, value FROM jsonb_each(p_coverage) LOOP
         IF btrim(entry.key) = ''
            OR jsonb_typeof(entry.value) <> 'object'
+           OR NOT (entry.value ? 'state')
+           OR jsonb_typeof(entry.value->'state') <> 'string'
            OR entry.value->>'state' NOT IN ('unknown', 'covered', 'not_covered')
-           OR jsonb_typeof(entry.value->'observed_on') <> 'string' THEN
+           OR NOT (entry.value ? 'observed_on')
+           OR jsonb_typeof(entry.value->'observed_on') <> 'string'
+           OR entry.value->>'observed_on' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
             RETURN false;
         END IF;
         BEGIN
-            PERFORM (entry.value->>'observed_on')::date;
+            observed_on := (entry.value->>'observed_on')::date;
         EXCEPTION WHEN others THEN
             RETURN false;
         END;
+        IF NOT isfinite(observed_on) OR to_char(observed_on, 'YYYY-MM-DD') <> entry.value->>'observed_on' THEN
+            RETURN false;
+        END IF;
     END LOOP;
     RETURN true;
 END;
@@ -52,15 +60,18 @@ AS $$
 DECLARE
     entry record;
 BEGIN
-    IF jsonb_typeof(p_intervals) <> 'object' THEN
+    IF jsonb_typeof(p_intervals) <> 'object' OR p_intervals = '{}'::jsonb THEN
         RETURN false;
     END IF;
     FOR entry IN SELECT key, value FROM jsonb_each(p_intervals) LOOP
         IF btrim(entry.key) = ''
            OR jsonb_typeof(entry.value) <> 'object'
+           OR NOT (entry.value ? 'value')
            OR jsonb_typeof(entry.value->'value') <> 'number'
            OR (entry.value->>'value') !~ '^[1-9][0-9]*$'
-           OR entry.value->>'unit' NOT IN ('minute', 'hour', 'day', 'week') THEN
+           OR NOT (entry.value ? 'unit')
+           OR jsonb_typeof(entry.value->'unit') <> 'string'
+           OR entry.value->>'unit' NOT IN ('second', 'minute', 'hour', 'day', 'week') THEN
             RETURN false;
         END IF;
     END LOOP;
@@ -85,6 +96,7 @@ $$;
 CREATE TABLE ops.competition_sync_policies (
     provider_id smallint NOT NULL REFERENCES source.providers(id) ON DELETE RESTRICT,
     season_id bigint NOT NULL REFERENCES football.seasons(id) ON DELETE RESTRICT,
+    policy_instance_id bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
     enabled boolean NOT NULL DEFAULT false,
     allowed_work_types text[] NOT NULL CHECK (ops.has_distinct_nonblank_texts(allowed_work_types)),
     coverage jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (ops.has_valid_coverage_observations(coverage)),
@@ -114,6 +126,9 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    IF NEW.policy_instance_id IS DISTINCT FROM OLD.policy_instance_id THEN
+        RAISE EXCEPTION 'competition sync policy instance is immutable' USING ERRCODE = '23514';
+    END IF;
     NEW.policy_version := OLD.policy_version + 1;
     NEW.updated_at := clock_timestamp();
     RETURN NEW;

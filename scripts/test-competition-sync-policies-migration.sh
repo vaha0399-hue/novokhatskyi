@@ -46,6 +46,38 @@ apply_policy_and_assertions() {
   psql_db "$database" -f "$ROOT_DIR/supabase/tests/competition_sync_policies_assertions.sql" >/dev/null
 }
 
+seed_upgrade_mapping() {
+  local database="$1"
+  psql_db "$database" <<'SQL' >/dev/null
+INSERT INTO source.providers(code, name) VALUES ('policy-upgrade-provider', 'Policy upgrade provider');
+INSERT INTO football.countries(name) VALUES ('Policy upgrade country');
+INSERT INTO football.leagues(name, country_id, competition_type)
+SELECT 'Policy upgrade competition', id, 'league' FROM football.countries WHERE name = 'Policy upgrade country';
+INSERT INTO source.league_provider_refs(provider_id, external_id, league_id)
+SELECT provider.id, 'upgrade-league', league.id
+FROM source.providers provider CROSS JOIN football.leagues league
+WHERE provider.code = 'policy-upgrade-provider' AND league.name = 'Policy upgrade competition';
+INSERT INTO football.seasons(league_id, start_year, label)
+SELECT id, 2023, '2023/24' FROM football.leagues WHERE name = 'Policy upgrade competition';
+INSERT INTO source.season_provider_refs(provider_id, league_external_id, external_season, season_id)
+SELECT provider.id, 'upgrade-league', 2023, season.id
+FROM source.providers provider
+JOIN source.league_provider_refs league_ref ON league_ref.provider_id = provider.id
+JOIN football.seasons season ON season.league_id = league_ref.league_id
+WHERE provider.code = 'policy-upgrade-provider' AND league_ref.external_id = 'upgrade-league'
+  AND season.label = '2023/24';
+SQL
+}
+
+assert_upgrade_mapping_preserved() {
+  local database="$1"
+  psql_db "$database" -Atc "SELECT count(*) FROM source.season_provider_refs ref
+    JOIN source.providers provider ON provider.id=ref.provider_id
+    JOIN football.seasons season ON season.id=ref.season_id
+    WHERE provider.code='policy-upgrade-provider' AND ref.league_external_id='upgrade-league'
+      AND ref.external_season=2023 AND season.label='2023/24'" | grep -qx '1'
+}
+
 mkdir -p "$SOCKET_DIR"
 fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$REDIS_SOCKET" "$CLEAN_DB" "$UPGRADE_DB"
 chown postgres:postgres "$WORK_DIR"
@@ -68,7 +100,9 @@ apply_policy_and_assertions "$CLEAN_DB"
 printf 'P02 additive upgrade from the previous schema...\n'
 fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$UPGRADE_DB"
 apply_prior_migrations "$UPGRADE_DB"
+seed_upgrade_mapping "$UPGRADE_DB"
 apply_policy_and_assertions "$UPGRADE_DB"
+assert_upgrade_mapping_preserved "$UPGRADE_DB"
 
 readonly TEST_DB_URL="postgresql://postgres@/$UPGRADE_DB?host=$SOCKET_DIR&port=$PORT"
 env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \

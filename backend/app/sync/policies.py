@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from re import fullmatch
 from typing import Any, Protocol, TypeVar
 
 from psycopg import Connection
@@ -35,6 +36,7 @@ class PolicyDenialReason(StrEnum):
     PAUSED = "paused"
     WORK_TYPE_NOT_ALLOWED = "work_type_not_allowed"
     COVERAGE_NOT_CONFIRMED = "coverage_not_confirmed"
+    INSTANCE_CHANGED = "instance_changed"
     VERSION_CHANGED = "version_changed"
 
 
@@ -50,6 +52,7 @@ class SyncPolicyDenied(RuntimeError):
 class CompetitionSyncPolicy:
     provider_id: int
     season_id: int
+    policy_instance_id: int
     enabled: bool
     allowed_work_types: frozenset[str]
     coverage: Mapping[str, CoverageObservation]
@@ -77,6 +80,7 @@ class SyncWorkRequest:
 @dataclass(frozen=True)
 class AuthorizedSyncWork:
     request: SyncWorkRequest
+    policy_instance_id: int
     policy_version: int
     coverage: CoverageObservation
     refresh_interval: RefreshInterval
@@ -95,10 +99,13 @@ def _coverage_from_json(value: object) -> dict[str, CoverageObservation]:
             raise ValueError("competition sync policy coverage is malformed")
         try:
             observed_on = item.get("observed_on")
-            if not isinstance(observed_on, str):
+            if not isinstance(observed_on, str) or fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", observed_on) is None:
+                raise ValueError
+            parsed_date = date.fromisoformat(observed_on)
+            if parsed_date.isoformat() != observed_on:
                 raise ValueError
             result[work_type] = CoverageObservation(
-                CoverageState(str(item.get("state"))), date.fromisoformat(observed_on)
+                CoverageState(str(item.get("state"))), parsed_date
             )
         except ValueError as exc:
             raise ValueError("competition sync policy coverage observation is malformed") from exc
@@ -114,7 +121,7 @@ def _intervals_from_json(value: object) -> dict[str, RefreshInterval]:
             raise ValueError("competition sync policy refresh interval is malformed")
         interval_value, unit = item.get("value"), item.get("unit")
         if not isinstance(interval_value, int) or isinstance(interval_value, bool) or interval_value < 1 or unit not in {
-            "minute", "hour", "day", "week"
+            "second", "minute", "hour", "day", "week"
         }:
             raise ValueError("competition sync policy refresh interval is malformed")
         result[work_type] = RefreshInterval(interval_value, unit)
@@ -129,22 +136,22 @@ class PostgresCompetitionSyncPolicyReader:
 
     def get(self, *, provider_id: int, season_id: int) -> CompetitionSyncPolicy | None:
         row = self._connection.execute(
-            """SELECT provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals,
+            """SELECT provider_id,season_id,policy_instance_id,enabled,allowed_work_types,coverage,refresh_intervals,
                       priority,history_depth_seasons,policy_version,paused_until
                  FROM ops.competition_sync_policies WHERE provider_id=%s AND season_id=%s""",
             (provider_id, season_id),
         ).fetchone()
         if row is None:
             return None
-        allowed_work_types = row[3]
+        allowed_work_types = row[4]
         if not isinstance(allowed_work_types, Sequence) or isinstance(allowed_work_types, str):
             raise ValueError("competition sync policy allowed work types are malformed")
         try:
             return CompetitionSyncPolicy(
-                provider_id=int(row[0]), season_id=int(row[1]), enabled=bool(row[2]),
+                provider_id=int(row[0]), season_id=int(row[1]), policy_instance_id=int(row[2]), enabled=bool(row[3]),
                 allowed_work_types=frozenset(str(value) for value in allowed_work_types),
-                coverage=_coverage_from_json(row[4]), refresh_intervals=_intervals_from_json(row[5]),
-                priority=int(row[6]), history_depth_seasons=int(row[7]), policy_version=int(row[8]), paused_until=row[9],
+                coverage=_coverage_from_json(row[5]), refresh_intervals=_intervals_from_json(row[6]),
+                priority=int(row[7]), history_depth_seasons=int(row[8]), policy_version=int(row[9]), paused_until=row[10],
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("competition sync policy row is malformed") from exc
@@ -159,15 +166,27 @@ class SyncPolicyGate:
         self._reader, self._now = reader, now
 
     def before_enqueue(self, request: SyncWorkRequest) -> AuthorizedSyncWork:
-        return self._authorize(request, expected_policy_version=None)
+        return self._authorize(request, expected_policy_instance_id=None, expected_policy_version=None)
 
     def before_execution(self, authorization: AuthorizedSyncWork) -> AuthorizedSyncWork:
-        return self._authorize(authorization.request, expected_policy_version=authorization.policy_version)
+        return self._authorize(
+            authorization.request,
+            expected_policy_instance_id=authorization.policy_instance_id,
+            expected_policy_version=authorization.policy_version,
+        )
 
-    def _authorize(self, request: SyncWorkRequest, *, expected_policy_version: int | None) -> AuthorizedSyncWork:
+    def _authorize(
+        self,
+        request: SyncWorkRequest,
+        *,
+        expected_policy_instance_id: int | None,
+        expected_policy_version: int | None,
+    ) -> AuthorizedSyncWork:
         policy = self._reader.get(provider_id=request.provider_id, season_id=request.season_id)
         if policy is None:
             raise SyncPolicyDenied(PolicyDenialReason.MISSING)
+        if expected_policy_instance_id is not None and policy.policy_instance_id != expected_policy_instance_id:
+            raise SyncPolicyDenied(PolicyDenialReason.INSTANCE_CHANGED)
         if expected_policy_version is not None and policy.policy_version != expected_policy_version:
             raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED)
         if not policy.enabled:
@@ -183,7 +202,7 @@ class SyncPolicyGate:
             interval = policy.refresh_intervals[request.work_type]
         except KeyError as exc:
             raise ValueError("allowed work type lacks a refresh interval") from exc
-        return AuthorizedSyncWork(request, policy.policy_version, coverage, interval)
+        return AuthorizedSyncWork(request, policy.policy_instance_id, policy.policy_version, coverage, interval)
 
 
 T = TypeVar("T")

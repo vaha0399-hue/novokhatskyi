@@ -16,6 +16,8 @@ from app.sync.policies import (
     SyncPolicyDenied,
     SyncPolicyGate,
     SyncWorkRequest,
+    _coverage_from_json,
+    _intervals_from_json,
 )
 
 
@@ -36,14 +38,14 @@ class MemoryReader:
 
 def _policy(**changes: object) -> CompetitionSyncPolicy:
     values: dict[str, object] = {
-        "provider_id": 7, "season_id": 42, "enabled": True,
+        "provider_id": 7, "season_id": 42, "policy_instance_id": 101, "enabled": True,
         "allowed_work_types": frozenset({"coverage_refresh", "fixtures_refresh"}),
         "coverage": {
             "coverage_refresh": CoverageObservation(CoverageState.UNKNOWN, date(2026, 9, 7)),
             "fixtures_refresh": CoverageObservation(CoverageState.COVERED, date(2026, 9, 7)),
         },
         "refresh_intervals": {
-            "coverage_refresh": RefreshInterval(6, "hour"),
+            "coverage_refresh": RefreshInterval(25, "second"),
             "fixtures_refresh": RefreshInterval(1, "hour"),
         },
         "priority": 0, "history_depth_seasons": 2, "policy_version": 1, "paused_until": None,
@@ -91,7 +93,7 @@ def test_unknown_or_negative_coverage_stays_observed_and_allows_an_explicit_fres
     gate, _ = _gate(_policy(coverage=coverage))
     authorization = gate.before_enqueue(COVERAGE_REQUEST)
     assert authorization.coverage == CoverageObservation(state, date(2026, 9, 7))
-    assert authorization.refresh_interval == RefreshInterval(6, "hour")
+    assert authorization.refresh_interval == RefreshInterval(25, "second")
 
 
 def test_execution_rereads_version_and_does_not_call_executor_after_disabling() -> None:
@@ -112,6 +114,31 @@ def test_execution_rejects_a_stale_version_even_when_changed_policy_stays_enable
     with pytest.raises(SyncPolicyDenied, match="version_changed"):
         PolicyCheckedExecutor(gate).execute(authorization, lambda value: called.append(value))
     assert called == []
+
+
+def test_execution_rejects_a_recreated_policy_instance_before_callback() -> None:
+    gate, reader = _gate(_policy())
+    authorization = gate.before_enqueue(COVERAGE_REQUEST)
+    reader.policy = replace(reader.policy, policy_instance_id=102, policy_version=1)  # type: ignore[arg-type]
+    called: list[object] = []
+    with pytest.raises(SyncPolicyDenied, match="instance_changed"):
+        PolicyCheckedExecutor(gate).execute(authorization, lambda value: called.append(value))
+    assert called == []
+
+
+@pytest.mark.parametrize("observed_on", ["20260908", "infinity", "tomorrow", "2026-02-30"])
+def test_python_coverage_reader_rejects_noncanonical_or_invalid_dates(observed_on: str) -> None:
+    with pytest.raises(ValueError, match="coverage observation"):
+        _coverage_from_json({"fixtures_refresh": {"state": "covered", "observed_on": observed_on}})
+
+
+def test_python_refresh_interval_reader_accepts_seconds_and_rejects_nonpositive_values() -> None:
+    assert _intervals_from_json({"coverage_refresh": {"value": 25, "unit": "second"}}) == {
+        "coverage_refresh": RefreshInterval(25, "second")
+    }
+    for value in (0, -1):
+        with pytest.raises(ValueError, match="refresh interval"):
+            _intervals_from_json({"coverage_refresh": {"value": value, "unit": "second"}})
 
 
 def test_execution_calls_executor_only_after_a_fresh_authorized_read() -> None:
