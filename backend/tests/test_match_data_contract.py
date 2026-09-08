@@ -7,8 +7,11 @@ import pytest
 from app.importer.match_data_contract import (
     MatchState,
     ObservationAction,
+    ObservationDecision,
     PollObservation,
+    PollProjection,
     PhaseTransitionAction,
+    ProviderPeriodSemantics,
     ResultKind,
     ResultObservation,
     ScorePair,
@@ -17,6 +20,7 @@ from app.importer.match_data_contract import (
     regulation_statistics_bucket,
     observation_action,
     observation_fingerprint,
+    decide_poll_observation,
     phase_transition_action,
     resolve_result,
     status_rule,
@@ -61,11 +65,11 @@ def test_unknown_status_is_never_silently_normalized() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "observation", "kind", "regulation", "eligible"),
+    ("status", "observation", "kind", "provider_fulltime", "eligible"),
     [
-        ("FT", ResultObservation(ScorePair(2, 1), ScorePair(2, 1), None, None), ResultKind.REGULATION, ScorePair(2, 1), True),
-        ("AET", ResultObservation(ScorePair(3, 2), ScorePair(2, 2), ScorePair(3, 2), None), ResultKind.AFTER_EXTRA_TIME, ScorePair(2, 2), True),
-        ("PEN", ResultObservation(ScorePair(1, 1), ScorePair(1, 1), None, ScorePair(5, 4)), ResultKind.PENALTY_SHOOTOUT, ScorePair(1, 1), True),
+        ("FT", ResultObservation(ScorePair(2, 1), ScorePair(2, 1), None, None), ResultKind.PROVIDER_FULLTIME, ScorePair(2, 1), False),
+        ("AET", ResultObservation(ScorePair(3, 2), ScorePair(2, 2), ScorePair(3, 2), None), ResultKind.AFTER_EXTRA_TIME, ScorePair(2, 2), False),
+        ("PEN", ResultObservation(ScorePair(1, 1), ScorePair(1, 1), None, ScorePair(5, 4)), ResultKind.PENALTY_SHOOTOUT, ScorePair(1, 1), False),
         ("AWD", ResultObservation(ScorePair(3, 0), None, None, None), ResultKind.ADMINISTRATIVE, None, False),
     ],
 )
@@ -73,13 +77,13 @@ def test_result_examples_preserve_each_provider_period(
     status: str,
     observation: ResultObservation,
     kind: ResultKind,
-    regulation: ScorePair | None,
+    provider_fulltime: ScorePair | None,
     eligible: bool,
 ) -> None:
     resolved = resolve_result(status, observation)
-    assert (resolved.kind, resolved.regulation_90, resolved.eligible_for_played_match_analytics) == (
+    assert (resolved.kind, resolved.provider_fulltime, resolved.eligible_for_regulation_90_analytics) == (
         kind,
-        regulation,
+        provider_fulltime,
         eligible,
     )
 
@@ -87,9 +91,9 @@ def test_result_examples_preserve_each_provider_period(
 def test_missing_fulltime_is_not_replaced_by_provider_overall_goals() -> None:
     resolved = resolve_result("FT", ResultObservation(ScorePair(4, 0), None, None, None))
     assert resolved.kind is ResultKind.UNRESOLVED
-    assert resolved.regulation_90 is None
+    assert resolved.provider_fulltime is None
     assert resolved.provider_overall == ScorePair(4, 0)
-    assert resolved.eligible_for_played_match_analytics is False
+    assert resolved.eligible_for_regulation_90_analytics is False
 
 
 def test_unknown_or_extra_time_statistics_never_enter_regulation_bucket() -> None:
@@ -170,3 +174,68 @@ def test_newer_terminal_to_live_observation_requires_review() -> None:
     current = _poll("FT", b'{"score":"1-0"}', 30, received)
     repair = _poll("SUSP", b'{"score":"1-0"}', 31, received + timedelta(seconds=1))
     assert observation_action(current, repair) is ObservationAction.REVIEW_CONFLICT
+
+
+@pytest.mark.parametrize("interruption", ["SUSP", "INT"])
+def test_interrupted_fixture_may_be_postponed(interruption: str) -> None:
+    assert phase_transition_action(interruption, "PST") is PhaseTransitionAction.ACCEPT
+
+
+def test_live_and_interruption_preserve_precise_phase_across_a_chain() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    start = PollProjection.from_observation(_poll("2H", b'{"score":"1-0"}', 1, received))
+    live = decide_poll_observation(start, _poll("LIVE", b'{"score":"1-0"}', 2, received + timedelta(seconds=1)))
+    assert live.action is ObservationAction.APPLY
+    assert live.next_projection.last_precise_phase == "2H"
+    regression = decide_poll_observation(live.next_projection, _poll("1H", b'{"score":"1-0"}', 3, received + timedelta(seconds=2)))
+    assert regression.action is ObservationAction.REVIEW_PHASE_REGRESSION
+    assert regression.next_projection.last_precise_phase == "2H"
+
+
+@pytest.mark.parametrize("interruption", ["SUSP", "INT"])
+def test_temporary_interruption_preserves_precise_phase(interruption: str) -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    start = PollProjection.from_observation(_poll("2H", b'{"score":"1-0"}', 1, received))
+    paused = decide_poll_observation(start, _poll(interruption, b'{"score":"1-0"}', 2, received + timedelta(seconds=1)))
+    regression = decide_poll_observation(paused.next_projection, _poll("1H", b'{"score":"1-0"}', 3, received + timedelta(seconds=2)))
+    assert paused.next_projection.last_precise_phase == "2H"
+    assert regression.action is ObservationAction.REVIEW_PHASE_REGRESSION
+
+
+def test_postponement_after_interruption_clears_precise_phase_memory() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    start = PollProjection.from_observation(_poll("2H", b'{"score":"1-0"}', 1, received))
+    suspended = decide_poll_observation(start, _poll("SUSP", b'{"score":"1-0"}', 2, received + timedelta(seconds=1)))
+    postponed = decide_poll_observation(suspended.next_projection, _poll("PST", b'{"score":"1-0"}', 3, received + timedelta(seconds=2)))
+    assert postponed.action is ObservationAction.APPLY
+    assert postponed.next_projection.last_precise_phase is None
+
+
+def test_extra_time_break_chain_keeps_and_advances_precise_phase() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    start = PollProjection.from_observation(_poll("ET", b'{"score":"2-2"}', 1, received))
+    break_time = decide_poll_observation(start, _poll("BT", b'{"score":"2-2"}', 2, received + timedelta(seconds=1)))
+    resumed = decide_poll_observation(break_time.next_projection, _poll("ET", b'{"score":"2-2","minute":105}', 3, received + timedelta(seconds=2)))
+    assert (break_time.action, resumed.action, resumed.next_projection.last_precise_phase) == (
+        ObservationAction.APPLY,
+        ObservationAction.APPLY,
+        "ET",
+    )
+
+
+def test_no_change_advances_processed_request_watermark() -> None:
+    received = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    first = PollProjection.from_observation(_poll("2H", b'{"score":"1-0"}', 1, received))
+    identical = decide_poll_observation(first, _poll("2H", b'{"score":"1-0"}', 3, received + timedelta(seconds=1)))
+    late_changed = decide_poll_observation(identical.next_projection, _poll("2H", b'{"score":"2-0"}', 2, received + timedelta(seconds=2)))
+    assert identical.action is ObservationAction.NO_CHANGE
+    assert identical.next_processed_request_sequence == 3
+    assert late_changed.action is ObservationAction.IGNORE_OLDER_REQUEST
+    assert late_changed.next_processed_request_sequence == 3
+
+
+def test_provider_fulltime_period_is_unconfirmed_and_not_eligible_for_90_minute_analytics() -> None:
+    resolved = resolve_result("FT", ResultObservation(ScorePair(2, 1), ScorePair(2, 1), None, None))
+    assert resolved.provider_fulltime == ScorePair(2, 1)
+    assert resolved.fulltime_period_semantics is ProviderPeriodSemantics.UNCONFIRMED
+    assert resolved.eligible_for_regulation_90_analytics is False

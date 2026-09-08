@@ -40,11 +40,17 @@ class StatusAction(StrEnum):
 
 
 class ResultKind(StrEnum):
-    REGULATION = "regulation"
+    PROVIDER_FULLTIME = "provider_fulltime"
     AFTER_EXTRA_TIME = "after_extra_time"
     PENALTY_SHOOTOUT = "penalty_shootout"
     ADMINISTRATIVE = "administrative"
     UNRESOLVED = "unresolved"
+
+
+class ProviderPeriodSemantics(StrEnum):
+    """Meaning of a provider score field when its temporal scope is unproven."""
+
+    UNCONFIRMED = "unconfirmed"
 
 
 class StatisticsPeriod(StrEnum):
@@ -104,11 +110,12 @@ class ResultObservation:
 @dataclass(frozen=True)
 class ResolvedResult:
     kind: ResultKind
-    regulation_90: ScorePair | None
+    provider_fulltime: ScorePair | None
+    fulltime_period_semantics: ProviderPeriodSemantics
     provider_overall: ScorePair | None
     provider_extratime: ScorePair | None
     penalty_shootout: ScorePair | None
-    eligible_for_played_match_analytics: bool
+    eligible_for_regulation_90_analytics: bool
 
 
 @dataclass(frozen=True)
@@ -135,6 +142,39 @@ class PollObservation:
             raise ValueError("content fingerprint must be a SHA-256 hex digest")
         if not isinstance(self.received_at, datetime) or self.received_at.tzinfo is None:
             raise ValueError("received_at must be timezone-aware")
+
+
+@dataclass(frozen=True)
+class PollProjection:
+    """Current snapshot plus per-fixture request watermark and precise phase."""
+
+    observation: PollObservation
+    processed_request_sequence: int
+    last_precise_phase: str | None
+
+    def __post_init__(self) -> None:
+        if self.processed_request_sequence < self.observation.request_sequence:
+            raise ValueError("processed request sequence cannot precede current observation")
+        if self.last_precise_phase is not None and self.last_precise_phase not in _PRECISE_PHASE_ORDER:
+            raise ValueError("last precise phase must be a documented precise phase")
+
+    @classmethod
+    def from_observation(cls, observation: PollObservation) -> PollProjection:
+        return cls(
+            observation=observation,
+            processed_request_sequence=observation.request_sequence,
+            last_precise_phase=_precise_phase(observation.provider_code),
+        )
+
+
+@dataclass(frozen=True)
+class ObservationDecision:
+    action: ObservationAction
+    next_projection: PollProjection
+
+    @property
+    def next_processed_request_sequence(self) -> int:
+        return self.next_projection.processed_request_sequence
 
 
 _RULES = (
@@ -171,26 +211,62 @@ def status_rule(provider_code: object) -> StatusRule:
 
 
 def resolve_result(provider_code: object, observed: ResultObservation) -> ResolvedResult:
-    """Classify score fields without treating a missing period as a zero.
-
-    ``score.fulltime`` is the only source for the 90-minute score, including
-    stoppage time.  ``goals``/``overall`` is never substituted into that
-    field.  Extra-time and shootout fields retain their provider labels; this
-    contract deliberately does not calculate an aggregate-round winner.
-    """
+    """Preserve provider score fields without assigning unconfirmed periods."""
     rule = status_rule(provider_code)
     if not rule.is_played_result:
         kind = ResultKind.ADMINISTRATIVE if rule.state is MatchState.ADMINISTRATIVE else ResultKind.UNRESOLVED
-        return ResolvedResult(kind, None, observed.overall, observed.extratime, observed.penalty, False)
+        return ResolvedResult(
+            kind,
+            None,
+            ProviderPeriodSemantics.UNCONFIRMED,
+            observed.overall,
+            observed.extratime,
+            observed.penalty,
+            False,
+        )
     if observed.fulltime is None:
-        return ResolvedResult(ResultKind.UNRESOLVED, None, observed.overall, observed.extratime, observed.penalty, False)
+        return ResolvedResult(
+            ResultKind.UNRESOLVED,
+            None,
+            ProviderPeriodSemantics.UNCONFIRMED,
+            observed.overall,
+            observed.extratime,
+            observed.penalty,
+            False,
+        )
     if provider_code == "FT":
         if observed.overall is not None and observed.overall != observed.fulltime:
-            return ResolvedResult(ResultKind.UNRESOLVED, observed.fulltime, observed.overall, observed.extratime, observed.penalty, False)
-        return ResolvedResult(ResultKind.REGULATION, observed.fulltime, observed.overall, observed.extratime, observed.penalty, True)
+            return ResolvedResult(
+                ResultKind.UNRESOLVED,
+                observed.fulltime,
+                ProviderPeriodSemantics.UNCONFIRMED,
+                observed.overall,
+                observed.extratime,
+                observed.penalty,
+                False,
+            )
+        return ResolvedResult(
+            ResultKind.PROVIDER_FULLTIME,
+            observed.fulltime,
+            ProviderPeriodSemantics.UNCONFIRMED,
+            observed.overall,
+            observed.extratime,
+            observed.penalty,
+            False,
+        )
     if provider_code == "AET":
-        return ResolvedResult(ResultKind.AFTER_EXTRA_TIME, observed.fulltime, observed.overall, observed.extratime, observed.penalty, True)
-    return ResolvedResult(ResultKind.PENALTY_SHOOTOUT, observed.fulltime, observed.overall, observed.extratime, observed.penalty, True)
+        kind = ResultKind.AFTER_EXTRA_TIME
+    else:
+        kind = ResultKind.PENALTY_SHOOTOUT
+    return ResolvedResult(
+        kind,
+        observed.fulltime,
+        ProviderPeriodSemantics.UNCONFIRMED,
+        observed.overall,
+        observed.extratime,
+        observed.penalty,
+        False,
+    )
 
 
 def regulation_statistics_bucket(period: StatisticsPeriod) -> StatisticsPeriod | None:
@@ -230,12 +306,14 @@ def phase_transition_action(previous_code: object, incoming_code: object) -> Pha
         return PhaseTransitionAction.REVIEW_CONFLICT
     if incoming.is_terminal:
         return PhaseTransitionAction.ACCEPT
+    if previous.provider_code in _INTERRUPTION_CODES:
+        return PhaseTransitionAction.ACCEPT
+    if incoming.provider_code in _INTERRUPTION_CODES:
+        return PhaseTransitionAction.ACCEPT
     if previous.provider_code in _SCHEDULE_CODES:
         return PhaseTransitionAction.ACCEPT
     if incoming.provider_code in _SCHEDULE_CODES:
         return PhaseTransitionAction.REVIEW_REGRESSION
-    if previous.provider_code in _INTERRUPTION_CODES or incoming.provider_code in _INTERRUPTION_CODES:
-        return PhaseTransitionAction.ACCEPT
     if incoming.provider_code == "LIVE":
         return PhaseTransitionAction.ACCEPT_AMBIGUOUS_LIVE
     if previous.provider_code == "LIVE":
@@ -251,24 +329,57 @@ def phase_transition_action(previous_code: object, incoming_code: object) -> Pha
     return PhaseTransitionAction.ACCEPT
 
 
-def observation_action(current: PollObservation, incoming: PollObservation) -> ObservationAction:
-    """Combine local request order, identity, then football phase semantics.
+def _precise_phase(provider_code: str) -> str | None:
+    return provider_code if provider_code in _PRECISE_PHASE_ORDER else None
 
-    A response from an earlier dispatched request is ignored even if it arrives
-    later.  Receipt time is intentionally absent from ordering.  Equal status
-    does not mean no change: only the same immutable content fingerprint does.
+
+def _next_precise_phase(current: PollProjection, incoming: PollObservation) -> str | None:
+    if incoming.provider_code in {"LIVE", "SUSP", "INT", "BT"}:
+        return current.last_precise_phase
+    if incoming.provider_code in _SCHEDULE_CODES or status_rule(incoming.provider_code).is_terminal:
+        return None
+    return _precise_phase(incoming.provider_code)
+
+
+def _with_watermark(projection: PollProjection, sequence: int) -> PollProjection:
+    return PollProjection(
+        observation=projection.observation,
+        processed_request_sequence=sequence,
+        last_precise_phase=projection.last_precise_phase,
+    )
+
+
+def decide_poll_observation(current: PollProjection, incoming: PollObservation) -> ObservationDecision:
+    """Decide a poll response and always return its next local watermark.
+
+    Receipt time is intentionally absent from freshness. Every response that is
+    not older than the watermark advances it, including ``NO_CHANGE`` and a
+    response rejected for review. This prevents an earlier in-flight request
+    from becoming acceptable after a newer one has already been handled.
     """
-    if incoming.request_sequence < current.request_sequence:
-        return ObservationAction.IGNORE_OLDER_REQUEST
-    if incoming.content_fingerprint == current.content_fingerprint:
-        return ObservationAction.NO_CHANGE
-    if incoming.request_sequence == current.request_sequence:
-        return ObservationAction.REVIEW_CONFLICT
-    if status_rule(current.provider_code).is_terminal and status_rule(incoming.provider_code).is_terminal:
-        return ObservationAction.APPLY_CORRECTION
-    phase = phase_transition_action(current.provider_code, incoming.provider_code)
+    if incoming.request_sequence < current.processed_request_sequence:
+        return ObservationDecision(ObservationAction.IGNORE_OLDER_REQUEST, current)
+    handled = _with_watermark(current, incoming.request_sequence)
+    if incoming.content_fingerprint == current.observation.content_fingerprint:
+        return ObservationDecision(ObservationAction.NO_CHANGE, handled)
+    if incoming.request_sequence == current.processed_request_sequence:
+        return ObservationDecision(ObservationAction.REVIEW_CONFLICT, handled)
+    if current.observation.provider_code in _INTERRUPTION_CODES and incoming.provider_code == "PST":
+        current_phase = current.observation.provider_code
+    else:
+        current_phase = current.last_precise_phase or current.observation.provider_code
+    if status_rule(current.observation.provider_code).is_terminal and status_rule(incoming.provider_code).is_terminal:
+        next_projection = PollProjection(incoming, incoming.request_sequence, _next_precise_phase(current, incoming))
+        return ObservationDecision(ObservationAction.APPLY_CORRECTION, next_projection)
+    phase = phase_transition_action(current_phase, incoming.provider_code)
     if phase is PhaseTransitionAction.REVIEW_REGRESSION:
-        return ObservationAction.REVIEW_PHASE_REGRESSION
+        return ObservationDecision(ObservationAction.REVIEW_PHASE_REGRESSION, handled)
     if phase is PhaseTransitionAction.REVIEW_CONFLICT:
-        return ObservationAction.REVIEW_CONFLICT
-    return ObservationAction.APPLY
+        return ObservationDecision(ObservationAction.REVIEW_CONFLICT, handled)
+    next_projection = PollProjection(incoming, incoming.request_sequence, _next_precise_phase(current, incoming))
+    return ObservationDecision(ObservationAction.APPLY, next_projection)
+
+
+def observation_action(current: PollObservation, incoming: PollObservation) -> ObservationAction:
+    """Compatibility shorthand for pairwise callers without projection state."""
+    return decide_poll_observation(PollProjection.from_observation(current), incoming).action
