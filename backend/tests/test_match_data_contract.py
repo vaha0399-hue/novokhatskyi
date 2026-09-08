@@ -18,7 +18,6 @@ from app.importer.match_data_contract import (
     StatisticsPeriod,
     StatusAction,
     regulation_statistics_bucket,
-    observation_action,
     observation_fingerprint,
     decide_poll_observation,
     phase_transition_action,
@@ -137,43 +136,51 @@ def test_identical_terminal_observation_is_no_change_by_content_not_status() -> 
     current = _poll("FT", b'{"goals":{"home":1,"away":0}}', 10, received)
     repeated = _poll("FT", b'{"goals":{"home":1,"away":0}}', 11, received + timedelta(seconds=1))
     corrected = _poll("FT", b'{"goals":{"home":2,"away":0}}', 12, received + timedelta(seconds=2))
-    assert observation_action(current, repeated) is ObservationAction.NO_CHANGE
-    assert observation_action(current, corrected) is ObservationAction.APPLY_CORRECTION
+    projection = PollProjection.from_observation(current)
+    repeated_decision = decide_poll_observation(projection, repeated)
+    corrected_decision = decide_poll_observation(repeated_decision.next_projection, corrected)
+    assert repeated_decision.action is ObservationAction.NO_CHANGE
+    assert corrected_decision.action is ObservationAction.APPLY_CORRECTION
 
 
 def test_newer_changed_terminal_status_is_also_a_result_correction() -> None:
     received = datetime(2026, 9, 8, 12, tzinfo=UTC)
     current = _poll("FT", b'{"score":"1-1"}', 10, received)
     corrected = _poll("AET", b'{"score":"2-1"}', 11, received + timedelta(seconds=1))
-    assert observation_action(current, corrected) is ObservationAction.APPLY_CORRECTION
+    decision = decide_poll_observation(PollProjection.from_observation(current), corrected)
+    assert decision.action is ObservationAction.APPLY_CORRECTION
 
 
 def test_late_response_from_an_older_dispatched_request_cannot_rollback_projection() -> None:
     received = datetime(2026, 9, 8, 12, tzinfo=UTC)
     newer_response = _poll("2H", b'{"score":"1-0"}', 8, received)
     older_response_arriving_later = _poll("1H", b'{"score":"0-0"}', 7, received + timedelta(seconds=5))
-    assert observation_action(newer_response, older_response_arriving_later) is ObservationAction.IGNORE_OLDER_REQUEST
+    decision = decide_poll_observation(PollProjection.from_observation(newer_response), older_response_arriving_later)
+    assert decision.action is ObservationAction.IGNORE_OLDER_REQUEST
 
 
 def test_same_request_sequence_with_different_content_requires_review() -> None:
     received = datetime(2026, 9, 8, 12, tzinfo=UTC)
     current = _poll("2H", b'{"score":"1-0"}', 8, received)
     conflicting_response = _poll("2H", b'{"score":"1-1"}', 8, received + timedelta(seconds=2))
-    assert observation_action(current, conflicting_response) is ObservationAction.REVIEW_CONFLICT
+    decision = decide_poll_observation(PollProjection.from_observation(current), conflicting_response)
+    assert decision.action is ObservationAction.REVIEW_CONFLICT
 
 
 def test_newer_phase_regression_requires_review_even_when_response_is_newer() -> None:
     received = datetime(2026, 9, 8, 12, tzinfo=UTC)
     current = _poll("ET", b'{"score":"2-2"}', 20, received)
     regression = _poll("2H", b'{"score":"1-1"}', 21, received + timedelta(seconds=1))
-    assert observation_action(current, regression) is ObservationAction.REVIEW_PHASE_REGRESSION
+    decision = decide_poll_observation(PollProjection.from_observation(current), regression)
+    assert decision.action is ObservationAction.REVIEW_PHASE_REGRESSION
 
 
 def test_newer_terminal_to_live_observation_requires_review() -> None:
     received = datetime(2026, 9, 8, 12, tzinfo=UTC)
     current = _poll("FT", b'{"score":"1-0"}', 30, received)
     repair = _poll("SUSP", b'{"score":"1-0"}', 31, received + timedelta(seconds=1))
-    assert observation_action(current, repair) is ObservationAction.REVIEW_CONFLICT
+    decision = decide_poll_observation(PollProjection.from_observation(current), repair)
+    assert decision.action is ObservationAction.REVIEW_CONFLICT
 
 
 @pytest.mark.parametrize("interruption", ["SUSP", "INT"])

@@ -378,8 +378,3 @@ def decide_poll_observation(current: PollProjection, incoming: PollObservation) 
         return ObservationDecision(ObservationAction.REVIEW_CONFLICT, handled)
     next_projection = PollProjection(incoming, incoming.request_sequence, _next_precise_phase(current, incoming))
     return ObservationDecision(ObservationAction.APPLY, next_projection)
-
-
-def observation_action(current: PollObservation, incoming: PollObservation) -> ObservationAction:
-    """Compatibility shorthand for pairwise callers without projection state."""
-    return decide_poll_observation(PollProjection.from_observation(current), incoming).action
