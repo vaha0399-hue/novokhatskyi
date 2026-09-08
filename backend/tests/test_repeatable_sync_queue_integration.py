@@ -234,3 +234,68 @@ def test_q03_fenced_lease_expiry_quarantine_and_conflicting_recovery() -> None:
         assert connection.execute("SELECT ops.retry_quarantined_repeatable_sync_work_item(%s)", (first,)).fetchone()[0] is True
         # A recovered version stays in history and remains executable; its sibling was never lost.
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE id IN (%s,%s)", (first, second)).fetchone()[0] == 2
+
+
+def test_q03_real_sessions_fence_old_owner_and_quarantine_attempt_limit() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id = int(setup.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-fence-{suffix}", "Q03 fence test")).fetchone()[0])
+        run_id = _run(setup, provider_id, f"q03-fence-{suffix}")
+        item_id, _ = _enqueue(setup, run_id, f"q03-fence:{suffix}", priority=10_000_000, execution_key=f"q03-fence:{suffix}")
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as first, psycopg.connect(TEST_DB_URL, autocommit=True) as second:
+        first_claim = first.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"same-{suffix}", "1 minute", 2)).fetchone()
+        assert first_claim is not None and int(first_claim[0]) == item_id
+        old_token = int(first_claim[-1])
+        # A live lease cannot be claimed by another real session.
+        other = second.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"other-{suffix}", "1 minute", 2)).fetchone()
+        assert other is None or int(other[0]) != item_id
+        assert first.execute("SELECT lease_owner,lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone() == (f"same-{suffix}", old_token)
+        second.execute("UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (item_id,))  # simulated stopped worker / expiry
+        second_claim = second.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"same-{suffix}", "1 minute", 2)).fetchone()
+        assert second_claim is not None and int(second_claim[0]) == item_id
+        new_token = int(second_claim[-1])
+        assert new_token != old_token
+        for function, args in (
+            ("heartbeat_repeatable_sync_work_item", (item_id, f"same-{suffix}", old_token, "1 minute")),
+            ("checkpoint_repeatable_sync_work_item", (item_id, f"same-{suffix}", old_token, Jsonb({"old": True}))),
+            ("complete_repeatable_sync_work_item", (item_id, f"same-{suffix}", old_token, Jsonb({}))),
+            ("requeue_repeatable_sync_work_item", (item_id, f"same-{suffix}", old_token, Jsonb({}), "old", "0 seconds", False)),
+        ):
+            placeholders = ",".join("%s" for _ in args)
+            assert first.execute(f"SELECT ops.{function}({placeholders})", args).fetchone()[0] is None
+        # The current short lease expires, reaches max attempts, and is preserved in quarantine.
+        second.execute("UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (item_id,))
+        second.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"third-{suffix}", "1 minute", 2)).fetchone()
+        row = second.execute("SELECT status,lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()
+        assert row[0] == "quarantined"
+        quarantined_token = int(row[1])
+        assert second.execute("SELECT ops.retry_quarantined_repeatable_sync_work_item(%s)", (item_id,)).fetchone()[0] is True
+        assert int(second.execute("SELECT lease_token FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0]) > quarantined_token
+
+
+def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_completion() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute("INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id", (f"q03-txn-{suffix}", "Q03 transaction test")).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-txn-{suffix}")
+        item_id, _ = _enqueue(connection, run_id, f"q03-txn:{suffix}", priority=11_000_000, execution_key=f"q03-txn:{suffix}")
+        claim = connection.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"txn-{suffix}", "1 minute", 3)).fetchone()
+        assert claim is not None and int(claim[0]) == item_id
+        token = int(claim[-1])
+        connection.execute("CREATE TEMP TABLE q03_atomic_marker(value text PRIMARY KEY)")
+        with pytest.raises(RuntimeError):
+            with connection.transaction():
+                assert connection.execute("SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)", (item_id, f"txn-{suffix}", token)).fetchone()[0] is True
+                connection.execute("INSERT INTO q03_atomic_marker VALUES('result')")
+                connection.execute("INSERT INTO q03_atomic_marker VALUES('dependent')")
+                raise RuntimeError("completion failed")
+        assert connection.execute("SELECT count(*) FROM q03_atomic_marker").fetchone()[0] == 0
+        assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item_id,)).fetchone()[0] == "running"
+        with connection.transaction():
+            assert connection.execute("SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)", (item_id, f"txn-{suffix}", token)).fetchone()[0] is True
+            connection.execute("INSERT INTO q03_atomic_marker VALUES('result')")
+            connection.execute("INSERT INTO q03_atomic_marker VALUES('dependent')")
+            assert connection.execute("SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)", (item_id, f"txn-{suffix}", token, Jsonb({}))).fetchone()[0] is True
+        assert connection.execute("SELECT count(*) FROM q03_atomic_marker").fetchone()[0] == 2

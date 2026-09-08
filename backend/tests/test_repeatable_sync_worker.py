@@ -9,6 +9,17 @@ class _Connection:
     def execute(self, query, params=None):
         return query, params
 
+    def transaction(self):
+        return _Transaction()
+
+
+class _Transaction:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
 
 def test_atomic_writer_capability_rejects_commit_rollback_close_and_connection_access() -> None:
     writer = AtomicWorkTransaction(_Connection())  # type: ignore[arg-type]
@@ -16,3 +27,5 @@ def test_atomic_writer_capability_rejects_commit_rollback_close_and_connection_a
     for forbidden in ("commit", "rollback", "close", "connection"):
         with pytest.raises(AttributeError):
             getattr(writer, forbidden)
+    with writer.transaction():
+        assert writer.execute("SELECT nested") == ("SELECT nested", None)
