@@ -1,0 +1,27 @@
+# Repeatable sync queue (Q02)
+
+`ops.sync_work_items` remains the only queue.  A periodic key is
+`periodic:type:provider:season:entity:window-start:window-end`; a recalculation
+key is `recalculation:type:provider:season:entity:input-version`.  The provider
+and canonical season are always included, so a completed key is permanent
+history and can never be enqueued again.  A later window or input version has a
+new key and therefore creates a new row.
+
+Periodic windows must be ordered, timezone-aware datetimes and are serialized
+in UTC, so equivalent offsets cannot create different identities.  Legacy
+run-scoped producers remain compatible: a trigger derives unique `legacy:<id>`
+keys for their omitted fields, while the Q02 repository creates repeatable
+work with explicit durable identities.  Runs owning work cannot be deleted
+(`ON DELETE RESTRICT`), preserving durable-key history.
+
+The Q02 repository checks Q01 policy before its database call.  Its default
+execution group is `entity:provider:season:entity`; a reviewed caller can
+supply a narrower conflict group.  Only one item in an execution group may be
+`running`; blocked versions stay `pending` and are claimed after the current
+writer finishes.
+
+Ready work is ordered by `priority + whole minutes waited`, then due time and
+ID.  Future work is never claimed.  This aging prevents a continuous stream of
+higher-priority work from starving an old ready item.  Scheduling missed time
+windows is intentionally Q05's responsibility; Q02 only deduplicates windows
+given to it and does not generate per-second catch-up work.
