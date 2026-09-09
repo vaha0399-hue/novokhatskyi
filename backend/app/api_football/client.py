@@ -91,8 +91,27 @@ class APIFootballClient:
         self, endpoint: str, *, params: Mapping[str, str | int] | None = None
     ) -> APIFootballResponse:
         """Make metered physical GETs; every internal retry reserves again."""
+        return await self._get(endpoint, params=params, max_5xx_retries=self._max_5xx_retries)
+
+    async def get_once(
+        self, endpoint: str, *, params: Mapping[str, str | int] | None = None
+    ) -> APIFootballResponse:
+        """Make exactly one metered physical GET.
+
+        Bounded importers own their retry accounting, so they use this method
+        even when a caller injects a normally configured client.
+        """
+        return await self._get(endpoint, params=params, max_5xx_retries=0)
+
+    async def _get(
+        self,
+        endpoint: str,
+        *,
+        params: Mapping[str, str | int] | None,
+        max_5xx_retries: int,
+    ) -> APIFootballResponse:
         normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        for attempt in range(self._max_5xx_retries + 1):
+        for attempt in range(max_5xx_retries + 1):
             # This is intentionally immediately before the transport call.  It
             # commits before a timeout/unknown outcome and is never released.
             await self._budget.reserve(self._budget_consumer)
@@ -101,7 +120,7 @@ class APIFootballClient:
             except httpx.HTTPError as error:
                 # An unknown outcome may have reached the provider; preserve
                 # the reservation and retry only after a bounded jitter delay.
-                if attempt < self._max_5xx_retries:
+                if attempt < max_5xx_retries:
                     await asyncio.sleep((2**attempt) + random.uniform(0, 1))
                     continue
                 raise APIFootballHTTPError(0) from error
@@ -110,7 +129,7 @@ class APIFootballClient:
             # A 429 consumes its pre-reserved slot then creates one shared
             # cooldown before this client exposes the failure to its caller.
             await self._budget.observe(response.status_code, safe_headers)
-            if response.status_code >= 500 and attempt < self._max_5xx_retries:
+            if response.status_code >= 500 and attempt < max_5xx_retries:
                 await asyncio.sleep((2**attempt) + random.uniform(0, 1))
                 continue
             break

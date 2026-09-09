@@ -14,6 +14,7 @@ from app.importer.season_bootstrap import CollectedBaseResponse
 from app.importer.season_sync import (
     APPROVED_LEAGUE_POLICIES,
     SeasonalLeaguePolicy,
+    SeasonalRunAcquisition,
     SeasonalSyncWorker,
     SeasonalWorkItem,
     discover_current_season,
@@ -68,9 +69,9 @@ class FakeRepository:
     rate_headers: list[dict[str, str]] = field(default_factory=list)
     _next: int = 0
 
-    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> int:
+    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> SeasonalRunAcquisition:
         assert tuple(policies) == tuple(self.policies)
-        return 55
+        return SeasonalRunAcquisition(55, acquired=True)
 
     def claim_next(self, run_id: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None:
         if self._next >= len(self.policies):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -11,7 +12,8 @@ import httpx
 
 from app.api_football import APIFootballClient
 from app.api_football.budget import APIFootballBudgetDenied, PostgresAPIFootballBudget
-from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy
+from app.importer import season_sync
+from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy, SeasonalSyncWorker
 TEST_DB_URL = os.environ.get("API_FOOTBALL_BUDGET_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="API_FOOTBALL_BUDGET_TEST_DB_URL is not configured")
 
@@ -38,13 +40,13 @@ def test_season_budget_defer_resumes_the_same_due_legacy_item_without_duplicatio
         if provider is None:
             setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
     with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-first") as first:
-        first_run = first.start_run([policy])
+        first_run = first.start_run([policy]).run_id
         item = first.claim_next(first_run, {policy.league_external_id: policy})
         assert item is not None
         first.defer(item, checkpoint={"outcome": "budget_pending"}, error="APIFootballBudgetDenied", delay_seconds=0)
         first.finish_run(first_run, status="failed", checkpoint={"outcome": "budget_pending"})
     with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-second") as second:
-        resumed_run = second.start_run([policy])
+        resumed_run = second.start_run([policy]).run_id
         resumed_item = second.claim_next(resumed_run, {policy.league_external_id: policy})
         assert resumed_run == first_run
         assert resumed_item is not None and resumed_item.id == item.id
@@ -52,6 +54,159 @@ def test_season_budget_defer_resumes_the_same_due_legacy_item_without_duplicatio
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
         assert verify.execute("SELECT count(*) FROM ops.sync_runs WHERE operation=%s", ("seasonal_active_bootstrap",)).fetchone() == (1,)
         assert verify.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (first_run,)).fetchone() == (1,)
+
+
+def test_overlapping_season_run_resume_and_start_share_one_real_postgres_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second connection must wait through the first resume transaction."""
+    assert TEST_DB_URL is not None
+    monkeypatch.setattr(season_sync, "OPERATION", f"seasonal_active_bootstrap_overlap_{uuid.uuid4().hex}")
+    policy = SeasonalLeaguePolicy(f"q04-overlap-{uuid.uuid4().hex}", 987655, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-overlap-seed") as seed:
+        failed_run = seed.start_run([policy]).run_id
+        item = seed.claim_next(failed_run, {policy.league_external_id: policy})
+        assert item is not None
+        seed.defer(item, checkpoint={"outcome": "budget_pending"}, error="APIFootballBudgetDenied", delay_seconds=0)
+        seed.finish_run(failed_run, status="failed", checkpoint={"outcome": "budget_pending"})
+
+    resumed = threading.Event()
+    release = threading.Event()
+    second_finished = threading.Event()
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    class BlockingConnection:
+        def __init__(self, connection: psycopg.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, statement: str, *args: object, **kwargs: object):
+            result = self._connection.execute(statement, *args, **kwargs)
+            if "UPDATE ops.sync_runs SET status='running'" in statement:
+                resumed.set()
+                assert release.wait(timeout=5)
+            return result
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    def resume() -> None:
+        try:
+            with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-overlap-resume") as repository:
+                repository._connection = BlockingConnection(repository._conn)  # type: ignore[assignment]
+                results.append(repository.start_run([policy]).run_id)
+        except BaseException as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    def start() -> None:
+        try:
+            with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-overlap-start") as repository:
+                results.append(repository.start_run([policy]).run_id)
+                second_finished.set()
+        except BaseException as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    first = threading.Thread(target=resume)
+    first.start()
+    assert resumed.wait(timeout=5)
+    second = threading.Thread(target=start)
+    second.start()
+    assert not second_finished.wait(timeout=0.2)
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not errors
+    assert results == [failed_run, failed_run]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT count(*) FROM ops.sync_runs run JOIN ops.sync_work_items item ON item.run_id=run.id "
+            "WHERE run.id=%s AND item.scope->>'policy'=%s",
+            (failed_run, policy.code),
+        ).fetchone() == (1,)
+
+
+def test_run_once_does_not_finish_another_workers_active_season_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A owns a leased job; B/C neither finish it nor create duplicate work."""
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_owner_{uuid.uuid4().hex}"
+    monkeypatch.setattr(season_sync, "OPERATION", operation)
+    policy = SeasonalLeaguePolicy(f"q04-owner-{uuid.uuid4().hex}", 987656, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    started = threading.Event()
+    release = threading.Event()
+    reports: list[object] = []
+    errors: list[BaseException] = []
+
+    class HoldingProvider:
+        async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+            assert endpoint == "/leagues" and params == {"id": policy.league_external_id}
+            started.set()
+            assert release.wait(timeout=5)
+            payload = {
+                "parameters": {"id": str(policy.league_external_id)},
+                "response": [{"league": {"id": policy.league_external_id, "type": "League"}, "seasons": []}],
+            }
+            raw = str(payload).encode()
+            return season_sync.APIFootballResponse(payload, raw, 200, {})
+
+        def response_contains_api_key(self, _body: bytes) -> bool:
+            return False
+
+    def run_a() -> None:
+        try:
+            with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-owner-a") as repository:
+                reports.append(asyncio.run(SeasonalSyncWorker(provider=HoldingProvider(), repository=repository, policies=[policy]).run_once()))
+        except BaseException as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    a = threading.Thread(target=run_a)
+    a.start()
+    assert started.wait(timeout=5)
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-owner-b") as repository_b:
+        b = asyncio.run(SeasonalSyncWorker(provider=HoldingProvider(), repository=repository_b, policies=[policy]).run_once())
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-owner-c") as repository_c:
+        c = asyncio.run(SeasonalSyncWorker(provider=HoldingProvider(), repository=repository_c, policies=[policy]).run_once())
+    assert b.status == c.status == "running"
+    assert b.provider_request_count == c.provider_request_count == 0
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        run_id, status = verify.execute(
+            "SELECT id,status FROM ops.sync_runs WHERE operation=%s", (operation,)
+        ).fetchone()
+        assert status == "running"
+        assert verify.execute(
+            "SELECT count(*) FROM ops.sync_runs WHERE operation=%s", (operation,)
+        ).fetchone() == (1,)
+        assert verify.execute(
+            "SELECT count(*) FROM ops.sync_work_items "
+            "WHERE run_id=%s AND status='running' AND lease_owner='q04-owner-a'", (run_id,)
+        ).fetchone() == (1,)
+        assert verify.execute(
+            "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)
+        ).fetchone() == (1,)
+
+    release.set()
+    a.join(timeout=5)
+    assert not a.is_alive()
+    assert not errors
+    assert len(reports) == 1 and reports[0].status == "succeeded"  # type: ignore[union-attr]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status FROM ops.sync_runs WHERE operation=%s", (operation,)
+        ).fetchone() == ("succeeded",)
+        assert verify.execute(
+            "SELECT item.status FROM ops.sync_work_items item JOIN ops.sync_runs run ON run.id=item.run_id "
+            "WHERE run.operation=%s", (operation,)
+        ).fetchone() == ("succeeded",)
 
 
 def test_budget_is_atomic_across_real_connections_and_enforces_each_share() -> None:
@@ -187,6 +342,27 @@ def test_positive_provider_remaining_is_a_shared_decreasing_cap_and_stale_header
         ).fetchone() == (1, 1)
         assert _reserve(connection, "operations")[:2] == (True, "reserved")
         assert _reserve(connection, "operations")[:2] == (False, "provider_daily_exhausted")
+
+
+def test_observe_binds_a_fresh_minute_cap_before_the_next_reservation() -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset(connection, daily=10, minute=10, operations=10, history=0, manual=0, reserve=0)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        # Model a request reserved before the boundary whose response returns
+        # after it, reporting one remaining provider request in the new minute.
+        connection.execute(
+            "UPDATE ops.api_football_budget_state SET minute_window=minute_window - interval '1 minute'"
+        )
+        connection.execute(
+            "SELECT ops.observe_api_football_budget(200,%s::jsonb)",
+            ('{"x-ratelimit-limit":"100","x-ratelimit-remaining":"1"}',),
+        )
+        assert connection.execute(
+            "SELECT minute_used,provider_minute_remaining FROM ops.api_football_budget_state"
+        ).fetchone() == (0, 1)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        assert _reserve(connection, "operations")[:2] == (False, "provider_minute_limit")
 
 
 @pytest.mark.parametrize(

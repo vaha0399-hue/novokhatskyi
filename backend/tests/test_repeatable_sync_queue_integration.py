@@ -195,7 +195,7 @@ def test_post_migration_cup_and_season_legacy_inserts_still_work() -> None:
         cup_run = cup.create_run([CupCompetition(900001, "Q02 Cup", 2026, True)], operation=CUP_OPERATION, policy_version=CUP_POLICY_VERSION)
         season = PostgresSeasonalSyncRepository("unused")
         season._connection, season._provider_id = connection, provider_id
-        season_run = season.start_run([SeasonalLeaguePolicy("q02-league", 900002, 2)])
+        season_run = season.start_run([SeasonalLeaguePolicy("q02-league", 900002, 2)]).run_id
         rows = connection.execute("SELECT run_id,stable_key,entity_key,execution_key FROM ops.sync_work_items WHERE run_id IN (%s,%s) ORDER BY run_id", (cup_run, season_run)).fetchall()
     assert len(rows) == 2
     assert all(all(str(value).startswith("legacy:") for value in row[1:]) for row in rows)

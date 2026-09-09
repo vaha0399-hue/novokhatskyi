@@ -901,6 +901,8 @@ def remote_verification(
 
 
 async def _fetch_once(client: APIFootballClient, target: FixtureTarget) -> APIFootballResponse:
+    if isinstance(client, APIFootballClient):
+        return await client.get_once(ENDPOINT, params=_params(target.external_id))
     return await client.get(ENDPOINT, params=_params(target.external_id))
 
 

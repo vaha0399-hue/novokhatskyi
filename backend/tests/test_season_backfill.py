@@ -3,9 +3,10 @@ import copy
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
-from app.api_football import APIFootballResponse
+from app.api_football import APIFootballClient, APIFootballResponse
 from app.api_football.errors import APIFootballHTTPError
 from app.importer import season_backfill
 from app.importer.season_backfill import (
@@ -58,6 +59,14 @@ class QueuedClient:
         return outcome
 
 
+class AllowBudget:
+    async def reserve(self, _consumer: str) -> None:
+        return None
+
+    async def observe(self, _status_code: int, _headers: object) -> None:
+        return None
+
+
 def test_real_season_sample_contract_and_batch_shape() -> None:
     response = sample_response()
     records = validate_fixture_season_response(
@@ -100,6 +109,28 @@ def test_importer_managed_retries_disable_client_retries(monkeypatch: pytest.Mon
     season_backfill._backfill_api_client()
 
     assert captured == {"budget_consumer": "operations", "max_5xx_retries": 0}
+
+
+def test_injected_default_client_cannot_multiply_season_backfill_http_attempts() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"errors": {}, "response": []})
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    client = APIFootballClient("test-secret", transport=httpx.MockTransport(handler), budget=AllowBudget())
+    try:
+        with pytest.raises(APIFootballHTTPError):
+            asyncio.run(
+                collect_fixture_season(client, record_failure=lambda _: None, sleep=no_sleep)
+            )
+    finally:
+        asyncio.run(client.aclose())
+    assert calls == MAX_API_ATTEMPTS
 
 
 def test_2025_scope_uses_its_own_params_and_validates_its_own_league_season() -> None:

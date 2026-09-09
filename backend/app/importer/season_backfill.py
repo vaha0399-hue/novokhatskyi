@@ -389,7 +389,10 @@ async def collect_fixture_season(
     for attempt in range(1, MAX_API_ATTEMPTS + 1):
         started_at = _utcnow()
         try:
-            response = await client.get("/fixtures", params=scope.request_params)
+            if isinstance(client, APIFootballClient):
+                response = await client.get_once("/fixtures", params=scope.request_params)
+            else:
+                response = await client.get("/fixtures", params=scope.request_params)
         except APIFootballHTTPError as error:
             received_at = _utcnow()
             failure = AttemptFailure(

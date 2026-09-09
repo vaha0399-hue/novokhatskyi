@@ -1,11 +1,15 @@
+import asyncio
 import copy
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 
+from app.api_football import APIFootballClient
+from app.api_football.errors import APIFootballHTTPError
 from app.importer.statistics_backfill import (
     DATASET_ATTEMPT_CAP,
     DEFAULT_RUN_ATTEMPT_CAP,
@@ -21,11 +25,20 @@ from app.importer.statistics_backfill import (
     map_statistics_block,
     run_statistics_backfill,
     acquire_context_and_lock,
+    _fetch_once,
 )
 from app.importer import statistics_backfill
 
 
 SAMPLE = Path(__file__).parents[2] / "samples" / "api-football" / "fixture-statistics.raw.json"
+
+
+class AllowBudget:
+    async def reserve(self, _consumer: str) -> None:
+        return None
+
+    async def observe(self, _status_code: int, _headers: object) -> None:
+        return None
 
 
 @pytest.fixture
@@ -69,6 +82,26 @@ def test_importer_managed_retries_disable_client_retries_and_keep_campaign_caps(
 
     assert captured == {"budget_consumer": "history", "max_5xx_retries": 0}
     assert (DEFAULT_RUN_ATTEMPT_CAP, DATASET_ATTEMPT_CAP, GLOBAL_RETRY_CAP) == (90, 385, 5)
+
+
+def test_injected_default_client_gets_one_physical_statistics_request_per_importer_attempt(
+    target: FixtureTarget,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"errors": {}, "response": []})
+
+    client = APIFootballClient("test-secret", transport=httpx.MockTransport(handler), budget=AllowBudget())
+    try:
+        for _ in range(2):
+            with pytest.raises(APIFootballHTTPError):
+                asyncio.run(_fetch_once(client, target))
+    finally:
+        asyncio.run(client.aclose())
+    assert calls == 2
 
 
 @pytest.mark.parametrize(

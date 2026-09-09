@@ -128,6 +128,14 @@ class SeasonalSyncReport:
     provider_request_count: int
 
 
+@dataclass(frozen=True)
+class SeasonalRunAcquisition:
+    """Whether this worker may claim and finish the returned run."""
+
+    run_id: int
+    acquired: bool
+
+
 class ProviderClient(Protocol):
     async def get(
         self, endpoint: str, *, params: Mapping[str, str | int] | None = None
@@ -137,7 +145,7 @@ class ProviderClient(Protocol):
 
 
 class SeasonalSyncRepository(Protocol):
-    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> int: ...
+    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> SeasonalRunAcquisition: ...
 
     def claim_next(self, run_id: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None: ...
 
@@ -198,47 +206,64 @@ class PostgresSeasonalSyncRepository:
             raise SeasonalSyncError("seasonal sync provider is not resolved")
         return self._provider_id
 
-    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> int:
+    def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> SeasonalRunAcquisition:
         # A quota-deferred legacy job belongs to its original run.  Resuming
         # that row preserves its attempts/checkpoint and prevents a duplicate
         # season scope when the next timer starts after ``available_at``.
-        prior = self._conn.execute(
-            """SELECT run.id FROM ops.sync_runs run
-               WHERE run.provider_id=%s AND run.operation=%s AND run.status='failed'
-                 AND EXISTS(SELECT 1 FROM ops.sync_work_items item
-                            WHERE item.run_id=run.id AND item.status='pending' AND item.job_type='legacy')
-               ORDER BY run.created_at DESC FOR UPDATE SKIP LOCKED LIMIT 1""",
-            (self._provider, OPERATION),
-        ).fetchone()
-        if prior is not None:
-            run_id = int(prior[0])
-            self._conn.execute("UPDATE ops.sync_runs SET status='running', finished_at=NULL WHERE id=%s", (run_id,))
-            return run_id
-        row = self._conn.execute(
-            """INSERT INTO ops.sync_runs(provider_id,operation,scope,status,started_at)
-               VALUES(%s,%s,%s,'running',clock_timestamp()) RETURNING id""",
-            (self._provider, OPERATION, Jsonb({"policy_version": POLICY_VERSION})),
-        ).fetchone()
-        assert row is not None
-        run_id = int(row[0])
-        for policy in policies:
+        # The transaction-scoped advisory lock serializes find/resume/create
+        # for this provider operation across independent timer processes.  A
+        # contender that waited for a resume/create sees the resulting running
+        # row and returns it instead of creating duplicate work.
+        with self._conn.transaction():
             self._conn.execute(
-                """INSERT INTO ops.sync_work_items(run_id,scope_key,scope)
-                   VALUES(%s,%s,%s)""",
-                (
-                    run_id,
-                    policy.scope_key,
-                    Jsonb(
-                        {
-                            "policy_version": POLICY_VERSION,
-                            "policy": policy.code,
-                            "league_external_id": policy.league_external_id,
-                            "expected_team_count": policy.expected_team_count,
-                        }
-                    ),
-                ),
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"seasonal-sync-run:{self._provider}:{OPERATION}",),
             )
-        return run_id
+            prior = self._conn.execute(
+                """SELECT run.id, run.status FROM ops.sync_runs run
+                   WHERE run.provider_id=%s AND run.operation=%s
+                     AND run.status IN ('failed', 'running')
+                     AND (run.status='running' OR EXISTS(
+                         SELECT 1 FROM ops.sync_work_items item
+                         WHERE item.run_id=run.id AND item.status='pending' AND item.job_type='legacy'
+                     ))
+                   ORDER BY (run.status='running') DESC, run.created_at DESC LIMIT 1""",
+                (self._provider, OPERATION),
+            ).fetchone()
+            if prior is not None:
+                run_id, status = int(prior[0]), str(prior[1])
+                if status == "failed":
+                    self._conn.execute(
+                        "UPDATE ops.sync_runs SET status='running', finished_at=NULL WHERE id=%s",
+                        (run_id,),
+                    )
+                    return SeasonalRunAcquisition(run_id, acquired=True)
+                return SeasonalRunAcquisition(run_id, acquired=False)
+            row = self._conn.execute(
+                """INSERT INTO ops.sync_runs(provider_id,operation,scope,status,started_at)
+                   VALUES(%s,%s,%s,'running',clock_timestamp()) RETURNING id""",
+                (self._provider, OPERATION, Jsonb({"policy_version": POLICY_VERSION})),
+            ).fetchone()
+            assert row is not None
+            run_id = int(row[0])
+            for policy in policies:
+                self._conn.execute(
+                    """INSERT INTO ops.sync_work_items(run_id,scope_key,scope)
+                       VALUES(%s,%s,%s)""",
+                    (
+                        run_id,
+                        policy.scope_key,
+                        Jsonb(
+                            {
+                                "policy_version": POLICY_VERSION,
+                                "policy": policy.code,
+                                "league_external_id": policy.league_external_id,
+                                "expected_team_count": policy.expected_team_count,
+                            }
+                        ),
+                    ),
+                )
+            return SeasonalRunAcquisition(run_id, acquired=True)
 
     def claim_next(self, run_id: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None:
         row = self._conn.execute(
@@ -502,7 +527,12 @@ class SeasonalSyncWorker:
         return SeasonalLeagueReport(policy.code, policy.league_external_id, "imported", season_start_year)
 
     async def run_once(self) -> SeasonalSyncReport:
-        run_id = self._repository.start_run(self._policies)
+        acquisition = self._repository.start_run(self._policies)
+        if not acquisition.acquired:
+            # A different process owns the active run.  It alone may claim its
+            # leased work or transition the run to a terminal status.
+            return SeasonalSyncReport(acquisition.run_id, "running", (), 0)
+        run_id = acquisition.run_id
         reports: list[SeasonalLeagueReport] = []
         terminal_status = "succeeded"
         try:
