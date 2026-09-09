@@ -50,6 +50,32 @@ class ApiCost(StrEnum):
 
 
 @dataclass(frozen=True)
+class FixtureScheduleSnapshot:
+    """Saved fixture facts required to calculate Section-7 deadlines.
+
+    Values are supplied by a read adapter; the scheduler never fetches or
+    normalizes football data itself.
+    """
+    fixture_id: int
+    provider_id: int
+    season_id: int
+    kickoff_at: datetime
+    lifecycle_state: str
+    terminal_observed_at: datetime | None = None
+    result_finalized_at: datetime | None = None
+    first_terminal_observed_at: datetime | None = None
+    statistics_eligible_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.fixture_id <= 0 or self.provider_id <= 0 or self.season_id <= 0:
+            raise ValueError("fixture, provider, and season ids must be positive")
+        _require_aware(self.kickoff_at, "fixture kickoff")
+        for value in (self.terminal_observed_at, self.result_finalized_at, self.first_terminal_observed_at, self.statistics_eligible_at):
+            if value is not None:
+                _require_aware(value, "fixture schedule timestamp")
+
+
+@dataclass(frozen=True)
 class PeriodicScheduleState:
     """Saved schedule progress, deliberately distinct from execution success.
 
@@ -164,6 +190,7 @@ class SyncScheduler:
         policies: Iterable[CompetitionSyncPolicy],
         schedule_state: Iterable[PeriodicScheduleState],
         executable_work_types: Iterable[str] | None = None,
+        fixtures: Iterable[FixtureScheduleSnapshot] = (),
     ) -> SchedulerPreview:
         _require_aware(now, "now")
         current = now.astimezone(UTC)
@@ -189,16 +216,65 @@ class SyncScheduler:
                 if decision.next_state is not None:
                     next_by_key[decision.next_state.key()] = decision.next_state
             for work_type in sorted(set(policy.allowed_work_types) - SUPPORTED_PERIODIC_WORK_TYPES):
+                if work_type in SECTION_7_WORK_TYPES:
+                    continue
                 decisions.append(SchedulerDecision(
                     scope={"provider_id": policy.provider_id, "season_id": policy.season_id, "work_type": work_type},
                     work_type=work_type, stable_key=None, deadline=None, priority=policy.priority,
-                    reason=(ScheduleDecisionReason.INPUT_UNAVAILABLE.value if work_type in SECTION_7_WORK_TYPES
-                            else ScheduleDecisionReason.NOT_IMPLEMENTED.value),
+                    reason=ScheduleDecisionReason.NOT_IMPLEMENTED.value,
                 ))
+
+        fixture_values = tuple(fixtures)
+        for policy in policy_by_scope.values():
+            if not any((item.provider_id, item.season_id) == (policy.provider_id, policy.season_id) for item in fixture_values):
+                for work_type in sorted(set(policy.allowed_work_types) & SECTION_7_WORK_TYPES):
+                    decisions.append(SchedulerDecision({"provider_id": policy.provider_id, "season_id": policy.season_id, "work_type": work_type}, work_type, None, None, policy.priority, ScheduleDecisionReason.INPUT_UNAVAILABLE.value))
+        for fixture in sorted(fixture_values, key=lambda item: (item.provider_id, item.season_id, item.fixture_id)):
+            policy = policy_by_scope.get((fixture.provider_id, fixture.season_id))
+            if policy is None:
+                continue
+            for work_type, deadline in self._fixture_deadlines(fixture, current):
+                if work_type not in policy.allowed_work_types:
+                    continue
+                try:
+                    gate.before_enqueue(SyncWorkRequest(fixture.provider_id, fixture.season_id, work_type))
+                except SyncPolicyDenied as error:
+                    decisions.append(SchedulerDecision({"fixture_id": fixture.fixture_id, "season_id": fixture.season_id}, work_type, None, deadline, policy.priority, error.reason.value))
+                    continue
+                work = self._fixture_work(policy, fixture, work_type, deadline)
+                reason = ScheduleDecisionReason.DUE.value if deadline <= current else ScheduleDecisionReason.NOT_DUE.value
+                if executable is not None and work_type not in executable:
+                    reason = ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+                decisions.append(SchedulerDecision(work.scope, work_type, work.stable_key(), deadline, policy.priority, reason, work, ApiCost.UNKNOWN))
 
         decisions.sort(key=lambda item: (int(item.scope["provider_id"]), int(item.scope["season_id"]), item.work_type))
         unknown_jobs = sum(item.work is not None and item.api_cost is ApiCost.UNKNOWN for item in decisions)
         return SchedulerPreview(tuple(decisions), tuple(sorted(next_by_key.values(), key=lambda item: item.key())), ApiCostEstimate(int(unknown_jobs)))
+
+    @staticmethod
+    def _fixture_deadlines(fixture: FixtureScheduleSnapshot, now: datetime) -> tuple[tuple[str, datetime], ...]:
+        kickoff = fixture.kickoff_at.astimezone(UTC)
+        values: list[tuple[str, datetime]] = [("schedule_near" if kickoff <= now + timedelta(days=7) else "schedule_far", now)]
+        if fixture.lifecycle_state in {"scheduled", "postponed"}:
+            values.extend((("prematch_check", kickoff - timedelta(minutes=60)), ("prematch_check", kickoff - timedelta(minutes=10))))
+        if fixture.lifecycle_state in {"in_progress", "paused", "suspended", "interrupted"}:
+            values.append(("live_refresh", now))
+        if fixture.lifecycle_state not in {"completed", "cancelled", "abandoned"} and now >= kickoff + timedelta(minutes=15):
+            values.append(("overdue_status_check", kickoff + timedelta(minutes=15)))
+        if fixture.terminal_observed_at is not None and fixture.result_finalized_at is None and now >= kickoff + timedelta(hours=3):
+            values.append(("result_finalization", max(kickoff + timedelta(hours=3), fixture.terminal_observed_at.astimezone(UTC))))
+        if fixture.statistics_eligible_at is not None:
+            values.append(("statistics_retry", fixture.statistics_eligible_at.astimezone(UTC)))
+        if fixture.first_terminal_observed_at is not None:
+            first = fixture.first_terminal_observed_at.astimezone(UTC)
+            values.extend((("correction_check", first + timedelta(hours=24)), ("correction_check", first + timedelta(hours=72))))
+        return tuple(values)
+
+    @staticmethod
+    def _fixture_work(policy: CompetitionSyncPolicy, fixture: FixtureScheduleSnapshot, work_type: str, deadline: datetime) -> PeriodicWork:
+        # A fixed one-second event window is a Q02 identity, never a launch-time key.
+        return PeriodicWork(policy.provider_id, policy.season_id, work_type, f"fixture:{fixture.fixture_id}", deadline - timedelta(seconds=1), deadline, policy.priority,
+                            {"provider_id": policy.provider_id, "season_id": policy.season_id, "fixture_id": fixture.fixture_id, "kickoff_at": fixture.kickoff_at.astimezone(UTC).isoformat(), "work_type": work_type})
 
     @staticmethod
     def _policies(policies: Iterable[CompetitionSyncPolicy]) -> dict[tuple[int, int], CompetitionSyncPolicy]:

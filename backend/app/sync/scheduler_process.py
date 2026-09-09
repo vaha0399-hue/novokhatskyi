@@ -11,7 +11,7 @@ from psycopg import Connection
 
 from app.sync.policies import CompetitionSyncPolicy, SyncPolicyDenied
 from app.sync.repository import LeasedWorkItem
-from app.sync.scheduler import PeriodicScheduleState, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
+from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
 from app.sync.scheduler_repository import PostgresSchedulerRepository, SchedulerEnqueueResult
 from app.sync.policies import AuthorizedSyncWork
 from app.sync.worker import AtomicWorkTransaction, WorkResult
@@ -39,13 +39,13 @@ class Q05SchedulerProcess:
         self._connection, self._repository, self._scheduler, self._handlers = connection, repository, scheduler, dict(handlers)
 
     def preview(self, *, now: datetime, policies: Iterable[CompetitionSyncPolicy],
-                schedule_state: Iterable[PeriodicScheduleState]) -> SchedulerPreview:
+                schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = ()) -> SchedulerPreview:
         return self._scheduler.preview(now=now, policies=policies, schedule_state=schedule_state,
-                                       executable_work_types=self._handlers)
+                                       executable_work_types=self._handlers, fixtures=fixtures)
 
     def enqueue_due(self, *, run_id: int, now: datetime, policies: Iterable[CompetitionSyncPolicy],
-                    schedule_state: Iterable[PeriodicScheduleState]) -> SchedulerRunResult:
-        preview = self.preview(now=now, policies=policies, schedule_state=schedule_state)
+                    schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = ()) -> SchedulerRunResult:
+        preview = self.preview(now=now, policies=policies, schedule_state=schedule_state, fixtures=fixtures)
         state_by_key = {state.key(): state for state in schedule_state}
         results: list[SchedulerEnqueueResult] = []
         denials: list[str] = []

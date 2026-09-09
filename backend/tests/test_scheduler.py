@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.sync.policies import CompetitionSyncPolicy, CoverageObservation, CoverageState, RefreshInterval
-from app.sync.scheduler import ApiCost, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
+from app.sync.scheduler import ApiCost, FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
 
 
 def _policy(*, provider_id: int = 7, season_id: int = 101, **changes: object) -> CompetitionSyncPolicy:
@@ -153,3 +153,16 @@ def test_preview_keeps_due_candidate_visible_when_handler_is_unavailable() -> No
     assert calendar.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
     assert calendar.next_state is None
     assert preview.planned_jobs == ()
+
+
+def test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler() -> None:
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    policy = _policy(allowed_work_types=frozenset({"schedule_near", "prematch_check", "overdue_status_check"}),
+                     coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("schedule_near", "prematch_check", "overdue_status_check")},
+                     refresh_intervals={name: RefreshInterval(1, "hour") for name in ("schedule_near", "prematch_check", "overdue_status_check")})
+    fixture = FixtureScheduleSnapshot(9, 7, 101, now + timedelta(minutes=30), "scheduled")
+    preview = SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[fixture], executable_work_types=())
+    checks = [item for item in preview.decisions if item.scope.get("fixture_id") == 9]
+    assert {item.work_type for item in checks} == {"schedule_near", "prematch_check"}
+    assert all(item.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value for item in checks)
+    assert all(item.stable_key is not None and item.deadline is not None for item in checks)
