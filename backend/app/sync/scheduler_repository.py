@@ -94,6 +94,19 @@ class PostgresSchedulerRepository:
         self._connection = connection
         self._gate = policy_gate
 
+    @staticmethod
+    def _raise_policy_denial(exc: psycopg.Error) -> None:
+        if exc.sqlstate != "55000":
+            raise exc
+        message = str(exc)
+        for marker, reason in (("policy no longer exists", PolicyDenialReason.MISSING),
+                               ("policy instance changed", PolicyDenialReason.INSTANCE_CHANGED),
+                               ("policy version changed", PolicyDenialReason.VERSION_CHANGED),
+                               ("policy changed since calculation", PolicyDenialReason.VERSION_CHANGED)):
+            if marker in message:
+                raise SyncPolicyDenied(reason) from exc
+        raise exc
+
     def enqueue_and_advance(
         self,
         *,
@@ -133,14 +146,7 @@ class PostgresSchedulerRepository:
                  next_state.last_scheduled_window_end, next_state.next_deadline),
             ).fetchone()
         except psycopg.Error as exc:
-            if exc.sqlstate == "55000":
-                message = str(exc)
-                if "policy instance changed" in message:
-                    raise SyncPolicyDenied(PolicyDenialReason.INSTANCE_CHANGED) from exc
-                if "policy version changed" in message:
-                    raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
-                raise SyncPolicyDenied(PolicyDenialReason.MISSING) from exc
-            raise
+            self._raise_policy_denial(exc)
         if row is None:
             raise RuntimeError("scheduler enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))
@@ -165,12 +171,7 @@ class PostgresSchedulerRepository:
                  work.provider_id, work.season_id),
             ).fetchone()
         except psycopg.Error as exc:
-            if exc.sqlstate == "55000":
-                message = str(exc)
-                if "policy instance changed" in message:
-                    raise SyncPolicyDenied(PolicyDenialReason.INSTANCE_CHANGED) from exc
-                raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
-            raise
+            self._raise_policy_denial(exc)
         if row is None:
             raise RuntimeError("scheduler event enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))
@@ -181,8 +182,6 @@ class PostgresSchedulerRepository:
             row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version))).fetchone()
         except psycopg.Error as exc:
-            if exc.sqlstate == "55000":
-                raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
-            raise
+            self._raise_policy_denial(exc)
         if row is None: raise RuntimeError("analytics enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]),bool(row[1]),bool(row[2]))
