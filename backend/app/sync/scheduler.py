@@ -317,10 +317,13 @@ class SyncScheduler:
             start = deadline - interval
         else:
             start = state.last_scheduled_window_end.astimezone(UTC)
-            # A shorter current policy must take effect at once.  Conversely,
-            # an already due persisted deadline remains authoritative, so a
-            # longer replacement cannot push it into the future.
-            deadline = min(state.next_deadline.astimezone(UTC), start + interval)
+            saved_deadline = state.next_deadline.astimezone(UTC)
+            # The first overdue deadline is already an accepted scheduling
+            # obligation. Changing an interval can accelerate only the next
+            # deadline after that window is enqueued; it cannot replace the
+            # overdue one. A shorter interval still takes effect immediately
+            # while the saved deadline is in the future.
+            deadline = saved_deadline if saved_deadline <= now else min(saved_deadline, start + interval)
         if deadline > now:
             work = self._work(policy, work_type, start, deadline, 1)
             return SchedulerDecision(work.scope, work_type, work.stable_key(), deadline, policy.priority, ScheduleDecisionReason.NOT_DUE.value)

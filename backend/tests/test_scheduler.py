@@ -108,6 +108,15 @@ def test_shorter_interval_does_not_wait_for_a_saved_future_deadline() -> None:
     assert result.deadline == datetime(2026, 9, 8, 1, tzinfo=UTC)
 
 
+def test_shorter_interval_preserves_an_overdue_deadline_and_only_accelerates_future_work() -> None:
+    state = _state("calendar_refresh", next_deadline=datetime(2026, 9, 8, 1, tzinfo=UTC))
+    policy = _policy(allowed_work_types=frozenset({"calendar_refresh"}), refresh_intervals={"calendar_refresh": RefreshInterval(30, "minute")})
+    result = _decision(SyncScheduler().preview(now=datetime(2026, 9, 8, 3, 5, tzinfo=UTC), policies=[policy], schedule_state=[state]), "calendar_refresh")
+    assert result.work is not None and result.next_state is not None
+    assert result.deadline == state.next_deadline
+    assert result.next_state.next_deadline == result.work.window_end + timedelta(minutes=30)
+
+
 def test_next_state_retains_not_due_and_denied_saved_scopes_unchanged() -> None:
     calendar = _state("calendar_refresh", next_deadline=datetime(2026, 9, 8, 3, tzinfo=UTC))
     standings = _state("standings_refresh", next_deadline=datetime(2026, 9, 8, 3, tzinfo=UTC))

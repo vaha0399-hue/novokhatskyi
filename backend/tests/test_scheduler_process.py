@@ -64,3 +64,22 @@ def test_registered_q03_compatible_handler_allows_only_enqueue_checkpoint_transi
     result = process.enqueue_due(run_id=4, now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()], schedule_state=[_state()])
     assert len(result.enqueue_results) == len(repository.calls) == connection.transactions == 1
     assert repository.calls[0]["expected_state"] == _state()
+
+
+def test_schedule_state_generator_is_materialized_before_preview_and_enqueue() -> None:
+    connection, repository = _Connection(), _Repository()
+    process = Q05SchedulerProcess(connection, repository, SyncScheduler(), {"calendar_refresh": _Handler()})
+    result = process.enqueue_due(
+        run_id=4, now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()],
+        schedule_state=(state for state in [_state()]),
+    )
+    assert len(result.enqueue_results) == 1
+    assert repository.calls[0]["expected_state"] == _state()
+
+
+def test_non_dispatch_object_does_not_make_a_handler_available() -> None:
+    connection, repository = _Connection(), _Repository()
+    process = Q05SchedulerProcess(connection, repository, SyncScheduler(), {"calendar_refresh": object()})  # type: ignore[dict-item]
+    result = process.enqueue_due(run_id=4, now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()], schedule_state=[_state()])
+    assert result.preview.decisions[0].reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+    assert repository.calls == [] and connection.transactions == 0

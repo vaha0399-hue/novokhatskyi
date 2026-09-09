@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from psycopg import Connection
 
@@ -17,11 +17,17 @@ from app.sync.policies import AuthorizedSyncWork
 from app.sync.worker import AtomicWorkTransaction, WorkResult
 
 
+@runtime_checkable
 class Q05Handler(Protocol):
     """The same callable pair required by ``RepeatableSyncWorker`` (Q03)."""
 
     def fetch(self, item: LeasedWorkItem, authorization: AuthorizedSyncWork) -> WorkResult: ...
     def apply_result(self, writer: AtomicWorkTransaction, item: LeasedWorkItem, result: WorkResult) -> None: ...
+
+
+def _is_q03_dispatch(handler: object) -> bool:
+    """A producer may enqueue only work that Q03 can actually dispatch."""
+    return isinstance(handler, Q05Handler) and callable(handler.fetch) and callable(handler.apply_result)
 
 
 @dataclass(frozen=True)
@@ -36,7 +42,8 @@ class Q05SchedulerProcess:
 
     def __init__(self, connection: Connection[Any], repository: PostgresSchedulerRepository,
                  scheduler: SyncScheduler, handlers: Mapping[str, Q05Handler]) -> None:
-        self._connection, self._repository, self._scheduler, self._handlers = connection, repository, scheduler, dict(handlers)
+        self._connection, self._repository, self._scheduler = connection, repository, scheduler
+        self._handlers = {work_type: handler for work_type, handler in handlers.items() if _is_q03_dispatch(handler)}
 
     def preview(self, *, now: datetime, policies: Iterable[CompetitionSyncPolicy],
                 schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = ()) -> SchedulerPreview:
@@ -45,8 +52,12 @@ class Q05SchedulerProcess:
 
     def enqueue_due(self, *, run_id: int, now: datetime, policies: Iterable[CompetitionSyncPolicy],
                     schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = ()) -> SchedulerRunResult:
-        preview = self.preview(now=now, policies=policies, schedule_state=schedule_state, fixtures=fixtures)
-        state_by_key = {state.key(): state for state in schedule_state}
+        # Preview and its transaction use precisely one materialized snapshot.
+        # In particular, a generator must not lose the expected checkpoint on
+        # its second traversal.
+        policy_values, state_values, fixture_values = tuple(policies), tuple(schedule_state), tuple(fixtures)
+        preview = self.preview(now=now, policies=policy_values, schedule_state=state_values, fixtures=fixture_values)
+        state_by_key = {state.key(): state for state in state_values}
         results: list[SchedulerEnqueueResult] = []
         denials: list[str] = []
         for decision in preview.decisions:
