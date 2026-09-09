@@ -304,7 +304,7 @@ def test_run_once_recovers_same_run_when_lease_lost_before_first_claim() -> None
         assert verify.execute("SELECT count(*) FROM ops.sync_runs WHERE operation=%s", (operation,)).fetchone() == (1,)
 
 
-def test_run_once_recovers_after_claim_when_lease_and_item_expire() -> None:
+def test_run_once_recovers_same_item_when_only_run_lease_expires() -> None:
     assert TEST_DB_URL is not None
     operation = f"seasonal_active_bootstrap_claim_lost_{uuid.uuid4().hex}"
     season_sync.OPERATION = operation
@@ -343,13 +343,15 @@ def test_run_once_recovers_after_claim_when_lease_and_item_expire() -> None:
         run_row = verify.execute("SELECT id FROM ops.sync_runs WHERE operation=%s", (operation,)).fetchone()
         assert run_row is not None
         run_id = run_row[0]
+        item_row = verify.execute(
+            "SELECT id,attempts,lease_expires_at > clock_timestamp() "
+            "FROM ops.sync_work_items WHERE run_id=%s AND status='running'",
+            (run_id,),
+        ).fetchone()
+        assert item_row is not None and item_row[1:] == (1, True)
+        item_id = int(item_row[0])
         verify.execute(
             "UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s",
-            (run_id,),
-        )
-        verify.execute(
-            "UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 minute' "
-            "WHERE run_id=%s AND status='running'",
             (run_id,),
         )
     b_reports: list[object] = []
@@ -373,6 +375,226 @@ def test_run_once_recovers_after_claim_when_lease_and_item_expire() -> None:
     assert b_reports[0].status == "succeeded"
     assert a_reports[0].status == "running"
     assert b_reports[0].run_id == a_reports[0].run_id
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT id,status,attempts FROM ops.sync_work_items WHERE run_id=%s", (run_id,)
+        ).fetchone() == (item_id, "succeeded", 2)
+
+
+def test_succeeded_run_rejects_pending_or_running_work_items() -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_unfinished_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policies = [
+        SeasonalLeaguePolicy(f"q04-unfinished-a-{uuid.uuid4().hex}", 987660, 2),
+        SeasonalLeaguePolicy(f"q04-unfinished-b-{uuid.uuid4().hex}", 987661, 2),
+    ]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-unfinished") as repository:
+        acquisition = repository.start_run(policies)
+        assert repository.claim_next(
+            acquisition.run_id, acquisition.run_token, {policy.league_external_id: policy for policy in policies}
+        ) is not None
+        with pytest.raises(season_sync.SeasonalSyncError, match="unfinished"):
+            repository.finish_run(
+                acquisition.run_id, acquisition.run_token, status="succeeded", checkpoint={"outcome": "invalid"}
+            )
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status FROM ops.sync_runs WHERE operation=%s", (operation,)
+        ).fetchone() == ("running",)
+
+
+def test_heartbeat_and_takeover_keep_the_successfully_renewed_run_lease() -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_heartbeat_race_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-heartbeat-race-{uuid.uuid4().hex}", 987662, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    renewed = threading.Event()
+    release = threading.Event()
+    heartbeat_result: list[bool] = []
+    takeover_result: list[object] = []
+
+    class PausingHeartbeatRepository(PostgresSeasonalSyncRepository):
+        def renew_run_lease(self, run_id: int, run_token: int) -> bool:
+            result = super().renew_run_lease(run_id, run_token)
+            renewed.set()
+            assert release.wait(timeout=5)
+            return result
+
+    with PausingHeartbeatRepository(TEST_DB_URL, lease_owner="q04-heartbeat-a") as first:
+        acquisition = first.start_run([policy])
+
+        def heartbeat() -> None:
+            heartbeat_result.append(first.renew_run_lease(acquisition.run_id, acquisition.run_token))
+
+        def takeover() -> None:
+            with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-heartbeat-b") as second:
+                takeover_result.append(second.start_run([policy]))
+
+        heartbeat_thread = threading.Thread(target=heartbeat)
+        heartbeat_thread.start()
+        assert renewed.wait(timeout=5)
+        takeover_thread = threading.Thread(target=takeover)
+        takeover_thread.start()
+        takeover_thread.join(timeout=5)
+        release.set()
+        heartbeat_thread.join(timeout=5)
+
+    assert heartbeat_result == [True]
+    assert len(takeover_result) == 1
+    contender = takeover_result[0]
+    assert contender.acquired is False  # type: ignore[union-attr]
+    assert contender.run_token == acquisition.run_token  # type: ignore[union-attr]
+
+
+def test_long_http_heartbeat_renews_without_holding_a_database_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    monkeypatch.setattr(season_sync, "RUN_LEASE_SECONDS", 4)
+    operation = f"seasonal_active_bootstrap_heartbeat_http_{uuid.uuid4().hex}"
+    monkeypatch.setattr(season_sync, "OPERATION", operation)
+    policy = SeasonalLeaguePolicy(f"q04-heartbeat-http-{uuid.uuid4().hex}", 987663, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    renewed = threading.Event()
+
+    class HeartbeatRepository(PostgresSeasonalSyncRepository):
+        def renew_run_lease(self, run_id: int, run_token: int) -> bool:
+            result = super().renew_run_lease(run_id, run_token)
+            if result:
+                renewed.set()
+            return result
+
+    class LongProvider:
+        def __init__(self, backend_pid: int) -> None:
+            self._backend_pid = backend_pid
+
+        async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+            assert endpoint == "/leagues" and params == {"id": policy.league_external_id}
+            for _ in range(40):
+                if renewed.is_set():
+                    break
+                await asyncio.sleep(0.05)
+            assert renewed.is_set()
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                state = observer.execute(
+                    "SELECT state, xact_start IS NULL FROM pg_stat_activity WHERE pid=%s", (self._backend_pid,)
+                ).fetchone()
+                assert state == ("idle", True)
+                lease_is_extended = observer.execute(
+                    "SELECT lease_expires_at > clock_timestamp() + interval '2 seconds' "
+                    "FROM ops.sync_runs WHERE operation=%s",
+                    (operation,),
+                ).fetchone()
+                assert lease_is_extended == (True,)
+            payload = {
+                "parameters": {"id": str(policy.league_external_id)},
+                "response": [{"league": {"id": policy.league_external_id, "type": "League"}, "seasons": []}],
+            }
+            return season_sync.APIFootballResponse(payload, str(payload).encode(), 200, {})
+
+        def response_contains_api_key(self, _body: bytes) -> bool:
+            return False
+
+    with HeartbeatRepository(TEST_DB_URL, lease_owner="q04-heartbeat-http") as repository:
+        provider = LongProvider(repository._conn.pgconn.backend_pid)
+        report = asyncio.run(SeasonalSyncWorker(provider=provider, repository=repository, policies=[policy]).run_once())
+    assert report.status == "succeeded"
+
+
+def test_lost_run_token_prevents_post_http_import_and_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_lost_result_{uuid.uuid4().hex}"
+    monkeypatch.setattr(season_sync, "OPERATION", operation)
+    policy = SeasonalLeaguePolicy(f"q04-lost-result-{uuid.uuid4().hex}", 987664, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    imported: list[object] = []
+    monkeypatch.setattr(season_sync, "import_active_base", lambda *_args, **_kwargs: imported.append(object()))
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-lost-result-a") as first:
+        acquisition_a = first.start_run([policy])
+        item = first.claim_next(acquisition_a.run_id, acquisition_a.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as expire:
+            expire.execute(
+                "UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s",
+                (acquisition_a.run_id,),
+            )
+        with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-lost-result-b") as second:
+            acquisition_b = second.start_run([policy])
+            assert acquisition_b.acquired and acquisition_b.run_token != acquisition_a.run_token
+        with pytest.raises(SeasonalRunLeaseLost, match="lost"):
+            first.import_verify_and_complete(
+                item,
+                acquisition_a.run_token,
+                scope=season_sync.ActiveSeasonScope(policy.league_external_id, 2027, policy.expected_fixture_count),
+                collected=(),
+                checkpoint={"outcome": "imported"},
+            )
+    assert imported == []
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,lease_owner,run_lease_token FROM ops.sync_work_items WHERE id=%s", (item.id,)
+        ).fetchone() == ("pending", None, 0)
+
+
+def test_post_http_import_verify_and_completion_rollback_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_atomic_finalize_{uuid.uuid4().hex}"
+    monkeypatch.setattr(season_sync, "OPERATION", operation)
+    policy = SeasonalLeaguePolicy(f"q04-atomic-finalize-{uuid.uuid4().hex}", 987665, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    def staged_import(connection: psycopg.Connection, **_kwargs: object) -> None:
+        connection.execute(
+            "UPDATE ops.sync_work_items SET checkpoint='{\"canonical_write\":true}'::jsonb WHERE id=%s",
+            (item.id,),
+        )
+
+    def failed_verify(*_args: object, **_kwargs: object) -> None:
+        raise season_sync.ActiveSeasonImportError("synthetic verification failure")
+
+    monkeypatch.setattr(season_sync, "import_active_base", staged_import)
+    monkeypatch.setattr(season_sync, "verify_active_season", failed_verify)
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-atomic-finalize") as repository:
+        acquisition = repository.start_run([policy])
+        item = repository.claim_next(acquisition.run_id, acquisition.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        with pytest.raises(season_sync.ActiveSeasonImportError, match="synthetic"):
+            repository.import_verify_and_complete(
+                item,
+                acquisition.run_token,
+                scope=season_sync.ActiveSeasonScope(policy.league_external_id, 2027, policy.expected_fixture_count),
+                collected=(),
+                checkpoint={"outcome": "imported"},
+            )
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,)
+        ).fetchone() == ("running", {})
 
 
 def test_finish_run_is_rejected_after_lease_takeover() -> None:

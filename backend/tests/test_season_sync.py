@@ -94,8 +94,17 @@ class FakeRepository:
     def observe_rate_limit(self, *, endpoint: str, headers: Mapping[str, str]) -> None:
         self.rate_headers.append(dict(headers))
 
-    def import_and_verify(self, *, scope: ActiveSeasonScope, collected: Sequence[CollectedBaseResponse]) -> None:
+    def import_verify_and_complete(
+        self,
+        item: SeasonalWorkItem,
+        run_token: int,
+        *,
+        scope: ActiveSeasonScope,
+        collected: Sequence[CollectedBaseResponse],
+        checkpoint: Mapping[str, Any],
+    ) -> None:
         self.imported.append(scope)
+        self.complete(item, run_token, checkpoint)
 
     def complete(self, item: SeasonalWorkItem, run_token: int, checkpoint: Mapping[str, Any]) -> None:
         self.complete_checkpoints.append(dict(checkpoint))

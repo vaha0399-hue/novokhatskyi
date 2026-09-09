@@ -166,8 +166,14 @@ class SeasonalSyncRepository(Protocol):
 
     def observe_rate_limit(self, *, endpoint: str, headers: Mapping[str, str]) -> None: ...
 
-    def import_and_verify(
-        self, *, scope: ActiveSeasonScope, collected: Sequence[CollectedBaseResponse]
+    def import_verify_and_complete(
+        self,
+        item: SeasonalWorkItem,
+        run_token: int,
+        *,
+        scope: ActiveSeasonScope,
+        collected: Sequence[CollectedBaseResponse],
+        checkpoint: Mapping[str, Any],
     ) -> None: ...
 
     def complete(self, item: SeasonalWorkItem, run_token: int, checkpoint: Mapping[str, Any]) -> None: ...
@@ -274,19 +280,21 @@ class PostgresSeasonalSyncRepository:
                 (f"seasonal-sync-run:{self._provider}:{OPERATION}",),
             )
             prior = self._conn.execute(
-                """SELECT run.id, run.status, run.lease_owner, run.lease_token, run.lease_expires_at
+                """SELECT run.id, run.status, run.lease_token,
+                          (run.status='running' AND run.lease_expires_at > clock_timestamp()) AS lease_is_live
                    FROM ops.sync_runs run
                    WHERE run.provider_id=%s AND run.operation=%s
                      AND run.status IN ('failed', 'running')
-                   ORDER BY (run.status='running') DESC, run.created_at DESC LIMIT 1""",
+                   ORDER BY (run.status='running') DESC, run.created_at DESC
+                   LIMIT 1
+                   FOR UPDATE""",
                 (self._provider, OPERATION),
             ).fetchone()
             if prior is not None:
                 run_id = int(prior[0])
                 status = str(prior[1])
-                existing_token = 0 if prior[3] is None else int(prior[3])
-                lease_expires_at = prior[4]
-                if status == "running" and lease_expires_at is not None and lease_expires_at > _now():
+                existing_token = 0 if prior[2] is None else int(prior[2])
+                if bool(prior[3]):
                     return SeasonalRunAcquisition(run_id=run_id, run_token=existing_token, acquired=False)
                 row = self._conn.execute(
                     """UPDATE ops.sync_runs SET status='running',
@@ -295,6 +303,7 @@ class PostgresSeasonalSyncRepository:
                        lease_expires_at=clock_timestamp() + (%s::interval),
                        finished_at=NULL
                        WHERE id=%s
+                         AND (status='failed' OR lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                        RETURNING lease_token""",
                     (
                         self._lease_owner,
@@ -302,8 +311,33 @@ class PostgresSeasonalSyncRepository:
                         run_id,
                     ),
                 ).fetchone()
-                assert row is not None
-                return SeasonalRunAcquisition(run_id=run_id, run_token=int(row[0]), acquired=True)
+                # The row remains locked for this transaction, but the expiry
+                # predicate is intentionally repeated in the UPDATE.  A
+                # successful heartbeat must never be overwritten by takeover.
+                if row is None:
+                    current = self._conn.execute(
+                        """SELECT lease_token
+                           FROM ops.sync_runs
+                           WHERE id=%s AND status='running' AND lease_expires_at > clock_timestamp()""",
+                        (run_id,),
+                    ).fetchone()
+                    if current is not None:
+                        return SeasonalRunAcquisition(run_id=run_id, run_token=int(current[0]), acquired=False)
+                    raise SeasonalSyncError("seasonal run changed while its lease was being acquired")
+                run_token = int(row[0])
+                if status == "running":
+                    # A run lease fences the process, not only the current HTTP
+                    # call.  On takeover every outstanding legacy item becomes
+                    # reclaimable in the same transaction as the new run token.
+                    # The row and its checkpoint/attempt history are preserved.
+                    self._conn.execute(
+                        """UPDATE ops.sync_work_items
+                           SET status='pending', available_at=clock_timestamp(),
+                               lease_owner=NULL, lease_expires_at=NULL, run_lease_token=0
+                           WHERE run_id=%s AND job_type='legacy' AND status='running'""",
+                        (run_id,),
+                    )
+                return SeasonalRunAcquisition(run_id=run_id, run_token=run_token, acquired=True)
             run_id, run_token = self._acquire_new_run(policies)
             return SeasonalRunAcquisition(run_id=run_id, run_token=run_token, acquired=True)
 
@@ -318,42 +352,69 @@ class PostgresSeasonalSyncRepository:
         ).fetchone()
         return row is not None
 
-    def claim_next(self, run_id: int, run_token: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None:
+    def _lock_owned_run(self, run_id: int, run_token: int) -> None:
         row = self._conn.execute(
-            """
-            WITH candidate AS (
-                SELECT item.id
-                FROM ops.sync_work_items AS item
-                JOIN ops.sync_runs run ON run.id=item.run_id
-                WHERE item.run_id=%s
-                  AND run.lease_owner=%s
-                  AND run.lease_token=%s
-                  AND run.lease_expires_at >= clock_timestamp()
-                  AND item.available_at <= clock_timestamp()
-                  AND item.job_type='legacy'
-                  AND (item.status='pending' OR (item.status='running' AND item.lease_expires_at < clock_timestamp()))
-                ORDER BY item.id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE ops.sync_work_items item
-            SET status='running',
-                attempts=item.attempts+1,
-                lease_owner=%s,
-                lease_expires_at=clock_timestamp()+(%s::interval),
-                started_at=coalesce(item.started_at, clock_timestamp()),
-                last_error=NULL
-            FROM candidate
-            WHERE item.id=candidate.id
-            RETURNING item.id, item.scope_key, item.scope, item.checkpoint, item.attempts""",
-            (
-                run_id,
-                self._lease_owner,
-                run_token,
-                self._lease_owner,
-                f"{LEASE_SECONDS} seconds",
-            ),
+            """SELECT status='running' AND lease_owner=%s AND lease_token=%s
+                         AND lease_expires_at > clock_timestamp()
+                FROM ops.sync_runs WHERE id=%s FOR UPDATE""",
+            (self._lease_owner, run_token, run_id),
         ).fetchone()
+        if row is None or row[0] is not True:
+            raise SeasonalRunLeaseLost("run lease was lost to another worker")
+
+    def _lock_owned_run_and_item(self, item: SeasonalWorkItem, run_token: int) -> None:
+        # Keep the lock order run -> item for takeover, completion and failure
+        # paths.  PostgreSQL evaluates the clock predicates after acquiring
+        # each row lock, so an expired owner cannot apply a late HTTP result.
+        run = self._conn.execute(
+            """SELECT run.id, run.status='running' AND run.lease_owner=%s AND run.lease_token=%s
+                         AND run.lease_expires_at > clock_timestamp()
+                FROM ops.sync_runs run
+                JOIN ops.sync_work_items item ON item.run_id=run.id
+                WHERE item.id=%s
+                FOR UPDATE OF run""",
+            (self._lease_owner, run_token, item.id),
+        ).fetchone()
+        if run is None or run[1] is not True:
+            raise SeasonalRunLeaseLost("run lease was lost before applying seasonal work")
+        locked_item = self._conn.execute(
+            """SELECT status='running' AND lease_owner=%s AND run_lease_token=%s
+                         AND lease_expires_at > clock_timestamp() AND job_type='legacy'
+                FROM ops.sync_work_items WHERE id=%s AND run_id=%s FOR UPDATE""",
+            (self._lease_owner, run_token, item.id, int(run[0])),
+        ).fetchone()
+        if locked_item is None or locked_item[0] is not True:
+            raise SeasonalRunLeaseLost("seasonal work item lease was lost before applying its result")
+
+    def claim_next(self, run_id: int, run_token: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None:
+        with self._conn.transaction():
+            self._lock_owned_run(run_id, run_token)
+            row = self._conn.execute(
+                """
+                WITH candidate AS (
+                    SELECT item.id
+                    FROM ops.sync_work_items AS item
+                    WHERE item.run_id=%s
+                      AND item.available_at <= clock_timestamp()
+                      AND item.job_type='legacy'
+                      AND (item.status='pending' OR (item.status='running' AND item.lease_expires_at < clock_timestamp()))
+                    ORDER BY item.id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE ops.sync_work_items item
+                SET status='running',
+                    attempts=item.attempts+1,
+                    lease_owner=%s,
+                    lease_expires_at=clock_timestamp()+(%s::interval),
+                    run_lease_token=%s,
+                    started_at=coalesce(item.started_at, clock_timestamp()),
+                    last_error=NULL
+                FROM candidate
+                WHERE item.id=candidate.id
+                RETURNING item.id, item.scope_key, item.scope, item.checkpoint, item.attempts""",
+                (run_id, self._lease_owner, f"{LEASE_SECONDS} seconds", run_token),
+            ).fetchone()
         if row is None:
             return None
         item_id, _scope_key, scope, _checkpoint, _attempts = row
@@ -397,49 +458,51 @@ class PostgresSeasonalSyncRepository:
             (self._provider, endpoint, Jsonb(dict(headers))),
         )
 
-    def import_and_verify(
-        self, *, scope: ActiveSeasonScope, collected: Sequence[CollectedBaseResponse]
-    ) -> None:
-        import_active_base(self._conn, collected=collected, scope=scope)
-        verify_active_season(self._conn, scope=scope)
-
     def complete(self, item: SeasonalWorkItem, run_token: int, checkpoint: Mapping[str, Any]) -> None:
-        row = self._conn.execute(
-            """
-            UPDATE ops.sync_work_items AS item
-            SET status='succeeded', checkpoint=%s, finished_at=clock_timestamp(),
-                lease_owner=NULL, lease_expires_at=NULL
-            FROM ops.sync_runs run
-            WHERE item.id=%s
-              AND item.status='running' AND item.lease_owner=%s
-              AND item.lease_expires_at >= clock_timestamp() AND item.job_type='legacy'
-              AND run.id=item.run_id
-              AND run.status='running' AND run.lease_owner=%s AND run.lease_token=%s
-              AND run.lease_expires_at >= clock_timestamp()
-            RETURNING true
-            """,
-            (Jsonb(dict(checkpoint)), item.id, self._lease_owner, self._lease_owner, run_token),
-        ).fetchone()
-        if row is None or row[0] is not True:
-            raise SeasonalRunLeaseLost("seasonal work item lease was lost before completion")
+        with self._conn.transaction():
+            self._lock_owned_run_and_item(item, run_token)
+            self._conn.execute(
+                """UPDATE ops.sync_work_items
+                   SET status='succeeded', checkpoint=%s, finished_at=clock_timestamp(),
+                       lease_owner=NULL, lease_expires_at=NULL, run_lease_token=0
+                   WHERE id=%s""",
+                (Jsonb(dict(checkpoint)), item.id),
+            )
+
+    def import_verify_and_complete(
+        self,
+        item: SeasonalWorkItem,
+        run_token: int,
+        *,
+        scope: ActiveSeasonScope,
+        collected: Sequence[CollectedBaseResponse],
+        checkpoint: Mapping[str, Any],
+    ) -> None:
+        # HTTP finished before this short transaction starts.  From here until
+        # completion the owning run and item remain locked and are revalidated
+        # with PostgreSQL time, so lost ownership rolls back canonical writes.
+        with self._conn.transaction():
+            self._lock_owned_run_and_item(item, run_token)
+            import_active_base(self._conn, collected=collected, scope=scope)
+            verify_active_season(self._conn, scope=scope)
+            self._conn.execute(
+                """UPDATE ops.sync_work_items
+                   SET status='succeeded', checkpoint=%s, finished_at=clock_timestamp(),
+                       lease_owner=NULL, lease_expires_at=NULL, run_lease_token=0
+                   WHERE id=%s""",
+                (Jsonb(dict(checkpoint)), item.id),
+            )
 
     def fail(self, item: SeasonalWorkItem, run_token: int, *, checkpoint: Mapping[str, Any], error: str) -> None:
-        cursor = self._conn.execute(
-            """
-            UPDATE ops.sync_work_items AS item
-               SET status='failed', checkpoint=%s, last_error=%s, finished_at=clock_timestamp(),
-                   lease_owner=NULL, lease_expires_at=NULL
-               FROM ops.sync_runs run
-               WHERE item.id=%s AND item.status='running' AND item.lease_owner=%s
-                 AND item.lease_expires_at >= clock_timestamp() AND item.job_type='legacy'
-                 AND run.id=item.run_id
-                 AND run.status='running' AND run.lease_owner=%s AND run.lease_token=%s
-                 AND run.lease_expires_at >= clock_timestamp()
-            """,
-            (Jsonb(dict(checkpoint)), error[:500], item.id, self._lease_owner, self._lease_owner, run_token),
-        )
-        if cursor.rowcount != 1:
-            raise SeasonalRunLeaseLost("seasonal work item lease was lost before failure recording")
+        with self._conn.transaction():
+            self._lock_owned_run_and_item(item, run_token)
+            self._conn.execute(
+                """UPDATE ops.sync_work_items
+                   SET status='failed', checkpoint=%s, last_error=%s, finished_at=clock_timestamp(),
+                       lease_owner=NULL, lease_expires_at=NULL, run_lease_token=0
+                   WHERE id=%s""",
+                (Jsonb(dict(checkpoint)), error[:500], item.id),
+            )
 
     def defer(
         self,
@@ -452,22 +515,16 @@ class PostgresSeasonalSyncRepository:
     ) -> None:
         if delay_seconds < 0:
             raise SeasonalSyncError("seasonal budget delay must be non-negative")
-        cursor = self._conn.execute(
-            """
-            UPDATE ops.sync_work_items AS item
-            SET status='pending', checkpoint=%s, last_error=%s,
-               available_at=clock_timestamp()+make_interval(secs=>%s), lease_owner=NULL, lease_expires_at=NULL
-            FROM ops.sync_runs run
-            WHERE item.id=%s AND item.status='running' AND item.lease_owner=%s AND item.lease_expires_at >= clock_timestamp()
-              AND item.job_type='legacy'
-              AND run.id=item.run_id
-              AND run.status='running' AND run.lease_owner=%s AND run.lease_token=%s
-              AND run.lease_expires_at >= clock_timestamp()
-            """,
-            (Jsonb(dict(checkpoint)), error[:500], delay_seconds, item.id, self._lease_owner, self._lease_owner, run_token),
-        )
-        if cursor.rowcount != 1:
-            raise SeasonalRunLeaseLost("seasonal work item lease was lost before budget deferral")
+        with self._conn.transaction():
+            self._lock_owned_run_and_item(item, run_token)
+            self._conn.execute(
+                """UPDATE ops.sync_work_items
+                   SET status='pending', checkpoint=%s, last_error=%s,
+                       available_at=clock_timestamp()+make_interval(secs=>%s),
+                       lease_owner=NULL, lease_expires_at=NULL, run_lease_token=0
+                   WHERE id=%s""",
+                (Jsonb(dict(checkpoint)), error[:500], delay_seconds, item.id),
+            )
 
     def pending_delay_seconds(self, run_id: int) -> float | None:
         row = self._conn.execute(
@@ -477,16 +534,24 @@ class PostgresSeasonalSyncRepository:
         return None if row is None or row[0] is None else max(0.0, float(row[0]))
 
     def finish_run(self, run_id: int, run_token: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
-        cursor = self._conn.execute(
-            """UPDATE ops.sync_runs
-               SET status=%s, checkpoint=%s, finished_at=clock_timestamp(),
-                   lease_owner=NULL, lease_token=0, lease_expires_at=NULL
-               WHERE id=%s AND status='running' AND lease_owner=%s AND lease_token=%s
-                 AND lease_expires_at >= clock_timestamp()""",
-            (status, Jsonb(dict(checkpoint)), run_id, self._lease_owner, run_token),
-        )
-        if cursor.rowcount != 1:
-            raise SeasonalRunLeaseLost("run lease was lost before completion")
+        with self._conn.transaction():
+            self._lock_owned_run(run_id, run_token)
+            if status == "succeeded":
+                item_statuses = self._conn.execute(
+                    """SELECT status FROM ops.sync_work_items
+                       WHERE run_id=%s AND job_type='legacy'
+                       FOR UPDATE""",
+                    (run_id,),
+                ).fetchall()
+                if any(str(row[0]) != "succeeded" for row in item_statuses):
+                    raise SeasonalSyncError("seasonal run has unfinished work items")
+            self._conn.execute(
+                """UPDATE ops.sync_runs
+                   SET status=%s, checkpoint=%s, finished_at=clock_timestamp(),
+                       lease_owner=NULL, lease_token=0, lease_expires_at=NULL
+                   WHERE id=%s""",
+                (status, Jsonb(dict(checkpoint)), run_id),
+            )
 
 
 def _now() -> datetime:
@@ -679,11 +744,14 @@ class SeasonalSyncWorker:
             return SeasonalLeagueReport(policy.code, policy.league_external_id, "not_ready", season_start_year, checkpoint["reason"])
         # This repeats the invariant validation inside import_active_base before any DML.
         validate_base_responses(collected, scope=scope)
-        self._assert_run_lease()
-        self._repository.import_and_verify(scope=scope, collected=collected)
-        self._assert_run_lease()
         checkpoint = {"outcome": "imported", "season_start_year": season_start_year}
-        self._repository.complete(item, run_token, checkpoint)
+        self._repository.import_verify_and_complete(
+            item,
+            run_token,
+            scope=scope,
+            collected=collected,
+            checkpoint=checkpoint,
+        )
         return SeasonalLeagueReport(policy.code, policy.league_external_id, "imported", season_start_year)
 
     async def run_once(self) -> SeasonalSyncReport:
