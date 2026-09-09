@@ -102,6 +102,7 @@ class AnalyticsInputSnapshot:
     observed_at: datetime
     coalescing_deadline: datetime | None = None
     window_fixture_id: int | None = None
+    window_identity: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.provider_id <= 0 or self.season_id <= 0 or not self.entity_key.strip():
@@ -111,6 +112,10 @@ class AnalyticsInputSnapshot:
             _require_aware(self.coalescing_deadline, "analytics coalescing deadline")
         if self.window_fixture_id is not None and self.window_fixture_id <= 0:
             raise ValueError("analytics window fixture id must be positive")
+        if self.window_identity is not None:
+            _require_aware(self.window_identity, "analytics window identity")
+        if (self.window_fixture_id is None) != (self.window_identity is None):
+            raise ValueError("analytics window fixture id and identity must be supplied together")
 
 
 @dataclass(frozen=True)
@@ -322,9 +327,9 @@ class SyncScheduler:
                     work_type, None, None, policy.priority, reason,
                 ))
 
-        latest_inputs: dict[tuple[int, int, str, datetime | None], AnalyticsInputSnapshot] = {}
+        latest_inputs: dict[tuple[int, int, str, datetime | None, datetime | None], AnalyticsInputSnapshot] = {}
         for item in analytics_inputs:
-            key = (item.provider_id, item.season_id, item.entity_key, item.coalescing_deadline)
+            key = (item.provider_id, item.season_id, item.entity_key, item.coalescing_deadline, item.window_identity)
             if key not in latest_inputs or item.observed_at > latest_inputs[key].observed_at:
                 latest_inputs[key] = item
         for item in latest_inputs.values():
@@ -339,8 +344,8 @@ class SyncScheduler:
             scope = {"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key, "input_version": item.input_version, "_sync_policy": _policy_fingerprint(policy, "analytics_recalculation")}
             if item.window_fixture_id is not None:
                 scope["_analytics_window_fixture_id"] = item.window_fixture_id
-            if item.coalescing_deadline is not None:
-                scope["_analytics_window_end"] = item.coalescing_deadline.astimezone(UTC).isoformat()
+                assert item.window_identity is not None
+                scope["_analytics_window_end"] = item.window_identity.astimezone(UTC).isoformat()
             work = RecalculationWork(item.provider_id, item.season_id, "analytics_recalculation", item.entity_key, item.input_version, policy.priority, scope)
             deadline = item.coalescing_deadline or _next_closed_boundary(item.observed_at.astimezone(UTC), timedelta(seconds=60))
             reason = ScheduleDecisionReason.DUE.value if deadline <= current else ScheduleDecisionReason.NOT_DUE.value

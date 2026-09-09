@@ -538,6 +538,44 @@ def test_q05_reader_handles_unknown_postponed_kickoff_and_saved_matchday() -> No
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
 
 
+def test_q05_colliding_analytics_identity_does_not_extend_the_source_deadline() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    original_at = datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=original_at + timedelta(days=1), observed_at=original_at)
+        original_fetch = _q05_fetch(connection, provider_id=provider_id, at=original_at)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (original_fetch, original_at, fixture_id))
+        first_due = datetime(2026, 9, 9, 12, 1, 0, 1, tzinfo=UTC)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: first_due)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        assert _q05_enqueue(process, run_id=run_id, now=first_due, snapshot=_q05_snapshot(first_due), provider_id=provider_id, season_id=season_id).enqueue_results[0].enqueued
+
+        late_at = datetime(2026, 9, 9, 12, 0, 40, tzinfo=UTC)
+        late_fetch = _q05_fetch(connection, provider_id=provider_id, at=late_at)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (late_fetch, late_at, fixture_id))
+        ordinary_at = datetime(2026, 9, 9, 12, 1, 10, tzinfo=UTC)
+        ordinary_fetch = _q05_fetch(connection, provider_id=provider_id, at=ordinary_at)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (ordinary_fetch, ordinary_at, fixture_id))
+
+        rows = connection.execute(
+            "SELECT window_end,deadline,latest_source_fetch_id,source_window_end FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s ORDER BY window_end",
+            (fixture_id,),
+        ).fetchall()
+        assert rows == [
+            (datetime(2026, 9, 9, 12, 1, tzinfo=UTC), datetime(2026, 9, 9, 12, 1, tzinfo=UTC), original_fetch, None),
+            (datetime(2026, 9, 9, 12, 2, tzinfo=UTC), datetime(2026, 9, 9, 12, 1, tzinfo=UTC), late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 3, tzinfo=UTC), datetime(2026, 9, 9, 12, 2, tzinfo=UTC), ordinary_fetch, datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+        ]
+        snapshot = _q05_snapshot(datetime(2026, 9, 9, 12, 1, 20, tzinfo=UTC))
+        pending = [item for item in snapshot.analytics_inputs if item.entity_key == f"fixture:{fixture_id}"]
+        assert [(item.input_version, item.coalescing_deadline, item.window_identity) for item in pending] == [
+            (late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC), datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+            (ordinary_fetch, datetime(2026, 9, 9, 12, 2, tzinfo=UTC), datetime(2026, 9, 9, 12, 3, tzinfo=UTC)),
+        ]
+
+
 def test_q05_reader_process_coalesces_sequential_analytics_versions_until_close() -> None:
     assert TEST_DB_URL is not None
     suffix, opened = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, 123456, tzinfo=UTC)
@@ -682,34 +720,41 @@ def test_q05_late_and_ordinary_windows_keep_distinct_versions_and_enqueue_once()
         late_observed = datetime(2026, 9, 9, 12, 0, 40, tzinfo=UTC)
         late_fetch = _q05_fetch(connection, provider_id=provider_id, at=late_observed)
         connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (late_fetch, late_observed, fixture_id))
-        late_deadline = datetime(2026, 9, 9, 12, 2, tzinfo=UTC)
+        late_identity = datetime(2026, 9, 9, 12, 2, tzinfo=UTC)
+        late_deadline = datetime(2026, 9, 9, 12, 1, tzinfo=UTC)
         assert connection.execute(
-            "SELECT window_end,latest_source_fetch_id,source_window_end FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s AND accepted_at IS NULL",
+            "SELECT window_end,deadline,latest_source_fetch_id,source_window_end FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s AND accepted_at IS NULL",
             (fixture_id,),
-        ).fetchone() == (late_deadline, late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC))
+        ).fetchone() == (late_identity, late_deadline, late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC))
 
         # Re-capturing the same canonical version neither shifts its deadline nor adds a row.
         connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (late_fetch, late_observed, fixture_id))
-        ordinary_observed = datetime(2026, 9, 9, 12, 1, 20, tzinfo=UTC)
-        ordinary_fetch = _q05_fetch(connection, provider_id=provider_id, at=ordinary_observed)
-        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (ordinary_fetch, ordinary_observed, fixture_id))
-        ordinary_deadline = datetime(2026, 9, 9, 12, 3, tzinfo=UTC)
-        windows = connection.execute(
-            "SELECT window_end,latest_source_fetch_id,source_window_end FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s ORDER BY window_end",
-            (fixture_id,),
-        ).fetchall()
-        assert windows == [
-            (datetime(2026, 9, 9, 12, 1, tzinfo=UTC), original_fetch, None),
-            (late_deadline, late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC)),
-            (ordinary_deadline, ordinary_fetch, datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
-        ]
 
-    # A fresh connection proves deadlines and versions survive restart.
+    # A fresh connection proves the late identity/deadline survives restart.
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
         late_run = late_deadline + timedelta(microseconds=201)
         process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: late_run)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
         late_result = _q05_enqueue(process, run_id=run_id, now=late_run, snapshot=_q05_snapshot(late_run), provider_id=provider_id, season_id=season_id)
         assert [item.enqueued for item in late_result.enqueue_results] == [True]
+
+        ordinary_observed = datetime(2026, 9, 9, 12, 1, 20, tzinfo=UTC)
+        ordinary_fetch = _q05_fetch(connection, provider_id=provider_id, at=ordinary_observed)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (ordinary_fetch, ordinary_observed, fixture_id))
+        ordinary_identity = datetime(2026, 9, 9, 12, 3, tzinfo=UTC)
+        ordinary_deadline = datetime(2026, 9, 9, 12, 2, tzinfo=UTC)
+        windows = connection.execute(
+            "SELECT window_end,deadline,latest_source_fetch_id,source_window_end FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s ORDER BY window_end",
+            (fixture_id,),
+        ).fetchall()
+        assert windows == [
+            (datetime(2026, 9, 9, 12, 1, tzinfo=UTC), datetime(2026, 9, 9, 12, 1, tzinfo=UTC), original_fetch, None),
+            (late_identity, late_deadline, late_fetch, datetime(2026, 9, 9, 12, 1, tzinfo=UTC)),
+            (ordinary_identity, ordinary_deadline, ordinary_fetch, datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+        ]
+
+    # The colliding ordinary window also survives restart and becomes due at
+    # its source deadline, not at its later storage identity.
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
         ordinary_run = ordinary_deadline + timedelta(microseconds=301)
         process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: ordinary_run)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
         ordinary_result = _q05_enqueue(process, run_id=run_id, now=ordinary_run, snapshot=_q05_snapshot(ordinary_run), provider_id=provider_id, season_id=season_id)
@@ -721,8 +766,8 @@ def test_q05_late_and_ordinary_windows_keep_distinct_versions_and_enqueue_once()
         ).fetchall()
         assert accepted_versions == [
             (datetime(2026, 9, 9, 12, 1, tzinfo=UTC), str(original_fetch)),
-            (late_deadline, str(late_fetch)),
-            (ordinary_deadline, str(ordinary_fetch)),
+            (late_identity, str(late_fetch)),
+            (ordinary_identity, str(ordinary_fetch)),
         ]
         queued_versions = connection.execute(
             "SELECT scope->>'input_version' FROM ops.sync_work_items WHERE run_id=%s AND job_type='analytics_recalculation' ORDER BY id",

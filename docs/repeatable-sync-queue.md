@@ -120,8 +120,9 @@ reported as `analytics_window_history_unavailable`; the scheduler does not
 invent a historical input sequence from the current latest value.
 If a version arrives for an already accepted source window, the trigger keeps
 that accepted row immutable and stores the latest late version in the next free
-durable window. Its deadline is fixed at capture time; ordinary and other late
-windows that collide with that slot spill forward without overwriting versions.
+durable identity. The persisted deadline remains the close of the source
+60-second window: identity collisions may move the storage key, but never delay
+enqueue eligibility or overwrite another version.
 
 ## Q03 leases
 

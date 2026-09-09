@@ -98,9 +98,9 @@ class PostgresSchedulerSnapshotReader:
             )
             for row in fixture_rows
         )
-        analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4], row[5], int(row[2])) for row in self._connection.execute(
+        analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4], row[5], int(row[2]), row[6]) for row in self._connection.execute(
             """SELECT ref.provider_id,fixture.season_id,fixture.id,analytics_window.latest_source_fetch_id,
-                      analytics_window.observed_at,analytics_window.window_end
+                      analytics_window.observed_at,analytics_window.deadline,analytics_window.window_end
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
                  JOIN ops.fixture_analytics_recalculation_windows analytics_window ON analytics_window.fixture_id=fixture.id
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
