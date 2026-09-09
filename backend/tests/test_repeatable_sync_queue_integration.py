@@ -402,7 +402,7 @@ def test_q03_direct_legacy_requeues_cannot_mutate_repeatable_work() -> None:
         with pytest.raises(CupQueueError):
             cup.requeue(CupWorkItem(repeatable_id, None, 1, {}), checkpoint={}, error="old", delay_seconds=0)  # type: ignore[arg-type]
         with pytest.raises(SeasonalSyncError):
-            season.fail(SeasonalWorkItem(repeatable_id, None), checkpoint={}, error="old")  # type: ignore[arg-type]
+            season.fail(SeasonalWorkItem(repeatable_id, None), run_token=0, checkpoint={}, error="old")  # type: ignore[arg-type]
         with pytest.raises(CatalogueBootstrapError):
             catalogue.requeue(WorkItem(repeatable_id, None, 1, {}), checkpoint={}, error="old", delay_seconds=0)  # type: ignore[arg-type]
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (repeatable_id,)).fetchone()[0] == "running"
@@ -411,9 +411,14 @@ def test_q03_direct_legacy_requeues_cannot_mutate_repeatable_work() -> None:
         cup.requeue(CupWorkItem(legacy_id, None, 1, {}), checkpoint={}, error="legacy", delay_seconds=0)  # type: ignore[arg-type]
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (legacy_id,)).fetchone()[0] == "pending"
         connection.execute("UPDATE ops.sync_work_items SET status='succeeded' WHERE id=%s", (legacy_id,))
+        connection.execute(
+            "UPDATE ops.sync_runs SET status='running', lease_owner=%s, lease_token=0, lease_expires_at=clock_timestamp()+interval '1 minute' "
+            "WHERE id=(SELECT run_id FROM ops.sync_work_items WHERE id=%s)",
+            (f"owner-{suffix}", legacy_id),
+        )
         season_legacy = int(connection.execute("INSERT INTO ops.sync_work_items(run_id,scope_key,scope) VALUES(%s,%s,%s) RETURNING id", (run_id, f"legacy-season-{suffix}", Jsonb({}))).fetchone()[0])
         assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, f"owner-{suffix}", "1 minute")).fetchone() is not None
-        season.fail(SeasonalWorkItem(season_legacy, None), checkpoint={}, error="legacy")  # type: ignore[arg-type]
+        season.fail(SeasonalWorkItem(season_legacy, None), run_token=0, checkpoint={}, error="legacy")  # type: ignore[arg-type]
         assert connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (season_legacy,)).fetchone()[0] == "failed"
         catalogue_legacy = int(connection.execute("INSERT INTO ops.sync_work_items(run_id,scope_key,scope) VALUES(%s,%s,%s) RETURNING id", (run_id, f"legacy-catalogue-{suffix}", Jsonb({}))).fetchone()[0])
         assert connection.execute("SELECT * FROM ops.claim_next_sync_work_item(%s,%s,%s)", (run_id, f"owner-{suffix}", "1 minute")).fetchone() is not None

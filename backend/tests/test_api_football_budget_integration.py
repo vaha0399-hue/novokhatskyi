@@ -4,6 +4,7 @@ import os
 import threading
 import asyncio
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -13,7 +14,12 @@ import httpx
 from app.api_football import APIFootballClient
 from app.api_football.budget import APIFootballBudgetDenied, PostgresAPIFootballBudget
 from app.importer import season_sync
-from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy, SeasonalSyncWorker
+from app.importer.season_sync import (
+    PostgresSeasonalSyncRepository,
+    SeasonalLeaguePolicy,
+    SeasonalRunLeaseLost,
+    SeasonalSyncWorker,
+)
 TEST_DB_URL = os.environ.get("API_FOOTBALL_BUDGET_TEST_DB_URL")
 pytestmark = pytest.mark.skipif(not TEST_DB_URL, reason="API_FOOTBALL_BUDGET_TEST_DB_URL is not configured")
 
@@ -40,14 +46,22 @@ def test_season_budget_defer_resumes_the_same_due_legacy_item_without_duplicatio
         if provider is None:
             setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
     with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-first") as first:
-        first_run = first.start_run([policy]).run_id
-        item = first.claim_next(first_run, {policy.league_external_id: policy})
+        first_acquisition = first.start_run([policy])
+        first_run = first_acquisition.run_id
+        item = first.claim_next(first_run, first_acquisition.run_token, {policy.league_external_id: policy})
         assert item is not None
-        first.defer(item, checkpoint={"outcome": "budget_pending"}, error="APIFootballBudgetDenied", delay_seconds=0)
-        first.finish_run(first_run, status="failed", checkpoint={"outcome": "budget_pending"})
+        first.defer(
+            item,
+            first_acquisition.run_token,
+            checkpoint={"outcome": "budget_pending"},
+            error="APIFootballBudgetDenied",
+            delay_seconds=0,
+        )
+        first.finish_run(first_run, first_acquisition.run_token, status="failed", checkpoint={"outcome": "budget_pending"})
     with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-second") as second:
-        resumed_run = second.start_run([policy]).run_id
-        resumed_item = second.claim_next(resumed_run, {policy.league_external_id: policy})
+        second_acquisition = second.start_run([policy])
+        resumed_run = second_acquisition.run_id
+        resumed_item = second.claim_next(resumed_run, second_acquisition.run_token, {policy.league_external_id: policy})
         assert resumed_run == first_run
         assert resumed_item is not None and resumed_item.id == item.id
         assert second.pending_delay_seconds(resumed_run) is None
@@ -68,11 +82,23 @@ def test_overlapping_season_run_resume_and_start_share_one_real_postgres_run(
         if provider is None:
             setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
     with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-overlap-seed") as seed:
-        failed_run = seed.start_run([policy]).run_id
-        item = seed.claim_next(failed_run, {policy.league_external_id: policy})
+        failed_acquisition = seed.start_run([policy])
+        failed_run = failed_acquisition.run_id
+        item = seed.claim_next(failed_run, failed_acquisition.run_token, {policy.league_external_id: policy})
         assert item is not None
-        seed.defer(item, checkpoint={"outcome": "budget_pending"}, error="APIFootballBudgetDenied", delay_seconds=0)
-        seed.finish_run(failed_run, status="failed", checkpoint={"outcome": "budget_pending"})
+        seed.defer(
+            item,
+            failed_acquisition.run_token,
+            checkpoint={"outcome": "budget_pending"},
+            error="APIFootballBudgetDenied",
+            delay_seconds=0,
+        )
+        seed.finish_run(
+            failed_run,
+            failed_acquisition.run_token,
+            status="failed",
+            checkpoint={"outcome": "budget_pending"},
+        )
 
     resumed = threading.Event()
     release = threading.Event()
@@ -207,6 +233,176 @@ def test_run_once_does_not_finish_another_workers_active_season_run(
             "SELECT item.status FROM ops.sync_work_items item JOIN ops.sync_runs run ON run.id=item.run_id "
             "WHERE run.operation=%s", (operation,)
         ).fetchone() == ("succeeded",)
+
+
+def test_run_once_recovers_same_run_when_lease_lost_before_first_claim() -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_preclaim_lost_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-preclaim-{uuid.uuid4().hex}", 987657, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    ready = threading.Event()
+    release = threading.Event()
+    a_reports: list[object] = []
+
+    class NeverCalledProvider:
+        async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+            raise AssertionError(f"provider should not be used when claim is blocked: {endpoint}")
+
+        def response_contains_api_key(self, _body: bytes) -> bool:
+            return False
+
+    class ClaimBlockingRepository(PostgresSeasonalSyncRepository):
+        def claim_next(
+            self, run_id: int, run_token: int, policies: Mapping[int, SeasonalLeaguePolicy]
+        ) -> season_sync.SeasonalWorkItem | None:
+            ready.set()
+            assert release.wait(timeout=10)
+            return super().claim_next(run_id, run_token, policies)
+
+    def run_a() -> None:
+        try:
+            with ClaimBlockingRepository(TEST_DB_URL, lease_owner="q04-preclaim-a") as repository:
+                a_reports.append(asyncio.run(SeasonalSyncWorker(provider=NeverCalledProvider(), repository=repository, policies=[policy]).run_once()))
+        except BaseException:
+            a_reports.append(None)
+
+    thread_a = threading.Thread(target=run_a)
+    thread_a.start()
+    assert ready.wait(timeout=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        run_row = verify.execute("SELECT id FROM ops.sync_runs WHERE operation=%s", (operation,)).fetchone()
+        assert run_row is not None
+        run_id = run_row[0]
+        verify.execute("UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s", (run_id,))
+    b_result = []
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-preclaim-b") as repository_b:
+        class FastProvider:
+            async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+                payload = {
+                    "parameters": {"id": str(policy.league_external_id)},
+                    "response": [{"league": {"id": policy.league_external_id, "type": "League"}, "seasons": []}],
+                }
+                raw = str(payload).encode()
+                return season_sync.APIFootballResponse(payload, raw, 200, {})
+
+            def response_contains_api_key(self, _body: bytes) -> bool:
+                return False
+
+        b_result.append(asyncio.run(SeasonalSyncWorker(provider=FastProvider(), repository=repository_b, policies=[policy]).run_once()))
+    release.set()
+    thread_a.join(timeout=5)
+    assert len(a_reports) == 1
+    assert a_reports[0].status == "running"  # type: ignore[union-attr]
+    assert b_result[0].status == "succeeded"  # type: ignore[index]
+    assert b_result[0].run_id == run_id
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute("SELECT count(*) FROM ops.sync_runs WHERE operation=%s", (operation,)).fetchone() == (1,)
+
+
+def test_run_once_recovers_after_claim_when_lease_and_item_expire() -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_claim_lost_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-claimlost-{uuid.uuid4().hex}", 987658, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    claim_started = threading.Event()
+    continue_provider = threading.Event()
+    a_reports: list[object] = []
+
+    class SlowProvider:
+        async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+            claim_started.set()
+            assert continue_provider.wait(timeout=10)
+            payload = {
+                "parameters": {"id": str(policy.league_external_id)},
+                "response": [{"league": {"id": policy.league_external_id, "type": "League"}, "seasons": []}],
+            }
+            raw = str(payload).encode()
+            return season_sync.APIFootballResponse(payload, raw, 200, {})
+
+        def response_contains_api_key(self, _body: bytes) -> bool:
+            return False
+
+    def run_a() -> None:
+        with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-claimlost-a") as repository:
+            a_reports.append(asyncio.run(SeasonalSyncWorker(provider=SlowProvider(), repository=repository, policies=[policy]).run_once()))
+
+    thread_a = threading.Thread(target=run_a)
+    thread_a.start()
+    assert claim_started.wait(timeout=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        run_row = verify.execute("SELECT id FROM ops.sync_runs WHERE operation=%s", (operation,)).fetchone()
+        assert run_row is not None
+        run_id = run_row[0]
+        verify.execute(
+            "UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s",
+            (run_id,),
+        )
+        verify.execute(
+            "UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 minute' "
+            "WHERE run_id=%s AND status='running'",
+            (run_id,),
+        )
+    b_reports: list[object] = []
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-claimlost-b") as repository_b:
+        class FastProvider:
+            async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
+                payload = {
+                    "parameters": {"id": str(policy.league_external_id)},
+                    "response": [{"league": {"id": policy.league_external_id, "type": "League"}, "seasons": []}],
+                }
+                raw = str(payload).encode()
+                return season_sync.APIFootballResponse(payload, raw, 200, {})
+
+            def response_contains_api_key(self, _body: bytes) -> bool:
+                return False
+
+        continue_provider.set()
+        b_reports.append(asyncio.run(SeasonalSyncWorker(provider=FastProvider(), repository=repository_b, policies=[policy]).run_once()))
+    thread_a.join(timeout=10)
+    assert len(a_reports) == 1 and len(b_reports) == 1
+    assert b_reports[0].status == "succeeded"
+    assert a_reports[0].status == "running"
+    assert b_reports[0].run_id == a_reports[0].run_id
+
+
+def test_finish_run_is_rejected_after_lease_takeover() -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_finish_reject_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-finishreject-{uuid.uuid4().hex}", 987659, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-finish-a") as first:
+        acquisition_a = first.start_run([policy])
+        run_id = acquisition_a.run_id
+        item = first.claim_next(run_id, acquisition_a.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+            verify.execute("UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s", (run_id,))
+            verify.execute(
+                "UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 minute' WHERE id=%s",
+                (item.id,),
+            )
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-finish-b") as second:
+        acquisition_b = second.start_run([policy])
+        assert acquisition_b.run_id == run_id
+        assert acquisition_b.run_token != acquisition_a.run_token
+    with pytest.raises(season_sync.SeasonalSyncError, match="lease was lost"):
+        with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-finish-a") as first_after:
+            first_after.finish_run(run_id, acquisition_a.run_token, status="failed", checkpoint={"outcome": "forced"})
 
 
 def test_budget_is_atomic_across_real_connections_and_enforces_each_share() -> None:

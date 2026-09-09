@@ -71,9 +71,14 @@ class FakeRepository:
 
     def start_run(self, policies: Sequence[SeasonalLeaguePolicy]) -> SeasonalRunAcquisition:
         assert tuple(policies) == tuple(self.policies)
-        return SeasonalRunAcquisition(55, acquired=True)
+        return SeasonalRunAcquisition(55, run_token=1234, acquired=True)
 
-    def claim_next(self, run_id: int, policies: Mapping[int, SeasonalLeaguePolicy]) -> SeasonalWorkItem | None:
+    def renew_run_lease(self, run_id: int, run_token: int) -> bool:
+        return True
+
+    def claim_next(
+        self, run_id: int, run_token: int, policies: Mapping[int, SeasonalLeaguePolicy]
+    ) -> SeasonalWorkItem | None:
         if self._next >= len(self.policies):
             return None
         policy = self.policies[self._next]
@@ -92,19 +97,27 @@ class FakeRepository:
     def import_and_verify(self, *, scope: ActiveSeasonScope, collected: Sequence[CollectedBaseResponse]) -> None:
         self.imported.append(scope)
 
-    def complete(self, item: SeasonalWorkItem, checkpoint: Mapping[str, Any]) -> None:
+    def complete(self, item: SeasonalWorkItem, run_token: int, checkpoint: Mapping[str, Any]) -> None:
         self.complete_checkpoints.append(dict(checkpoint))
 
-    def fail(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str) -> None:
+    def fail(self, item: SeasonalWorkItem, run_token: int, *, checkpoint: Mapping[str, Any], error: str) -> None:
         self.failed.append(error)
 
-    def defer(self, item: SeasonalWorkItem, *, checkpoint: Mapping[str, Any], error: str, delay_seconds: float) -> None:
+    def defer(
+        self,
+        item: SeasonalWorkItem,
+        run_token: int,
+        *,
+        checkpoint: Mapping[str, Any],
+        error: str,
+        delay_seconds: float,
+    ) -> None:
         self.deferred.append({"id": item.id, "checkpoint": dict(checkpoint), "error": error, "delay_seconds": delay_seconds})
 
     def pending_delay_seconds(self, run_id: int) -> float | None:
         return None
 
-    def finish_run(self, run_id: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
+    def finish_run(self, run_id: int, run_token: int, *, status: str, checkpoint: Mapping[str, Any]) -> None:
         self.finished = (status, dict(checkpoint))
 
 
