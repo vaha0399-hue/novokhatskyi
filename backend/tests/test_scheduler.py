@@ -100,6 +100,22 @@ def test_interval_change_preserves_old_first_deadline_and_schedules_uncovered_se
     assert (result.work.window_start, result.work.window_end) == (datetime(2026, 9, 8, 0, tzinfo=UTC), datetime(2026, 9, 8, 3, tzinfo=UTC))
 
 
+def test_shorter_interval_does_not_wait_for_a_saved_future_deadline() -> None:
+    state = _state("calendar_refresh", next_deadline=datetime(2026, 9, 8, 4, tzinfo=UTC))
+    policy = _policy(allowed_work_types=frozenset({"calendar_refresh"}), refresh_intervals={"calendar_refresh": RefreshInterval(1, "hour")})
+    result = _decision(SyncScheduler().preview(now=datetime(2026, 9, 8, 1, 5, tzinfo=UTC), policies=[policy], schedule_state=[state]), "calendar_refresh")
+    assert result.reason == ScheduleDecisionReason.DUE.value
+    assert result.deadline == datetime(2026, 9, 8, 1, tzinfo=UTC)
+
+
+def test_next_state_retains_not_due_and_denied_saved_scopes_unchanged() -> None:
+    calendar = _state("calendar_refresh", next_deadline=datetime(2026, 9, 8, 3, tzinfo=UTC))
+    standings = _state("standings_refresh", next_deadline=datetime(2026, 9, 8, 3, tzinfo=UTC))
+    policy = _policy(enabled=False)
+    preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[policy], schedule_state=[calendar, standings])
+    assert preview.next_state == (calendar, standings)
+
+
 def test_policy_gate_keeps_coverage_and_unimplemented_types_explicit() -> None:
     policy = _policy(allowed_work_types=frozenset({"calendar_refresh", "fixtures_refresh"}), coverage={"calendar_refresh": CoverageObservation(CoverageState.UNKNOWN, date(2026, 9, 1))}, refresh_intervals={"calendar_refresh": RefreshInterval(1, "hour"), "fixtures_refresh": RefreshInterval(1, "hour")})
     preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[policy], schedule_state=[_state("calendar_refresh")])

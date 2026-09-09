@@ -160,14 +160,17 @@ class SyncScheduler:
         state_by_key = self._state(schedule_state)
         gate = SyncPolicyGate(_PolicyReader(policy_by_scope), now=lambda: current)
         decisions: list[SchedulerDecision] = []
-        updates: list[PeriodicScheduleState] = []
+        # Preview always returns a complete prospective snapshot.  A skipped or
+        # not-due scope remains scheduled at its existing checkpoint; callers
+        # can atomically replace only the due entries after queue insertion.
+        next_by_key = dict(state_by_key)
 
         for policy in sorted(policy_by_scope.values(), key=lambda item: (item.provider_id, item.season_id)):
             for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES):
                 decision = self._periodic_decision(policy, work_type, state_by_key.get((policy.provider_id, policy.season_id, work_type)), current, gate)
                 decisions.append(decision)
                 if decision.next_state is not None:
-                    updates.append(decision.next_state)
+                    next_by_key[decision.next_state.key()] = decision.next_state
             for work_type in sorted(set(policy.allowed_work_types) - SUPPORTED_PERIODIC_WORK_TYPES):
                 decisions.append(SchedulerDecision(
                     scope={"provider_id": policy.provider_id, "season_id": policy.season_id, "work_type": work_type},
@@ -176,9 +179,8 @@ class SyncScheduler:
                 ))
 
         decisions.sort(key=lambda item: (int(item.scope["provider_id"]), int(item.scope["season_id"]), item.work_type))
-        updates.sort(key=lambda item: item.key())
         unknown_jobs = sum(item.work is not None and item.api_cost is ApiCost.UNKNOWN for item in decisions)
-        return SchedulerPreview(tuple(decisions), tuple(updates), ApiCostEstimate(int(unknown_jobs)))
+        return SchedulerPreview(tuple(decisions), tuple(sorted(next_by_key.values(), key=lambda item: item.key())), ApiCostEstimate(int(unknown_jobs)))
 
     @staticmethod
     def _policies(policies: Iterable[CompetitionSyncPolicy]) -> dict[tuple[int, int], CompetitionSyncPolicy]:
@@ -221,7 +223,10 @@ class SyncScheduler:
             start = deadline - interval
         else:
             start = state.last_scheduled_window_end.astimezone(UTC)
-            deadline = state.next_deadline.astimezone(UTC)
+            # A shorter current policy must take effect at once.  Conversely,
+            # an already due persisted deadline remains authoritative, so a
+            # longer replacement cannot push it into the future.
+            deadline = min(state.next_deadline.astimezone(UTC), start + interval)
         if deadline > now:
             work = self._work(policy, work_type, start, deadline, 1)
             return SchedulerDecision(work.scope, work_type, work.stable_key(), deadline, policy.priority, ScheduleDecisionReason.NOT_DUE.value)
