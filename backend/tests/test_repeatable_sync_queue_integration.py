@@ -365,18 +365,19 @@ def _q05_scheduler_setup(connection: psycopg.Connection, suffix: str) -> tuple[i
 
 
 def _q05_fixture(connection: psycopg.Connection, *, provider_id: int, season_id: int, suffix: str,
-                 kickoff_at: datetime | None, lifecycle_state: str = "scheduled") -> int:
+                 kickoff_at: datetime | None, lifecycle_state: str = "scheduled", observed_at: datetime | None = None) -> int:
     home_id = int(connection.execute("INSERT INTO football.teams(name) VALUES(%s) RETURNING id", (f"Q05 home {suffix}",)).fetchone()[0])
     away_id = int(connection.execute("INSERT INTO football.teams(name) VALUES(%s) RETURNING id", (f"Q05 away {suffix}",)).fetchone()[0])
     connection.execute("INSERT INTO football.season_teams(season_id,team_id) VALUES(%s,%s),(%s,%s)", (season_id, home_id, season_id, away_id))
     inserted_state = "scheduled" if lifecycle_state == "completed" else lifecycle_state
-    row = connection.execute("INSERT INTO football.fixtures(season_id,home_team_id,away_team_id,kickoff_at,lifecycle_state) VALUES(%s,%s,%s,%s,%s) RETURNING id", (season_id, home_id, away_id, kickoff_at, inserted_state)).fetchone()
+    first_seen = observed_at or datetime.now(UTC)
+    row = connection.execute("INSERT INTO football.fixtures(season_id,home_team_id,away_team_id,kickoff_at,lifecycle_state,first_seen_at,last_seen_at) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id", (season_id, home_id, away_id, kickoff_at, inserted_state, first_seen, first_seen)).fetchone()
     assert row is not None
     fixture_id = int(row[0])
     connection.execute("INSERT INTO source.fixture_provider_refs(provider_id,external_id,fixture_id) VALUES(%s,%s,%s)", (provider_id, f"q05-fixture-{suffix}", fixture_id))
     if lifecycle_state == "completed":
         assert kickoff_at is not None
-        observed = datetime.now(UTC)
+        observed = observed_at or datetime.now(UTC)
         fetch_id = _q05_fetch(connection, provider_id=provider_id, at=observed, subject_fixture_id=fixture_id, purpose="postmatch_reconciliation")
         connection.execute("""UPDATE football.fixtures
                               SET lifecycle_state='completed',home_goals=1,away_goals=0,last_source_fetch_id=%s,
@@ -494,6 +495,32 @@ def test_q05_reader_uses_statistics_coverage_not_result_reconciliation() -> None
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 1
 
 
+def test_q05_reader_schedules_initial_statistics_and_caps_persisted_retries() -> None:
+    assert TEST_DB_URL is not None
+    suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 12, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("statistics_retry",))
+        eligible_at = now - timedelta(hours=2)
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=now - timedelta(hours=8), lifecycle_state="completed", observed_at=eligible_at)
+        snapshot = _q05_snapshot(now)
+        fixture = next(item for item in snapshot.fixtures if item.fixture_id == fixture_id)
+        assert fixture.statistics_eligible_at == eligible_at and fixture.statistics_retry_at is None and not fixture.statistics_completed
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)), SyncScheduler(), {"statistics_retry": _Q05Dispatch()})
+        result = _q05_enqueue(process, run_id=run_id, now=now, snapshot=snapshot, provider_id=provider_id, season_id=season_id)
+        assert len(result.enqueue_results) == 1 and result.enqueue_results[0].enqueued
+        source_fetch_id = int(connection.execute("SELECT last_source_fetch_id FROM football.fixtures WHERE id=%s", (fixture_id,)).fetchone()[0])
+        connection.execute(
+            """INSERT INTO football.fixture_statistics_coverage(fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts)
+                VALUES(%s,'empty',0,%s,%s,%s,5)""",
+            (fixture_id, source_fetch_id, now - timedelta(minutes=10), now - timedelta(minutes=1)),
+        )
+        capped = _q05_snapshot(now)
+        capped_result = _q05_enqueue(process, run_id=run_id, now=now, snapshot=capped, provider_id=provider_id, season_id=season_id)
+        retry = next(item for item in capped_result.preview.decisions if item.work_type == "statistics_retry")
+        assert retry.reason == "retry_exhausted" and capped_result.enqueue_results == ()
+
+
 def test_q05_reader_handles_unknown_postponed_kickoff_and_saved_matchday() -> None:
     assert TEST_DB_URL is not None
     suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 12, tzinfo=UTC)
@@ -513,19 +540,19 @@ def test_q05_reader_handles_unknown_postponed_kickoff_and_saved_matchday() -> No
 
 def test_q05_reader_process_coalesces_sequential_analytics_versions_until_close() -> None:
     assert TEST_DB_URL is not None
-    suffix, opened = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC)
+    suffix, opened = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, 123456, tzinfo=UTC)
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
         provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
         _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
-        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=opened + timedelta(days=1))
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=opened + timedelta(days=1), observed_at=opened)
         first_fetch = _q05_fetch(connection, provider_id=provider_id, at=opened)
-        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=clock_timestamp() WHERE id=%s", (first_fetch, fixture_id))
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (first_fetch, opened, fixture_id))
         process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: opened)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
         first = _q05_snapshot(opened)
         assert _q05_enqueue(process, run_id=run_id, now=opened, snapshot=first, provider_id=provider_id, season_id=season_id).enqueue_results == ()
         later = opened + timedelta(seconds=30)
         second_fetch = _q05_fetch(connection, provider_id=provider_id, at=later)
-        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=clock_timestamp() WHERE id=%s", (second_fetch, fixture_id))
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (second_fetch, later, fixture_id))
         second = _q05_snapshot(later)
         assert _q05_enqueue(process, run_id=run_id, now=later, snapshot=second, provider_id=provider_id, season_id=season_id).enqueue_results == ()
         closed = opened.replace(second=0) + timedelta(minutes=1)
@@ -536,6 +563,127 @@ def test_q05_reader_process_coalesces_sequential_analytics_versions_until_close(
         assert connection.execute("SELECT input_version FROM ops.sync_scheduler_analytics_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone() == (str(second_fetch),)
 
 
+def test_q05_analytics_windows_keep_their_first_deadline_across_delay_and_restart() -> None:
+    assert TEST_DB_URL is not None
+    suffix, opened = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(setup, suffix)
+        _q05_policy(setup, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
+        fixture_id = _q05_fixture(setup, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=opened + timedelta(days=1), observed_at=opened)
+        versions: list[int] = []
+        events = (
+            (datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC), datetime(2026, 9, 9, 12, 1, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 0, 35, tzinfo=UTC), datetime(2026, 9, 9, 12, 1, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 1, 0, tzinfo=UTC), datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 1, 25, tzinfo=UTC), datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 1, 50, tzinfo=UTC), datetime(2026, 9, 9, 12, 2, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 2, 15, tzinfo=UTC), datetime(2026, 9, 9, 12, 3, tzinfo=UTC)),
+            (datetime(2026, 9, 9, 12, 2, 40, tzinfo=UTC), datetime(2026, 9, 9, 12, 3, tzinfo=UTC)),
+        )
+        for observed, _window_end in events:
+            fetch_id = _q05_fetch(setup, provider_id=provider_id, at=observed)
+            versions.append(fetch_id)
+            setup.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (fetch_id, observed, fixture_id))
+    delayed = opened + timedelta(minutes=2, seconds=35, microseconds=321)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        snapshot = _q05_snapshot(delayed)
+        inputs = [item for item in snapshot.analytics_inputs if item.entity_key == f"fixture:{fixture_id}"]
+        expected_latest_by_window = (
+            (versions[1], events[1][1]),
+            (versions[4], events[4][1]),
+            (versions[6], events[6][1]),
+        )
+        assert [(item.input_version, item.coalescing_deadline) for item in inputs] == [
+            *expected_latest_by_window,
+        ]
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: delayed)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        result = _q05_enqueue(process, run_id=run_id, now=delayed, snapshot=snapshot, provider_id=provider_id, season_id=season_id)
+        assert len(result.enqueue_results) == 2 and all(item.enqueued for item in result.enqueue_results)
+    restarted = opened + timedelta(minutes=3, seconds=5, microseconds=777)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        snapshot = _q05_snapshot(restarted)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: restarted)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        result = _q05_enqueue(process, run_id=run_id, now=restarted, snapshot=snapshot, provider_id=provider_id, season_id=season_id)
+        assert len(result.enqueue_results) == 1 and result.enqueue_results[0].enqueued
+        accepted = connection.execute(
+            "SELECT window_end,accepted_input_version FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s ORDER BY window_end",
+            (fixture_id,),
+        ).fetchall()
+        assert [row[1] for row in accepted] == [str(versions[1]), str(versions[4]), str(versions[6])]
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 3
+
+
+def test_q05_analytics_event_on_a_window_boundary_waits_for_the_next_close() -> None:
+    assert TEST_DB_URL is not None
+    suffix, observed = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 1, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=observed + timedelta(days=1), observed_at=observed)
+        fetch_id = _q05_fetch(connection, provider_id=provider_id, at=observed)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (fetch_id, observed, fixture_id))
+        before_close = observed + timedelta(microseconds=1)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: before_close)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        assert _q05_enqueue(process, run_id=run_id, now=before_close, snapshot=_q05_snapshot(before_close), provider_id=provider_id, season_id=season_id).enqueue_results == ()
+        after_close = observed + timedelta(minutes=1, microseconds=1)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: after_close)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        result = _q05_enqueue(process, run_id=run_id, now=after_close, snapshot=_q05_snapshot(after_close), provider_id=provider_id, season_id=season_id)
+        assert len(result.enqueue_results) == 1 and result.enqueue_results[0].enqueued
+
+
+def test_q05_two_scheduler_connections_accept_one_analytics_window_once() -> None:
+    assert TEST_DB_URL is not None
+    suffix, observed = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(setup, suffix)
+        _q05_policy(setup, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
+        fixture_id = _q05_fixture(setup, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=observed + timedelta(days=1), observed_at=observed)
+        fetch_id = _q05_fetch(setup, provider_id=provider_id, at=observed)
+        setup.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (fetch_id, observed, fixture_id))
+    now, barrier, results, failures = observed.replace(second=0) + timedelta(minutes=1, seconds=1), threading.Barrier(2), [], []
+    def enqueue() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            try:
+                snapshot = _q05_snapshot(now)
+                process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+                barrier.wait()
+                results.append(_q05_enqueue(process, run_id=run_id, now=now, snapshot=snapshot, provider_id=provider_id, season_id=season_id))
+            except BaseException as error:
+                failures.append(error)
+    left, right = threading.Thread(target=enqueue), threading.Thread(target=enqueue)
+    left.start(); right.start(); left.join(); right.join()
+    assert failures == []
+    assert sum(result.enqueue_results[0].enqueued for result in results) == 1
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as check:
+        assert check.execute("SELECT accepted_input_version FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s", (fixture_id,)).fetchone() == (str(fetch_id),)
+        assert check.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 1
+
+
+def test_q05_analytics_window_rollback_preserves_the_due_window() -> None:
+    assert TEST_DB_URL is not None
+    suffix, observed = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 0, 10, tzinfo=UTC)
+    now = observed.replace(second=0) + timedelta(minutes=1, seconds=1)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("analytics_recalculation",))
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=observed + timedelta(days=1), observed_at=observed)
+        fetch_id = _q05_fetch(connection, provider_id=provider_id, at=observed)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (fetch_id, observed, fixture_id))
+        snapshot = _q05_snapshot(now)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)), SyncScheduler(), {"analytics_recalculation": _Q05Dispatch()})
+        connection.execute("CREATE FUNCTION ops.q05_fail_window_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'q05 forced window checkpoint failure'; END; $$")
+        connection.execute("CREATE TRIGGER q05_fail_window_checkpoint BEFORE INSERT ON ops.sync_scheduler_analytics_checkpoints FOR EACH ROW EXECUTE FUNCTION ops.q05_fail_window_checkpoint()")
+        with pytest.raises(psycopg.errors.RaiseException, match="forced window checkpoint failure"):
+            _q05_enqueue(process, run_id=run_id, now=now, snapshot=snapshot, provider_id=provider_id, season_id=season_id)
+        assert connection.execute("SELECT accepted_at FROM ops.fixture_analytics_recalculation_windows WHERE fixture_id=%s", (fixture_id,)).fetchone() == (None,)
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+        connection.execute("DROP TRIGGER q05_fail_window_checkpoint ON ops.sync_scheduler_analytics_checkpoints")
+        connection.execute("DROP FUNCTION ops.q05_fail_window_checkpoint()")
+        retry = _q05_enqueue(process, run_id=run_id, now=now, snapshot=_q05_snapshot(now), provider_id=provider_id, season_id=season_id)
+        assert len(retry.enqueue_results) == 1 and retry.enqueue_results[0].enqueued
+
+
 def test_q05_reader_ignores_expired_q04_counters_without_reserving_budget() -> None:
     assert TEST_DB_URL is not None
     suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 12, 1, tzinfo=UTC)
@@ -543,9 +691,10 @@ def test_q05_reader_ignores_expired_q04_counters_without_reserving_budget() -> N
         provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
         _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("calendar_refresh", "analytics_recalculation"))
         connection.execute("INSERT INTO ops.sync_scheduler_checkpoints(provider_id,season_id,work_type,last_scheduled_window_end,next_deadline) VALUES(%s,%s,'calendar_refresh',%s,%s)", (provider_id, season_id, now - timedelta(hours=2), now - timedelta(hours=1)))
-        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=now + timedelta(days=1))
-        fetch_id = _q05_fetch(connection, provider_id=provider_id, at=now)
-        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=clock_timestamp() WHERE id=%s", (fetch_id, fixture_id))
+        observed = now - timedelta(seconds=1)
+        fixture_id = _q05_fixture(connection, provider_id=provider_id, season_id=season_id, suffix=suffix, kickoff_at=now + timedelta(days=1), observed_at=observed)
+        fetch_id = _q05_fetch(connection, provider_id=provider_id, at=observed)
+        connection.execute("UPDATE football.fixtures SET last_source_fetch_id=%s,last_seen_at=%s WHERE id=%s", (fetch_id, observed, fixture_id))
         connection.execute("""INSERT INTO ops.api_football_budget_state(singleton,daily_window,minute_window,daily_used,minute_used)
                               VALUES(true,%s,%s,6000,300)
                               ON CONFLICT(singleton) DO UPDATE SET daily_window=excluded.daily_window,minute_window=excluded.minute_window,daily_used=excluded.daily_used,minute_used=excluded.minute_used""",
@@ -588,6 +737,8 @@ def test_q05_process_enqueues_analytics_and_deduplicates_versions() -> None:
         again = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
         assert len(again.enqueue_results) == 1 and not again.enqueue_results[0].enqueued
         newer = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 2, now + timedelta(seconds=1))])
+        assert newer.enqueue_results == ()
+        newer = process.enqueue_due(run_id=run_id, now=now + timedelta(minutes=1), policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 2, now + timedelta(seconds=1))])
         assert len(newer.enqueue_results) == 1 and newer.enqueue_results[0].enqueued
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 2
 
@@ -627,9 +778,7 @@ def test_q05_late_analytics_version_does_not_replace_newer_checkpoint() -> None:
         process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)), SyncScheduler(), {'analytics_recalculation': _Q05Dispatch()})
         newest = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 2, now)])
         late = process.enqueue_due(run_id=run_id, now=now + timedelta(seconds=1), policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now - timedelta(seconds=1))])
-        assert newest.enqueue_results[0].enqueued and late.enqueue_results == ()
-        late = process.enqueue_due(run_id=run_id, now=now + timedelta(minutes=1), policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now - timedelta(seconds=1))])
-        assert late.enqueue_results[0].enqueued
+        assert newest.enqueue_results[0].enqueued and late.enqueue_results[0].enqueued
         versions = connection.execute("SELECT input_version FROM ops.sync_scheduler_analytics_checkpoints WHERE provider_id=%s AND season_id=%s AND entity_key='fixture:1' ORDER BY input_version", (provider_id, season_id)).fetchall()
         assert versions == [('1',), ('2',)]
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 2

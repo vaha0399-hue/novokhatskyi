@@ -70,20 +70,42 @@ class PostgresSchedulerSnapshotReader:
         policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
         checkpoints = tuple(PeriodicScheduleState(int(row[0]), int(row[1]), str(row[2]), row[3], row[4]) for row in self._connection.execute(
             "SELECT provider_id,season_id,work_type,last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints ORDER BY provider_id,season_id,work_type").fetchall())
-        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], None, int(row[9] or 0), 5, str(row[10]) == "complete", row[8]) for row in self._connection.execute(
+        fixture_rows = self._connection.execute(
             """SELECT ref.fixture_id,ref.provider_id,fixture.season_id,fixture.kickoff_at,fixture.lifecycle_state::text,
                       fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,
-                      statistics_coverage.next_retry_at,statistics_coverage.attempts,statistics_coverage.coverage_state::text
+                      fixture.result_available_at,statistics_coverage.next_retry_at,statistics_coverage.attempts,
+                      statistics_coverage.coverage_state::text,statistics_facts.pair_ready
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
                  LEFT JOIN ops.fixture_reconciliation_state reconciliation ON reconciliation.fixture_id=fixture.id
                  LEFT JOIN football.fixture_statistics_coverage statistics_coverage ON statistics_coverage.fixture_id=fixture.id
+                 LEFT JOIN LATERAL (
+                     SELECT count(*) = 2
+                         AND count(DISTINCT statistics.team_id) = 2
+                         AND coalesce(bool_and(statistics.team_id IN (fixture.home_team_id,fixture.away_team_id)),false)
+                         AND coalesce(bool_and(statistics.last_source_fetch_id IS NOT NULL),false) AS pair_ready
+                       FROM football.fixture_team_statistics statistics
+                      WHERE statistics.fixture_id=fixture.id
+                 ) statistics_facts ON true
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
-                 ORDER BY ref.provider_id,fixture.season_id,ref.fixture_id""").fetchall())
-        analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4]) for row in self._connection.execute(
-            """SELECT ref.provider_id,fixture.season_id,fixture.id,fixture.last_source_fetch_id,fixture.last_seen_at
+                 ORDER BY ref.provider_id,fixture.season_id,ref.fixture_id""").fetchall()
+        fixtures = tuple(
+            FixtureScheduleSnapshot(
+                fixture_id=int(row[0]), provider_id=int(row[1]), season_id=int(row[2]), kickoff_at=row[3], lifecycle_state=str(row[4]),
+                terminal_observed_at=row[5], result_finalized_at=row[6], first_terminal_observed_at=row[7],
+                statistics_eligible_at=row[8] if row[11] is None and not bool(row[12]) else None,
+                statistics_attempts=int(row[10] or 0), statistics_max_attempts=5, statistics_completed=bool(row[12]),
+                statistics_retry_at=row[9] if row[11] is not None and not bool(row[12]) else None,
+            )
+            for row in fixture_rows
+        )
+        analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4], row[5], int(row[2])) for row in self._connection.execute(
+            """SELECT ref.provider_id,fixture.season_id,fixture.id,analytics_window.latest_source_fetch_id,
+                      analytics_window.observed_at,analytics_window.window_end
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                 JOIN ops.fixture_analytics_recalculation_windows analytics_window ON analytics_window.fixture_id=fixture.id
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
-                WHERE fixture.last_source_fetch_id IS NOT NULL ORDER BY ref.provider_id,fixture.season_id,fixture.id""").fetchall())
+                WHERE analytics_window.accepted_at IS NULL
+                ORDER BY ref.provider_id,fixture.season_id,fixture.id,analytics_window.window_end""").fetchall())
         seasons = tuple(SeasonScheduleSnapshot(int(row[0]), int(row[1]),
             None if row[2] is None else datetime.combine(row[2], time.min, tzinfo=UTC), bool(row[3])) for row in self._connection.execute(
                 """SELECT policy.provider_id,policy.season_id,season.starts_on,
@@ -99,8 +121,19 @@ class PostgresSchedulerSnapshotReader:
                                           FROM ops.api_football_budget_config config LEFT JOIN ops.api_football_budget_state state ON state.singleton=true
                                          WHERE config.singleton=true""").fetchone()
         budget = BudgetSnapshot(None, None, None, None, None) if row is None else BudgetSnapshot(*row)
+        missing_analytics_history = self._connection.execute(
+            """SELECT EXISTS(
+                    SELECT 1 FROM source.fixture_provider_refs ref
+                    JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                    JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
+                   WHERE fixture.last_source_fetch_id IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM ops.fixture_analytics_recalculation_windows analytics_window WHERE analytics_window.fixture_id=fixture.id)
+                )""").fetchone()
+        gaps = ["season_expected_start_unavailable"]
+        if missing_analytics_history is not None and bool(missing_analytics_history[0]):
+            gaps.append("analytics_window_history_unavailable")
         return SchedulerMaterializedSnapshot(tuple(policy for policy in policies if policy is not None), checkpoints, fixtures, budget, seasons, analytics_inputs,
-                                             ("season_expected_start_unavailable",))
+                                             tuple(gaps))
 
 
 class PostgresSchedulerRepository:
@@ -194,9 +227,15 @@ class PostgresSchedulerRepository:
 
     def enqueue_recalculation(self, *, run_id: int, work: RecalculationWork, available_at: datetime) -> SchedulerEnqueueResult:
         self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
+        window_fixture_id = work.scope.get("_analytics_window_fixture_id")
+        window_end = work.scope.get("_analytics_window_end")
+        if window_fixture_id is not None and (not isinstance(window_fixture_id, int) or isinstance(window_fixture_id, bool) or window_fixture_id <= 0):
+            raise ValueError("analytics work has malformed window fixture id")
+        if window_end is not None and not isinstance(window_end, str):
+            raise ValueError("analytics work has malformed window end")
         try:
-            row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version))).fetchone()
+            row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_window_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version),window_fixture_id,window_end,None if window_fixture_id is None else str(work.input_version))).fetchone()
         except psycopg.Error as exc:
             self._raise_policy_denial(exc)
         if row is None: raise RuntimeError("analytics enqueue/checkpoint did not return a result")

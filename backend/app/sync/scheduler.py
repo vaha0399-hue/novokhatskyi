@@ -100,11 +100,17 @@ class AnalyticsInputSnapshot:
     entity_key: str
     input_version: str | int
     observed_at: datetime
+    coalescing_deadline: datetime | None = None
+    window_fixture_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.provider_id <= 0 or self.season_id <= 0 or not self.entity_key.strip():
             raise ValueError("analytics input scope is malformed")
         _require_aware(self.observed_at, "analytics input observation")
+        if self.coalescing_deadline is not None:
+            _require_aware(self.coalescing_deadline, "analytics coalescing deadline")
+        if self.window_fixture_id is not None and self.window_fixture_id <= 0:
+            raise ValueError("analytics window fixture id must be positive")
 
 
 @dataclass(frozen=True)
@@ -255,15 +261,12 @@ class SyncScheduler:
         # Preview always returns a complete prospective snapshot.  A skipped or
         # not-due scope remains scheduled at its existing checkpoint; callers
         # can atomically replace only the due entries after queue insertion.
-        next_by_key = dict(state_by_key)
 
         for policy in sorted(policy_by_scope.values(), key=lambda item: (item.provider_id, item.season_id)):
             for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES & set(policy.allowed_work_types)):
                 decision = self._periodic_decision(policy, work_type, state_by_key.get((policy.provider_id, policy.season_id, work_type)), current, gate)
                 decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
-                if decision.next_state is not None:
-                    next_by_key[decision.next_state.key()] = decision.next_state
             for work_type in sorted(set(policy.allowed_work_types) - SUPPORTED_PERIODIC_WORK_TYPES):
                 if work_type in SECTION_7_WORK_TYPES:
                     continue
@@ -283,15 +286,11 @@ class SyncScheduler:
                 decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "season_discovery")]
                 decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
-                if decision.next_state is not None:
-                    next_by_key[decision.next_state.key()] = decision.next_state
             if season is not None and "standings_refresh" in policy.allowed_work_types:
                 decision = self._periodic_decision(policy, "standings_refresh", state_by_key.get((policy.provider_id, policy.season_id, "standings_refresh")), current, gate, interval_override=None if season.matchday_today else timedelta(days=1))
                 decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "standings_refresh")]
                 decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
-                if decision.next_state is not None:
-                    next_by_key[decision.next_state.key()] = decision.next_state
         for policy in policy_by_scope.values():
             if not any((item.provider_id, item.season_id) == (policy.provider_id, policy.season_id) for item in fixture_values):
                 for work_type in sorted((set(policy.allowed_work_types) & SECTION_7_WORK_TYPES) - SUPPORTED_PERIODIC_WORK_TYPES - {"analytics_recalculation"}):
@@ -316,7 +315,7 @@ class SyncScheduler:
             scheduled_types = {work_type for work_type, _deadline in self._fixture_deadlines(fixture, policy, current)}
             for work_type in sorted((set(policy.allowed_work_types) & SECTION_7_WORK_TYPES) - scheduled_types):
                 reason = ScheduleDecisionReason.RETRY_EXHAUSTED.value if (
-                    work_type == "statistics_retry" and fixture.statistics_eligible_at is not None
+                    work_type == "statistics_retry" and (fixture.statistics_eligible_at is not None or fixture.statistics_retry_at is not None)
                     and not fixture.statistics_completed and fixture.statistics_attempts >= min(fixture.statistics_max_attempts, 5)
                 ) else ScheduleDecisionReason.INPUT_UNAVAILABLE.value
                 decisions.append(SchedulerDecision(
@@ -324,9 +323,9 @@ class SyncScheduler:
                     work_type, None, None, policy.priority, reason,
                 ))
 
-        latest_inputs: dict[tuple[int, int, str], AnalyticsInputSnapshot] = {}
+        latest_inputs: dict[tuple[int, int, str, datetime | None], AnalyticsInputSnapshot] = {}
         for item in analytics_inputs:
-            key = (item.provider_id, item.season_id, item.entity_key)
+            key = (item.provider_id, item.season_id, item.entity_key, item.coalescing_deadline)
             if key not in latest_inputs or item.observed_at > latest_inputs[key].observed_at:
                 latest_inputs[key] = item
         for item in latest_inputs.values():
@@ -338,8 +337,13 @@ class SyncScheduler:
             except SyncPolicyDenied as error:
                 decisions.append(SchedulerDecision({"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key}, "analytics_recalculation", None, item.observed_at, policy.priority, error.reason.value))
                 continue
-            work = RecalculationWork(item.provider_id, item.season_id, "analytics_recalculation", item.entity_key, item.input_version, policy.priority, {"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key, "input_version": item.input_version, "_sync_policy": _policy_fingerprint(policy, "analytics_recalculation")})
-            deadline = _next_closed_boundary(current, timedelta(seconds=60))
+            scope = {"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key, "input_version": item.input_version, "_sync_policy": _policy_fingerprint(policy, "analytics_recalculation")}
+            if item.window_fixture_id is not None:
+                scope["_analytics_window_fixture_id"] = item.window_fixture_id
+            if item.coalescing_deadline is not None:
+                scope["_analytics_window_end"] = item.coalescing_deadline.astimezone(UTC).isoformat()
+            work = RecalculationWork(item.provider_id, item.season_id, "analytics_recalculation", item.entity_key, item.input_version, policy.priority, scope)
+            deadline = item.coalescing_deadline or _next_closed_boundary(item.observed_at.astimezone(UTC), timedelta(seconds=60))
             reason = ScheduleDecisionReason.DUE.value if deadline <= current else ScheduleDecisionReason.NOT_DUE.value
             decisions.append(self._apply_handler_gate(SchedulerDecision(work.scope, work.work_type, work.stable_key(), deadline, policy.priority, reason, work, ApiCost.UNKNOWN), executable))
 
@@ -351,6 +355,10 @@ class SyncScheduler:
                 if item.reason == ScheduleDecisionReason.DUE.value and item.work is not None and item.work_type != "analytics_recalculation" else item
                 for item in decisions
             ]
+        next_by_key = dict(state_by_key)
+        for decision in decisions:
+            if decision.reason == ScheduleDecisionReason.DUE.value and decision.next_state is not None:
+                next_by_key[decision.next_state.key()] = decision.next_state
         decisions.sort(key=lambda item: (int(item.scope["provider_id"]), int(item.scope["season_id"]), item.work_type))
         unknown_jobs = sum(item.work is not None and item.api_cost is ApiCost.UNKNOWN for item in decisions)
         return SchedulerPreview(tuple(decisions), tuple(sorted(next_by_key.values(), key=lambda item: item.key())), ApiCostEstimate(int(unknown_jobs)))
@@ -396,9 +404,10 @@ class SyncScheduler:
             values.append(("overdue_status_check", kickoff + timedelta(minutes=15)))
         if fixture.terminal_observed_at is not None and fixture.result_finalized_at is None and now >= kickoff + timedelta(hours=3):
             values.append(("result_finalization", max(kickoff + timedelta(hours=3), fixture.terminal_observed_at.astimezone(UTC))))
-        if fixture.statistics_retry_at is not None and not fixture.statistics_completed:
+        statistics_exhausted = fixture.statistics_attempts >= min(fixture.statistics_max_attempts, 5)
+        if fixture.statistics_retry_at is not None and not fixture.statistics_completed and not statistics_exhausted:
             values.append(("statistics_retry", fixture.statistics_retry_at.astimezone(UTC)))
-        elif fixture.statistics_eligible_at is not None and not fixture.statistics_completed:
+        elif fixture.statistics_eligible_at is not None and not fixture.statistics_completed and not statistics_exhausted:
             retry_offsets = (timedelta(), timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
             if fixture.statistics_attempts < min(fixture.statistics_max_attempts, len(retry_offsets)):
                 values.append(("statistics_retry", fixture.statistics_eligible_at.astimezone(UTC) + retry_offsets[fixture.statistics_attempts]))

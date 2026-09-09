@@ -137,6 +137,17 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
                    JOIN source.team_provider_refs away_ref ON away_ref.team_id=fixture.away_team_id"""
             ).fetchall()
         }
+        stale_fixture_id, stale_fetch_id = conn.execute(
+            """SELECT id,last_source_fetch_id FROM football.fixtures
+                 WHERE lifecycle_state='completed' AND result_available_at IS NOT NULL AND last_source_fetch_id IS NOT NULL
+                 ORDER BY kickoff_at DESC,id DESC LIMIT 1"""
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO football.fixture_statistics_coverage(
+                    fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts
+                ) VALUES(%s,'empty',0,%s,%s,%s,1)""",
+            (stale_fixture_id, stale_fetch_id, datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 1, tzinfo=UTC)),
+        )
     client = BatchClient(fixtures)
     scope = CurrentSeasonStatisticsScope(league_external_id=39, season_start_year=2024, max_requests=11)
 
@@ -155,7 +166,7 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
     assert all(len(str(call[1]["ids"]).split("-")) == 20 for call in client.calls[1:])
 
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
-        fetch_id, raw_count, memberships, rows, metric_rows = conn.execute(
+        fetch_id, raw_count, memberships, rows, metric_rows, complete_coverage = conn.execute(
             """SELECT
                    (SELECT max(id) FROM source.provider_fetches WHERE endpoint='/fixtures' AND purpose='scheduled_refresh'),
                    (SELECT count(*) FROM source.provider_raw_payloads raw
@@ -167,10 +178,15 @@ def test_one_league_batch_statistics_persists_raw_provenance_pairs_and_metrics(
                    (SELECT count(*) FROM football.fixture_team_statistics statistics
                      JOIN source.provider_fetches provider_fetch ON provider_fetch.id=statistics.last_source_fetch_id
                     WHERE provider_fetch.endpoint='/fixtures' AND provider_fetch.purpose='scheduled_refresh'),
-                   (SELECT count(*) FROM football.team_rolling_metrics WHERE season_id=(SELECT season_id FROM source.season_provider_refs WHERE external_season=2024))"""
+                   (SELECT count(*) FROM football.team_rolling_metrics WHERE season_id=(SELECT season_id FROM source.season_provider_refs WHERE external_season=2024)),
+                   (SELECT count(*) FROM football.fixture_statistics_coverage WHERE coverage_state='complete' AND team_count=2)"""
         ).fetchone()
         assert fetch_id is not None
-        assert (raw_count, memberships, rows, metric_rows) == (11, 580, 400, 120)
+        assert (raw_count, memberships, rows, metric_rows, complete_coverage) == (11, 580, 400, 120, 200)
+        assert conn.execute(
+            "SELECT coverage_state::text,team_count FROM football.fixture_statistics_coverage WHERE fixture_id=%s",
+            (stale_fixture_id,),
+        ).fetchone() == ("complete", 2)
         assert conn.execute(
             """SELECT count(*) FROM football.fixture_team_statistics statistics
                JOIN source.provider_fetches provider_fetch ON provider_fetch.id=statistics.last_source_fetch_id

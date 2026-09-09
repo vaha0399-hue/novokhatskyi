@@ -112,6 +112,7 @@ def test_partial_statistics_are_skipped_without_inventing_a_half_pair() -> None:
     parsed = _batch_entries(payload, targets=_sample_targets(), league_external_id=39)
 
     assert parsed.statistics_by_fixture[2] is None
+    assert parsed.statistics_partial_fixture_ids == {2}
     assert parsed.statistics_by_fixture[1] is not None and parsed.statistics_by_fixture[3] is not None
 
 

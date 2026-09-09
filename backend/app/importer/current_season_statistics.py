@@ -105,6 +105,7 @@ class BatchParseResult:
     returned_fixture_ids: frozenset[int]
     statistics_by_fixture: Mapping[int, list[dict[str, Any]] | None]
     statistics_unavailable_fixture_ids: frozenset[int]
+    statistics_partial_fixture_ids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,7 @@ def _batch_entries(
     parsed: dict[int, list[dict[str, Any]] | None] = {target.fixture_id: None for target in targets}
     seen: set[int] = set()
     unavailable: set[int] = set()
+    partial: set[int] = set()
     for entry in response:
         if not isinstance(entry, Mapping):
             raise StatisticsContractError("batch fixture entry must be an object")
@@ -283,9 +285,11 @@ def _batch_entries(
             parsed[target.fixture_id] = mapped
         elif state == "empty":
             unavailable.add(target.fixture_id)
+        elif state == "partial":
+            partial.add(target.fixture_id)
     return BatchParseResult(
         frozenset(by_external[external_id].fixture_id for external_id in seen), parsed,
-        frozenset(unavailable),
+        frozenset(unavailable), frozenset(partial),
     )
 
 
@@ -756,23 +760,44 @@ def _statistics_rows(
     return rows, affected_teams, skipped
 
 
-def _mark_statistics_unavailable(
+def _mark_statistics_incomplete(
+    conn: Connection[Any], *, fixture_ids: frozenset[int], fetch: BatchFetch, coverage_state: str, team_count: int
+) -> None:
+    """Persist a retryable provider coverage fact without inventing a pair."""
+    if not fixture_ids:
+        return
+    if (coverage_state, team_count) not in {("empty", 0), ("partial", 1)}:
+        raise ValueError("statistics incomplete coverage is malformed")
+    conn.execute(
+        """INSERT INTO football.fixture_statistics_coverage(
+                fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts
+            )
+            SELECT fixture_id,%s::football.snapshot_coverage_state,%s,%s,%s,%s,1
+            FROM unnest(%s::bigint[]) AS fixture_id
+            ON CONFLICT (fixture_id) DO UPDATE
+              SET coverage_state=excluded.coverage_state,team_count=excluded.team_count,last_source_fetch_id=excluded.last_source_fetch_id,
+                  observed_at=excluded.observed_at,next_retry_at=excluded.next_retry_at,
+                  attempts=football.fixture_statistics_coverage.attempts + 1""",
+        (coverage_state, team_count, fetch.fetch_id, fetch.response_received_at, fetch.response_received_at + timedelta(hours=6), list(fixture_ids)),
+    )
+
+
+def _mark_statistics_complete(
     conn: Connection[Any], *, fixture_ids: frozenset[int], fetch: BatchFetch
 ) -> None:
-    """Persist an empty provider response as retryable coverage, never zeroes."""
+    """A validated two-team batch supersedes a retryable empty/partial marker."""
     if not fixture_ids:
         return
     conn.execute(
         """INSERT INTO football.fixture_statistics_coverage(
                 fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts
             )
-            SELECT fixture_id,'empty'::football.snapshot_coverage_state,0,%s,%s,%s,1
+            SELECT fixture_id,'complete'::football.snapshot_coverage_state,2,%s,%s,%s,1
             FROM unnest(%s::bigint[]) AS fixture_id
             ON CONFLICT (fixture_id) DO UPDATE
-              SET coverage_state='empty',team_count=0,last_source_fetch_id=excluded.last_source_fetch_id,
-                  observed_at=excluded.observed_at,next_retry_at=excluded.next_retry_at,
-                  attempts=football.fixture_statistics_coverage.attempts + 1""",
-        (fetch.fetch_id, fetch.response_received_at, fetch.response_received_at + timedelta(hours=6), list(fixture_ids)),
+              SET coverage_state='complete',team_count=2,last_source_fetch_id=excluded.last_source_fetch_id,
+                  observed_at=excluded.observed_at,next_retry_at=excluded.next_retry_at""",
+        (fetch.fetch_id, fetch.response_received_at, fetch.response_received_at, list(fixture_ids)),
     )
 
 
@@ -1075,12 +1100,28 @@ async def run_current_season_statistics_backfill_async(
                             rows, teams, skipped_in_batch = _statistics_rows(
                                 parsed=parsed.statistics_by_fixture, targets=batch, fetch=fetched
                             )
-                            _mark_statistics_unavailable(
+                            _mark_statistics_incomplete(
                                 conn,
                                 fixture_ids=parsed.statistics_unavailable_fixture_ids,
                                 fetch=fetched,
+                                coverage_state="empty",
+                                team_count=0,
                             )
                             written += bulk_upsert_statistics(conn, rows=rows)
+                            _mark_statistics_complete(
+                                conn,
+                                fixture_ids=frozenset(
+                                    fixture_id for fixture_id, blocks in parsed.statistics_by_fixture.items() if blocks is not None
+                                ),
+                                fetch=fetched,
+                            )
+                            _mark_statistics_incomplete(
+                                conn,
+                                fixture_ids=parsed.statistics_partial_fixture_ids,
+                                fetch=fetched,
+                                coverage_state="partial",
+                                team_count=1,
+                            )
                             if teams:
                                 bulk_upsert_rolling_metrics(conn, season_id=season_id, team_ids=teams, now=clock())
                             conn.execute("UPDATE source.provider_fetches SET normalized_at=clock_timestamp() WHERE id=%s", (fetched.fetch_id,))

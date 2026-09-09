@@ -102,7 +102,7 @@ candidate visible as `handler_unavailable`, and missing saved input is
 | statistics retry | eligibility offsets 0, 15m, 1h, 6h, 24h; capped retry becomes `retry_exhausted` | `test_statistics_retry_follows_all_configured_offsets_and_signals_exhaustion` |
 | correction check | immutable first-terminal +24h and +72h event windows | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions` |
 | standings | daily control away from a matchday; policy interval on a matchday | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs`; `test_standings_uses_hourly_policy_interval_on_a_matchday` |
-| analytics/scanner | latest saved input version per entity is coalesced to a stable 60-second boundary; version identity is persisted separately | `test_analytics_coalesces_input_events_to_the_newest_version_inside_60_seconds`; `test_q05_process_enqueues_analytics_and_deduplicates_versions`; `test_q05_late_analytics_version_does_not_replace_newer_checkpoint` |
+| analytics/scanner | fixture-write trigger records the latest version in each fixed 60-second window; enqueue atomically records Q02 work, version identity, and window acceptance | `test_q05_analytics_windows_keep_their_first_deadline_across_delay_and_restart`; `test_q05_analytics_event_on_a_window_boundary_waits_for_the_next_close`; `test_q05_two_scheduler_connections_accept_one_analytics_window_once` |
 | quality sweep | daily policy work from the saved season input | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs` |
 
 The repository boundary is covered by real isolated PostgreSQL sessions:
@@ -113,6 +113,11 @@ The repository boundary is covered by real isolated PostgreSQL sessions:
 `test_scheduler_cli_passes_materialized_season_and_analytics_inputs` verifies
 that both preview and `--enqueue` receive the same materialized season and
 analytics inputs.
+
+Analytics windows begin only when the additive fixture trigger observes a new
+saved `last_source_fetch_id`. Existing fixtures without an observed window are
+reported as `analytics_window_history_unavailable`; the scheduler does not
+invent a historical input sequence from the current latest value.
 
 ## Q03 leases
 

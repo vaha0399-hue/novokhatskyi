@@ -296,6 +296,8 @@ def test_statistics_retry_follows_all_configured_offsets_and_signals_exhaustion(
         assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[fixture]), "statistics_retry").deadline == now + offset
     exhausted = FixtureScheduleSnapshot(9, 7, 101, now - timedelta(hours=4), "completed", statistics_eligible_at=now, statistics_attempts=5, statistics_max_attempts=5)
     assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[exhausted]), "statistics_retry").reason == ScheduleDecisionReason.RETRY_EXHAUSTED.value
+    persisted_exhausted = FixtureScheduleSnapshot(10, 7, 101, now - timedelta(hours=4), "completed", statistics_attempts=5, statistics_max_attempts=5, statistics_retry_at=now - timedelta(minutes=1))
+    assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[persisted_exhausted]), "statistics_retry").reason == ScheduleDecisionReason.RETRY_EXHAUSTED.value
 
 
 def test_standings_uses_hourly_policy_interval_on_a_matchday() -> None:
@@ -311,6 +313,29 @@ def test_standings_uses_hourly_policy_interval_on_a_matchday() -> None:
     ), "standings_refresh")
     assert result.next_state is not None
     assert result.next_state.next_deadline - result.next_state.last_scheduled_window_end == timedelta(hours=1)
+
+
+def test_skipped_standings_override_and_budget_keep_the_saved_checkpoint() -> None:
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"standings_refresh"}),
+        coverage={"standings_refresh": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+        refresh_intervals={"standings_refresh": RefreshInterval(1, "hour")},
+    )
+    saved = PeriodicScheduleState(7, 101, "standings_refresh", now - timedelta(hours=2), now + timedelta(hours=1))
+    overridden = SyncScheduler().preview(
+        now=now, policies=[policy], schedule_state=[saved],
+        seasons=[SeasonScheduleSnapshot(7, 101, None, False)],
+    )
+    assert _decision(overridden, "standings_refresh").reason == ScheduleDecisionReason.NOT_DUE.value
+    assert overridden.next_state == (saved,)
+    due = PeriodicScheduleState(7, 101, "standings_refresh", now - timedelta(hours=2), now - timedelta(hours=1))
+    budget_blocked = SyncScheduler().preview(
+        now=now, policies=[policy], schedule_state=[due],
+        budget=_Budget(cooldown_until=now + timedelta(minutes=1)),
+    )
+    assert _decision(budget_blocked, "standings_refresh").reason == ScheduleDecisionReason.BUDGET_COOLDOWN.value
+    assert budget_blocked.next_state == (due,)
 
 
 def test_discovery_uses_weekly_policy_interval_outside_preseason() -> None:
@@ -346,7 +371,33 @@ def test_analytics_coalesces_input_events_to_the_newest_version_inside_60_second
     assert first_job.work.scope["input_version"] == 2
     assert first_job.reason == ScheduleDecisionReason.NOT_DUE.value
     assert first_job.deadline == datetime(2026, 9, 8, 12, 1, tzinfo=UTC)
+    assert second_job.deadline == first_job.deadline
     assert first_job.stable_key == second_job.stable_key
+    delayed = SyncScheduler().preview(now=now + timedelta(seconds=40), policies=[policy], schedule_state=[], analytics_inputs=inputs)
+    delayed_job = next(item for item in delayed.decisions if item.work_type == "analytics_recalculation" and item.work is not None)
+    assert delayed_job.deadline == first_job.deadline
+    assert delayed_job.reason == ScheduleDecisionReason.DUE.value
+
+
+def test_analytics_window_deadline_survives_continuous_versions_after_its_close() -> None:
+    opened = datetime(2026, 9, 8, 12, 0, 10, tzinfo=UTC)
+    deadline = datetime(2026, 9, 8, 12, 1, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"analytics_recalculation"}),
+        coverage={"analytics_recalculation": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+        refresh_intervals={"analytics_recalculation": RefreshInterval(1, "minute")},
+    )
+    preview = SyncScheduler().preview(
+        now=deadline + timedelta(seconds=10), policies=[policy], schedule_state=[],
+        analytics_inputs=[
+            AnalyticsInputSnapshot(7, 101, "fixture:9", 1, opened, coalescing_deadline=deadline),
+            AnalyticsInputSnapshot(7, 101, "fixture:9", 2, opened + timedelta(seconds=25), coalescing_deadline=deadline),
+        ],
+    )
+    decision = next(item for item in preview.decisions if item.work_type == "analytics_recalculation" and item.work is not None)
+    assert decision.deadline == deadline
+    assert decision.reason == ScheduleDecisionReason.DUE.value
+    assert decision.work.scope["input_version"] == 2
 
 
 def test_stale_q04_counters_do_not_block_a_new_budget_window_or_local_analytics() -> None:
