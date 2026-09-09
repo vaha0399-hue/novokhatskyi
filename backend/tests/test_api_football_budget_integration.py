@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -456,6 +457,210 @@ def test_heartbeat_and_takeover_keep_the_successfully_renewed_run_lease() -> Non
     assert contender.run_token == acquisition.run_token  # type: ignore[union-attr]
 
 
+def test_completion_rejects_run_lease_expiring_while_waiting_for_run_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_run_lock_expiry_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-run-lock-expiry-{uuid.uuid4().hex}", 987666, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    canonical_marker = f"Q04 run-lock marker {uuid.uuid4().hex}"
+
+    def staged_import(connection: psycopg.Connection, **_kwargs: object) -> None:
+        connection.execute("INSERT INTO football.countries(name) VALUES(%s)", (canonical_marker,))
+
+    monkeypatch.setattr(season_sync, "import_active_base", staged_import)
+    monkeypatch.setattr(season_sync, "verify_active_season", lambda *_args, **_kwargs: None)
+    rejected: list[BaseException] = []
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-run-lock-expiry") as repository:
+        acquisition = repository.start_run([policy])
+        item = repository.claim_next(acquisition.run_id, acquisition.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        backend_pid = repository._conn.pgconn.backend_pid
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as expire:
+            expire.execute(
+                "UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=%s",
+                (acquisition.run_id,),
+            )
+        with psycopg.connect(TEST_DB_URL, autocommit=False) as blocker:
+            blocker.execute("SELECT id FROM ops.sync_runs WHERE id=%s FOR UPDATE", (acquisition.run_id,))
+
+            def complete() -> None:
+                try:
+                    repository.import_verify_and_complete(
+                        item,
+                        acquisition.run_token,
+                        scope=season_sync.ActiveSeasonScope(policy.league_external_id, 2027, policy.expected_fixture_count),
+                        collected=(),
+                        checkpoint={"outcome": "late"},
+                    )
+                except BaseException as error:  # pragma: no cover - asserted below
+                    rejected.append(error)
+
+            waiting = threading.Thread(target=complete)
+            waiting.start()
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                for _ in range(100):
+                    row = observer.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s", (backend_pid,)
+                    ).fetchone()
+                    if row == ("Lock",):
+                        break
+                    time.sleep(0.01)
+                assert row == ("Lock",)
+            time.sleep(1.1)
+            blocker.commit()
+            waiting.join(timeout=5)
+
+    assert len(rejected) == 1 and isinstance(rejected[0], SeasonalRunLeaseLost)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,)
+        ).fetchone() == ("running", {})
+        assert verify.execute("SELECT count(*) FROM football.countries WHERE name=%s", (canonical_marker,)).fetchone() == (0,)
+
+
+def test_completion_rejects_item_lease_expiring_while_waiting_for_item_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_item_lock_expiry_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-item-lock-expiry-{uuid.uuid4().hex}", 987667, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    canonical_marker = f"Q04 item-lock marker {uuid.uuid4().hex}"
+
+    def staged_import(connection: psycopg.Connection, **_kwargs: object) -> None:
+        connection.execute("INSERT INTO football.countries(name) VALUES(%s)", (canonical_marker,))
+
+    monkeypatch.setattr(season_sync, "import_active_base", staged_import)
+    monkeypatch.setattr(season_sync, "verify_active_season", lambda *_args, **_kwargs: None)
+    rejected: list[BaseException] = []
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-item-lock-expiry") as repository:
+        acquisition = repository.start_run([policy])
+        item = repository.claim_next(acquisition.run_id, acquisition.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        backend_pid = repository._conn.pgconn.backend_pid
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as expire:
+            expire.execute(
+                "UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=%s",
+                (item.id,),
+            )
+        with psycopg.connect(TEST_DB_URL, autocommit=False) as blocker:
+            blocker.execute("SELECT id FROM ops.sync_work_items WHERE id=%s FOR UPDATE", (item.id,))
+
+            def complete() -> None:
+                try:
+                    repository.import_verify_and_complete(
+                        item,
+                        acquisition.run_token,
+                        scope=season_sync.ActiveSeasonScope(policy.league_external_id, 2027, policy.expected_fixture_count),
+                        collected=(),
+                        checkpoint={"outcome": "late"},
+                    )
+                except BaseException as error:  # pragma: no cover - asserted below
+                    rejected.append(error)
+
+            waiting = threading.Thread(target=complete)
+            waiting.start()
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                for _ in range(100):
+                    row = observer.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s", (backend_pid,)
+                    ).fetchone()
+                    if row == ("Lock",):
+                        break
+                    time.sleep(0.01)
+                assert row == ("Lock",)
+            time.sleep(1.1)
+            blocker.commit()
+            waiting.join(timeout=5)
+
+    assert len(rejected) == 1 and isinstance(rejected[0], SeasonalRunLeaseLost)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,)
+        ).fetchone() == ("running", {})
+        assert verify.execute("SELECT count(*) FROM football.countries WHERE name=%s", (canonical_marker,)).fetchone() == (0,)
+
+
+def test_completion_rejects_run_lease_expiring_while_waiting_for_item_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    operation = f"seasonal_active_bootstrap_item_wait_run_expiry_{uuid.uuid4().hex}"
+    season_sync.OPERATION = operation
+    policy = SeasonalLeaguePolicy(f"q04-item-wait-run-expiry-{uuid.uuid4().hex}", 987668, 2)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider = setup.execute("SELECT id FROM source.providers WHERE code='api-football'").fetchone()
+        if provider is None:
+            setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
+
+    canonical_marker = f"Q04 item-wait run marker {uuid.uuid4().hex}"
+
+    def staged_import(connection: psycopg.Connection, **_kwargs: object) -> None:
+        connection.execute("INSERT INTO football.countries(name) VALUES(%s)", (canonical_marker,))
+
+    monkeypatch.setattr(season_sync, "import_active_base", staged_import)
+    monkeypatch.setattr(season_sync, "verify_active_season", lambda *_args, **_kwargs: None)
+    rejected: list[BaseException] = []
+    with PostgresSeasonalSyncRepository(TEST_DB_URL, lease_owner="q04-item-wait-run-expiry") as repository:
+        acquisition = repository.start_run([policy])
+        item = repository.claim_next(acquisition.run_id, acquisition.run_token, {policy.league_external_id: policy})
+        assert item is not None
+        backend_pid = repository._conn.pgconn.backend_pid
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as expire:
+            expire.execute(
+                "UPDATE ops.sync_runs SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=%s",
+                (acquisition.run_id,),
+            )
+        with psycopg.connect(TEST_DB_URL, autocommit=False) as blocker:
+            blocker.execute("SELECT id FROM ops.sync_work_items WHERE id=%s FOR UPDATE", (item.id,))
+
+            def complete() -> None:
+                try:
+                    repository.import_verify_and_complete(
+                        item,
+                        acquisition.run_token,
+                        scope=season_sync.ActiveSeasonScope(policy.league_external_id, 2027, policy.expected_fixture_count),
+                        collected=(),
+                        checkpoint={"outcome": "late"},
+                    )
+                except BaseException as error:  # pragma: no cover - asserted below
+                    rejected.append(error)
+
+            waiting = threading.Thread(target=complete)
+            waiting.start()
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                for _ in range(100):
+                    row = observer.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s", (backend_pid,)
+                    ).fetchone()
+                    if row == ("Lock",):
+                        break
+                    time.sleep(0.01)
+                assert row == ("Lock",)
+            time.sleep(1.1)
+            blocker.commit()
+            waiting.join(timeout=5)
+
+    assert len(rejected) == 1 and isinstance(rejected[0], SeasonalRunLeaseLost)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,)
+        ).fetchone() == ("running", {})
+        assert verify.execute("SELECT count(*) FROM football.countries WHERE name=%s", (canonical_marker,)).fetchone() == (0,)
+
+
 def test_long_http_heartbeat_renews_without_holding_a_database_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -469,13 +674,18 @@ def test_long_http_heartbeat_renews_without_holding_a_database_transaction(
         if provider is None:
             setup.execute("INSERT INTO source.providers(code,name) VALUES('api-football','API-Football')")
 
-    renewed = threading.Event()
+    http_started = threading.Event()
+    heartbeat_during_http = threading.Event()
 
     class HeartbeatRepository(PostgresSeasonalSyncRepository):
+        renewals = 0
+
         def renew_run_lease(self, run_id: int, run_token: int) -> bool:
             result = super().renew_run_lease(run_id, run_token)
             if result:
-                renewed.set()
+                self.renewals += 1
+                if http_started.is_set():
+                    heartbeat_during_http.set()
             return result
 
     class LongProvider:
@@ -484,11 +694,14 @@ def test_long_http_heartbeat_renews_without_holding_a_database_transaction(
 
         async def get(self, endpoint: str, *, params: dict[str, str | int] | None = None):
             assert endpoint == "/leagues" and params == {"id": policy.league_external_id}
+            renewals_at_http_start = repository.renewals
+            http_started.set()
             for _ in range(40):
-                if renewed.is_set():
+                if heartbeat_during_http.is_set() and repository.renewals > renewals_at_http_start:
                     break
                 await asyncio.sleep(0.05)
-            assert renewed.is_set()
+            assert heartbeat_during_http.is_set()
+            assert repository.renewals > renewals_at_http_start
             with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
                 state = observer.execute(
                     "SELECT state, xact_start IS NULL FROM pg_stat_activity WHERE pid=%s", (self._backend_pid,)
