@@ -14,6 +14,7 @@ from app.sync.dispatch import Q03Dispatch, Q03DispatchRegistry
 from app.sync.repository import LeasedWorkItem
 from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
 from app.sync.scheduler_repository import PostgresSchedulerRepository, SchedulerEnqueueResult
+from app.sync.repository import RecalculationWork
 from app.sync.policies import AuthorizedSyncWork
 from app.sync.worker import AtomicWorkTransaction, WorkResult
 
@@ -59,6 +60,9 @@ class Q05SchedulerProcess:
             try:
                 with self._connection.transaction():
                     if decision.next_state is None:
+                        if isinstance(decision.work, RecalculationWork):
+                            results.append(self._repository.enqueue_recalculation(run_id=run_id, work=decision.work, available_at=decision.deadline or now))
+                            continue
                         if "fixture_id" not in decision.work.scope:
                             continue
                         results.append(self._repository.enqueue_event(

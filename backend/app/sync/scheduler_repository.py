@@ -18,7 +18,7 @@ from app.sync.policies import (
     SyncPolicyGate,
     SyncWorkRequest,
 )
-from app.sync.repository import PeriodicWork
+from app.sync.repository import PeriodicWork, RecalculationWork
 from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot
 
 
@@ -174,3 +174,10 @@ class PostgresSchedulerRepository:
         if row is None:
             raise RuntimeError("scheduler event enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))
+
+    def enqueue_recalculation(self, *, run_id: int, work: RecalculationWork, available_at: datetime) -> SchedulerEnqueueResult:
+        self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
+        row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version))).fetchone()
+        if row is None: raise RuntimeError("analytics enqueue/checkpoint did not return a result")
+        return SchedulerEnqueueResult(None if row[0] is None else int(row[0]),bool(row[1]),bool(row[2]))
