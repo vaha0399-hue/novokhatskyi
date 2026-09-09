@@ -19,7 +19,7 @@ from app.sync.policies import (
     SyncWorkRequest,
 )
 from app.sync.repository import PeriodicWork
-from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState
+from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,9 @@ class SchedulerMaterializedSnapshot:
     checkpoints: tuple[PeriodicScheduleState, ...]
     fixtures: tuple[FixtureScheduleSnapshot, ...]
     budget: BudgetSnapshot
+    seasons: tuple[SeasonScheduleSnapshot, ...]
+    analytics_inputs: tuple[AnalyticsInputSnapshot, ...]
+    input_gaps: tuple[str, ...]
 
 
 class PostgresSchedulerSnapshotReader:
@@ -62,18 +65,26 @@ class PostgresSchedulerSnapshotReader:
         policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
         checkpoints = tuple(PeriodicScheduleState(int(row[0]), int(row[1]), str(row[2]), row[3], row[4]) for row in self._connection.execute(
             "SELECT provider_id,season_id,work_type,last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints ORDER BY provider_id,season_id,work_type").fetchall())
-        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], row[8]) for row in self._connection.execute(
+        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], row[8], int(row[9] or 0), int(row[10] or 0), str(row[11]) == "completed") for row in self._connection.execute(
             """SELECT ref.fixture_id,ref.provider_id,fixture.season_id,fixture.kickoff_at,fixture.lifecycle_state::text,
-                      fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,reconciliation.eligible_at
+                      fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,reconciliation.eligible_at,
+                      reconciliation.attempt_count,reconciliation.max_attempts,reconciliation.state::text
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
                  LEFT JOIN ops.fixture_reconciliation_state reconciliation ON reconciliation.fixture_id=fixture.id
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
                  ORDER BY ref.provider_id,fixture.season_id,ref.fixture_id""").fetchall())
+        analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4]) for row in self._connection.execute(
+            """SELECT ref.provider_id,fixture.season_id,fixture.id,fixture.last_source_fetch_id,fixture.last_seen_at
+                 FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                 JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
+                WHERE fixture.last_source_fetch_id IS NOT NULL ORDER BY ref.provider_id,fixture.season_id,fixture.id""").fetchall())
+        seasons = tuple(SeasonScheduleSnapshot(int(row[0]), int(row[1]), None, False) for row in rows)
         row = self._connection.execute("""SELECT config.daily_limit,state.daily_used,config.minute_limit,state.minute_used,state.cooldown_until
                                           FROM ops.api_football_budget_config config LEFT JOIN ops.api_football_budget_state state ON state.singleton=true
                                          WHERE config.singleton=true""").fetchone()
         budget = BudgetSnapshot(None, None, None, None, None) if row is None else BudgetSnapshot(*row)
-        return SchedulerMaterializedSnapshot(tuple(policy for policy in policies if policy is not None), checkpoints, fixtures, budget)
+        return SchedulerMaterializedSnapshot(tuple(policy for policy in policies if policy is not None), checkpoints, fixtures, budget, seasons, analytics_inputs,
+                                             ("season_expected_start_unavailable",))
 
 
 class PostgresSchedulerRepository:

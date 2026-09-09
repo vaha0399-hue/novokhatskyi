@@ -12,7 +12,7 @@ from psycopg import Connection
 from app.sync.policies import CompetitionSyncPolicy, SyncPolicyDenied
 from app.sync.dispatch import Q03Dispatch, Q03DispatchRegistry
 from app.sync.repository import LeasedWorkItem
-from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
+from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
 from app.sync.scheduler_repository import PostgresSchedulerRepository, SchedulerEnqueueResult
 from app.sync.policies import AuthorizedSyncWork
 from app.sync.worker import AtomicWorkTransaction, WorkResult
@@ -37,9 +37,9 @@ class Q05SchedulerProcess:
         self._registry = Q03DispatchRegistry(handlers)
 
     def preview(self, *, now: datetime, policies: Iterable[CompetitionSyncPolicy],
-                schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None) -> SchedulerPreview:
+                schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None, seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = ()) -> SchedulerPreview:
         return self._scheduler.preview(now=now, policies=policies, schedule_state=schedule_state,
-                                       executable_work_types=self._registry.available_work_types(), fixtures=fixtures, budget=budget)
+                                       executable_work_types=self._registry.available_work_types(), fixtures=fixtures, budget=budget, seasons=seasons, analytics_inputs=analytics_inputs)
 
     def enqueue_due(self, *, run_id: int, now: datetime, policies: Iterable[CompetitionSyncPolicy],
                     schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None) -> SchedulerRunResult:

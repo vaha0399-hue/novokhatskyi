@@ -45,6 +45,7 @@ class ScheduleDecisionReason(StrEnum):
     HANDLER_UNAVAILABLE = "handler_unavailable"
     BUDGET_COOLDOWN = "budget_cooldown"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    RETRY_EXHAUSTED = "retry_exhausted"
 
 
 class ApiCost(StrEnum):
@@ -304,9 +305,13 @@ class SyncScheduler:
                 decisions.append(SchedulerDecision(work.scope, work_type, work.stable_key(), deadline, policy.priority, reason, work, ApiCost.UNKNOWN))
             scheduled_types = {work_type for work_type, _deadline in self._fixture_deadlines(fixture, policy, current)}
             for work_type in sorted((set(policy.allowed_work_types) & SECTION_7_WORK_TYPES) - scheduled_types):
+                reason = ScheduleDecisionReason.RETRY_EXHAUSTED.value if (
+                    work_type == "statistics_retry" and fixture.statistics_eligible_at is not None
+                    and not fixture.statistics_completed and fixture.statistics_attempts >= min(fixture.statistics_max_attempts, 5)
+                ) else ScheduleDecisionReason.INPUT_UNAVAILABLE.value
                 decisions.append(SchedulerDecision(
                     {"provider_id": fixture.provider_id, "season_id": fixture.season_id, "fixture_id": fixture.fixture_id, "work_type": work_type},
-                    work_type, None, None, policy.priority, ScheduleDecisionReason.INPUT_UNAVAILABLE.value,
+                    work_type, None, None, policy.priority, reason,
                 ))
 
         latest_inputs: dict[tuple[int, int, str], AnalyticsInputSnapshot] = {}

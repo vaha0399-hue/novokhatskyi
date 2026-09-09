@@ -39,7 +39,7 @@ def main() -> None:
         # code must inject reviewed Q03 handler pairs before using --enqueue.
         process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, gate), SyncScheduler(), {})
         result = (process.enqueue_due(run_id=args.run_id, now=now, policies=snapshot.policies, schedule_state=snapshot.checkpoints, fixtures=snapshot.fixtures, budget=snapshot.budget)
-                  if args.enqueue else process.preview(now=now, policies=snapshot.policies, schedule_state=snapshot.checkpoints, fixtures=snapshot.fixtures, budget=snapshot.budget))
+                  if args.enqueue else process.preview(now=now, policies=snapshot.policies, schedule_state=snapshot.checkpoints, fixtures=snapshot.fixtures, budget=snapshot.budget, seasons=snapshot.seasons, analytics_inputs=snapshot.analytics_inputs))
     print(json.dumps({"snapshot": asdict(snapshot), "result": asdict(result)}, default=_json_default, sort_keys=True))
 
 

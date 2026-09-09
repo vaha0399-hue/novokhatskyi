@@ -239,4 +239,4 @@ def test_analytics_uses_latest_input_version_and_statistics_retries_are_bounded(
     retry = _decision(preview, "statistics_retry")
     assert retry.deadline == fixture.statistics_eligible_at + timedelta(hours=1)
     exhausted = FixtureScheduleSnapshot(10, 7, 101, now - timedelta(hours=4), "completed", statistics_eligible_at=now, statistics_attempts=5, statistics_max_attempts=5)
-    assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[exhausted]), "statistics_retry").reason == ScheduleDecisionReason.INPUT_UNAVAILABLE.value
+    assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[exhausted]), "statistics_retry").reason == ScheduleDecisionReason.RETRY_EXHAUSTED.value
