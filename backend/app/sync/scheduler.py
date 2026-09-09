@@ -208,9 +208,8 @@ def _closed_boundary(now: datetime, interval: timedelta) -> datetime:
 
 
 def _next_closed_boundary(now: datetime, interval: timedelta) -> datetime:
-    """Return the close of the current window, except at its exact boundary."""
-    boundary = _closed_boundary(now, interval)
-    return boundary if boundary == now else boundary + interval
+    """Return the exclusive close of the window containing the event."""
+    return _closed_boundary(now, interval) + interval
 
 
 def _scope(policy: CompetitionSyncPolicy, work_type: str, start: datetime, end: datetime, windows: int) -> dict[str, object]:

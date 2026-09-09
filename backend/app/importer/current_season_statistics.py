@@ -286,6 +286,9 @@ def _batch_entries(
         elif state == "empty":
             unavailable.add(target.fixture_id)
         elif state == "partial":
+            expected = {target.home_external_team_id, target.away_external_team_id}
+            if len(mapped) != 1 or mapped[0]["external_team_id"] not in expected:
+                raise StatisticsContractError("statistics team is not a canonical fixture participant")
             partial.add(target.fixture_id)
     return BatchParseResult(
         frozenset(by_external[external_id].fixture_id for external_id in seen), parsed,

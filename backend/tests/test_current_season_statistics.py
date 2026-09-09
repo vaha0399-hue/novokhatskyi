@@ -116,6 +116,15 @@ def test_partial_statistics_are_skipped_without_inventing_a_half_pair() -> None:
     assert parsed.statistics_by_fixture[1] is not None and parsed.statistics_by_fixture[3] is not None
 
 
+def test_partial_statistics_rejects_a_nonparticipant_team() -> None:
+    payload = json.loads(SAMPLE.read_text())
+    payload["response"][1]["statistics"] = payload["response"][1]["statistics"][:1]
+    payload["response"][1]["statistics"][0]["team"]["id"] = 999_999
+
+    with pytest.raises(StatisticsContractError, match="statistics team is not a canonical fixture participant"):
+        _batch_entries(payload, targets=_sample_targets(), league_external_id=39)
+
+
 def test_empty_statistics_is_a_retryable_fixture_coverage_state() -> None:
     payload = json.loads(SAMPLE.read_text())
     payload["response"][1]["statistics"] = []

@@ -102,7 +102,7 @@ candidate visible as `handler_unavailable`, and missing saved input is
 | statistics retry | eligibility offsets 0, 15m, 1h, 6h, 24h; capped retry becomes `retry_exhausted` | `test_statistics_retry_follows_all_configured_offsets_and_signals_exhaustion` |
 | correction check | immutable first-terminal +24h and +72h event windows | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions` |
 | standings | daily control away from a matchday; policy interval on a matchday | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs`; `test_standings_uses_hourly_policy_interval_on_a_matchday` |
-| analytics/scanner | fixture-write trigger records the latest version in each fixed 60-second window; enqueue atomically records Q02 work, version identity, and window acceptance | `test_q05_analytics_windows_keep_their_first_deadline_across_delay_and_restart`; `test_q05_analytics_event_on_a_window_boundary_waits_for_the_next_close`; `test_q05_two_scheduler_connections_accept_one_analytics_window_once` |
+| analytics/scanner | fixture-write trigger records the latest version in each fixed 60-second window; an event exactly on a boundary starts the next window; enqueue atomically records Q02 work, version identity, and window acceptance | `test_q05_analytics_windows_keep_their_first_deadline_across_delay_and_restart`; `test_q05_analytics_event_on_a_window_boundary_waits_for_the_next_close`; `test_q05_two_scheduler_connections_accept_one_analytics_window_once` |
 | quality sweep | daily policy work from the saved season input | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs` |
 
 The repository boundary is covered by real isolated PostgreSQL sessions:
@@ -118,6 +118,10 @@ Analytics windows begin only when the additive fixture trigger observes a new
 saved `last_source_fetch_id`. Existing fixtures without an observed window are
 reported as `analytics_window_history_unavailable`; the scheduler does not
 invent a historical input sequence from the current latest value.
+If a version arrives for an already accepted source window, the trigger keeps
+that accepted row immutable and stores the latest late version in the next free
+durable window. Its deadline is fixed at capture time; ordinary and other late
+windows that collide with that slot spill forward without overwriting versions.
 
 ## Q03 leases
 

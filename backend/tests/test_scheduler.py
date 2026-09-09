@@ -400,6 +400,21 @@ def test_analytics_window_deadline_survives_continuous_versions_after_its_close(
     assert decision.work.scope["input_version"] == 2
 
 
+def test_direct_analytics_event_on_boundary_belongs_to_the_new_window() -> None:
+    observed = datetime(2026, 9, 8, 12, 2, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"analytics_recalculation"}),
+        coverage={"analytics_recalculation": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+        refresh_intervals={"analytics_recalculation": RefreshInterval(1, "minute")},
+    )
+    decision = _decision(SyncScheduler().preview(
+        now=observed + timedelta(seconds=1), policies=[policy], schedule_state=[],
+        analytics_inputs=[AnalyticsInputSnapshot(7, 101, "fixture:9", 3, observed)],
+    ), "analytics_recalculation")
+    assert decision.deadline == observed + timedelta(minutes=1)
+    assert decision.reason == ScheduleDecisionReason.NOT_DUE.value
+
+
 def test_stale_q04_counters_do_not_block_a_new_budget_window_or_local_analytics() -> None:
     now = datetime(2026, 9, 8, 12, 1, tzinfo=UTC)
     policy = _policy(
@@ -409,7 +424,7 @@ def test_stale_q04_counters_do_not_block_a_new_budget_window_or_local_analytics(
     )
     preview = SyncScheduler().preview(
         now=now, policies=[policy], schedule_state=[_state("calendar_refresh", now - timedelta(hours=2), next_deadline=now - timedelta(hours=1))],
-        analytics_inputs=[AnalyticsInputSnapshot(7, 101, "fixture:9", 2, now)],
+        analytics_inputs=[AnalyticsInputSnapshot(7, 101, "fixture:9", 2, now - timedelta(seconds=1))],
         budget=_Budget(daily_limit=1, daily_used=1, minute_limit=1, minute_used=1,
                        daily_window=(now - timedelta(days=1)).date(), minute_window=now - timedelta(minutes=1)),
     )
