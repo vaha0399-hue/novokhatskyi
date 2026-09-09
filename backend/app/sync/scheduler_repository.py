@@ -177,7 +177,12 @@ class PostgresSchedulerRepository:
 
     def enqueue_recalculation(self, *, run_id: int, work: RecalculationWork, available_at: datetime) -> SchedulerEnqueueResult:
         self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
-        row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version))).fetchone()
+        try:
+            row = self._connection.execute("SELECT * FROM ops.enqueue_repeatable_analytics_work_and_checkpoint(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (run_id,work.stable_key(),Jsonb(dict(work.scope)),work.work_type,work.priority,available_at,work.stable_key(),work.entity_key,work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",work.provider_id,work.season_id,str(work.input_version))).fetchone()
+        except psycopg.Error as exc:
+            if exc.sqlstate == "55000":
+                raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
+            raise
         if row is None: raise RuntimeError("analytics enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]),bool(row[1]),bool(row[2]))

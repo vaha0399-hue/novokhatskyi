@@ -19,7 +19,7 @@ from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLea
 from app.importer.catalogue_bootstrap import CatalogueBootstrapError, PostgresRepository as CatalogueRepository, WorkItem
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
-from app.sync.scheduler import PeriodicScheduleState, SyncScheduler
+from app.sync.scheduler import AnalyticsInputSnapshot, PeriodicScheduleState, SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import PostgresSchedulerRepository
 from app.sync.scheduler_repository import PostgresSchedulerSnapshotReader
@@ -399,6 +399,42 @@ class _Q05Dispatch:
 
     def apply_result(self, writer, item, result) -> None:
         raise AssertionError("scheduler must not write results")
+
+
+def test_q05_process_enqueues_analytics_and_deduplicates_versions() -> None:
+    assert TEST_DB_URL is not None
+    suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 1, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        connection.execute("UPDATE ops.competition_sync_policies SET enabled=true,allowed_work_types=ARRAY['analytics_recalculation'],coverage=%s,refresh_intervals=%s WHERE provider_id=%s AND season_id=%s", (Jsonb({'analytics_recalculation': {'state':'covered','observed_on':'2026-09-09'}}), Jsonb({'analytics_recalculation': {'value':1,'unit':'minute'}}), provider_id, season_id))
+        policy = PostgresCompetitionSyncPolicyReader(connection).get(provider_id=provider_id, season_id=season_id); assert policy is not None
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)), SyncScheduler(), {'analytics_recalculation': _Q05Dispatch()})
+        first = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
+        assert len(first.enqueue_results) == 1 and first.enqueue_results[0].enqueued
+        again = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
+        assert len(again.enqueue_results) == 1 and not again.enqueue_results[0].enqueued
+        newer = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 2, now + timedelta(seconds=1))])
+        assert len(newer.enqueue_results) == 1 and newer.enqueue_results[0].enqueued
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 2
+
+
+def test_q05_analytics_no_handler_and_stale_policy_write_nothing() -> None:
+    assert TEST_DB_URL is not None
+    suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 1, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        connection.execute("UPDATE ops.competition_sync_policies SET enabled=true,allowed_work_types=ARRAY['analytics_recalculation'],coverage=%s,refresh_intervals=%s WHERE provider_id=%s AND season_id=%s", (Jsonb({'analytics_recalculation': {'state':'covered','observed_on':'2026-09-09'}}), Jsonb({'analytics_recalculation': {'value':1,'unit':'minute'}}), provider_id, season_id))
+        policy = PostgresCompetitionSyncPolicyReader(connection).get(provider_id=provider_id, season_id=season_id); assert policy is not None
+        inp = [AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)]
+        gate = SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)
+        no_handler = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, gate), SyncScheduler(), {})
+        assert no_handler.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=inp).enqueue_results == ()
+        connection.execute("UPDATE ops.competition_sync_policies SET priority=priority+1 WHERE provider_id=%s AND season_id=%s", (provider_id, season_id))
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, gate), SyncScheduler(), {'analytics_recalculation': _Q05Dispatch()})
+        result = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[], analytics_inputs=inp)
+        assert result.policy_denials == ('version_changed',)
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM ops.sync_scheduler_analytics_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == 0
 
 
 def test_q05_preview_fingerprint_survives_process_repository_to_locked_sql() -> None:
