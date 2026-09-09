@@ -264,7 +264,7 @@ def test_q05_policy_lock_rechecks_calculation_fingerprint_with_real_connections(
     scope = Jsonb({"_sync_policy": {
         "provider_id": provider_id, "season_id": season_id, "work_type": "calendar_refresh",
         "instance_id": int(policy[0]), "version": int(policy[1]),
-    }})
+    }, "window_start": "2026-09-09T00:00:00+00:00", "window_end": "2026-09-09T01:00:00+00:00"})
     started = threading.Event()
     backend_pid: list[int] = []
     outcome: list[str] = []
@@ -280,7 +280,7 @@ def test_q05_policy_lock_rechecks_calculation_fingerprint_with_real_connections(
                     "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (run_id, stable_key, scope, "calendar_refresh", 0, datetime(2026, 9, 9, tzinfo=UTC),
                      stable_key, "season:" + str(season_id), "season:" + str(season_id), provider_id, season_id,
-                     None, None, datetime(2026, 9, 9, tzinfo=UTC), datetime(2026, 9, 9, 1, tzinfo=UTC)),
+                     None, None, datetime(2026, 9, 9, 1, tzinfo=UTC), datetime(2026, 9, 9, 2, tzinfo=UTC)),
                 ).fetchone()
                 outcome.append("enqueued")
             except psycopg.Error as exc:
