@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.sync.policies import CompetitionSyncPolicy, CoverageObservation, CoverageState, RefreshInterval
-from app.sync.scheduler import ApiCost, FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
+from app.sync.scheduler import AnalyticsInputSnapshot, ApiCost, FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SeasonScheduleSnapshot, SyncScheduler
 
 
 class _Budget:
@@ -211,3 +211,32 @@ def test_budget_snapshot_defers_due_work_without_reserving_requests() -> None:
                                       budget=_Budget(cooldown_until=now + timedelta(minutes=5)))
     assert {item.reason for item in preview.decisions} == {ScheduleDecisionReason.BUDGET_COOLDOWN.value}
     assert preview.planned_jobs == () and preview.api_request_cost.value is ApiCost.UNKNOWN
+
+
+def test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs() -> None:
+    policy = _policy(allowed_work_types=frozenset({"season_discovery", "quality_sweep", "standings_refresh"}),
+                     coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("season_discovery", "quality_sweep", "standings_refresh")},
+                     refresh_intervals={"season_discovery": RefreshInterval(1, "week"), "quality_sweep": RefreshInterval(1, "day"), "standings_refresh": RefreshInterval(1, "hour")})
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    states = [_state(name, now - timedelta(days=2), next_deadline=now - timedelta(days=1)) for name in ("season_discovery", "quality_sweep", "standings_refresh")]
+    preview = SyncScheduler().preview(now=now, policies=[policy], schedule_state=states,
+                                      seasons=[SeasonScheduleSnapshot(7, 101, now + timedelta(days=10), False)])
+    assert {item.work_type for item in preview.planned_jobs} == {"season_discovery", "quality_sweep", "standings_refresh"}
+    standings = _decision(preview, "standings_refresh")
+    assert standings.work is not None and standings.work.window_end == now
+
+
+def test_analytics_uses_latest_input_version_and_statistics_retries_are_bounded() -> None:
+    policy = _policy(allowed_work_types=frozenset({"analytics_recalculation", "statistics_retry"}),
+                     coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("analytics_recalculation", "statistics_retry")},
+                     refresh_intervals={"analytics_recalculation": RefreshInterval(1, "minute"), "statistics_retry": RefreshInterval(1, "hour")})
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    fixture = FixtureScheduleSnapshot(9, 7, 101, now - timedelta(hours=4), "completed", statistics_eligible_at=now - timedelta(hours=2), statistics_attempts=2, statistics_max_attempts=5)
+    preview = SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[fixture],
+                                      analytics_inputs=[AnalyticsInputSnapshot(7, 101, "team:9", 1, now - timedelta(seconds=30)), AnalyticsInputSnapshot(7, 101, "team:9", 2, now)])
+    analytics = next(item for item in preview.decisions if item.work_type == "analytics_recalculation" and item.work is not None)
+    assert analytics.work.scope["input_version"] == 2
+    retry = _decision(preview, "statistics_retry")
+    assert retry.deadline == fixture.statistics_eligible_at + timedelta(hours=1)
+    exhausted = FixtureScheduleSnapshot(10, 7, 101, now - timedelta(hours=4), "completed", statistics_eligible_at=now, statistics_attempts=5, statistics_max_attempts=5)
+    assert _decision(SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[exhausted]), "statistics_retry").reason == ScheduleDecisionReason.INPUT_UNAVAILABLE.value

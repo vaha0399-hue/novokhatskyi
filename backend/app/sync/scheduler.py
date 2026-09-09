@@ -20,12 +20,12 @@ from app.sync.policies import (
     SyncPolicyGate,
     SyncWorkRequest,
 )
-from app.sync.repository import PeriodicWork
+from app.sync.repository import PeriodicWork, RecalculationWork
 
 
 CALENDAR_REFRESH = "calendar_refresh"
 STANDINGS_REFRESH = "standings_refresh"
-SUPPORTED_PERIODIC_WORK_TYPES = frozenset((CALENDAR_REFRESH, STANDINGS_REFRESH))
+SUPPORTED_PERIODIC_WORK_TYPES = frozenset((CALENDAR_REFRESH, STANDINGS_REFRESH, "season_discovery", "quality_sweep"))
 # These names make the whole Section 7 surface auditable.  Only the first two
 # have a reviewed input adapter in this slice; the rest must remain explicit
 # skips until their D/A readers and Q03 handlers are supplied.
@@ -67,6 +67,9 @@ class FixtureScheduleSnapshot:
     result_finalized_at: datetime | None = None
     first_terminal_observed_at: datetime | None = None
     statistics_eligible_at: datetime | None = None
+    statistics_attempts: int = 0
+    statistics_max_attempts: int = 5
+    statistics_completed: bool = False
 
     def __post_init__(self) -> None:
         if self.fixture_id <= 0 or self.provider_id <= 0 or self.season_id <= 0:
@@ -75,6 +78,30 @@ class FixtureScheduleSnapshot:
         for value in (self.terminal_observed_at, self.result_finalized_at, self.first_terminal_observed_at, self.statistics_eligible_at):
             if value is not None:
                 _require_aware(value, "fixture schedule timestamp")
+        if self.statistics_attempts < 0 or self.statistics_max_attempts < 0:
+            raise ValueError("statistics attempts must not be negative")
+
+
+@dataclass(frozen=True)
+class SeasonScheduleSnapshot:
+    provider_id: int
+    season_id: int
+    expected_season_start: datetime | None = None
+    matchday_today: bool = False
+
+
+@dataclass(frozen=True)
+class AnalyticsInputSnapshot:
+    provider_id: int
+    season_id: int
+    entity_key: str
+    input_version: str | int
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.provider_id <= 0 or self.season_id <= 0 or not self.entity_key.strip():
+            raise ValueError("analytics input scope is malformed")
+        _require_aware(self.observed_at, "analytics input observation")
 
 
 @dataclass(frozen=True)
@@ -112,7 +139,7 @@ class SchedulerDecision:
     deadline: datetime | None
     priority: int | None
     reason: str
-    work: PeriodicWork | None = None
+    work: PeriodicWork | RecalculationWork | None = None
     api_cost: ApiCost | None = None
     next_state: PeriodicScheduleState | None = None
 
@@ -135,7 +162,7 @@ class SchedulerPreview:
     api_request_cost: ApiCostEstimate
 
     @property
-    def planned_jobs(self) -> tuple[PeriodicWork, ...]:
+    def planned_jobs(self) -> tuple[PeriodicWork | RecalculationWork, ...]:
         return tuple(item.work for item in self.decisions if item.reason == ScheduleDecisionReason.DUE.value and item.work is not None)
 
 
@@ -206,6 +233,8 @@ class SyncScheduler:
         executable_work_types: Iterable[str] | None = None,
         fixtures: Iterable[FixtureScheduleSnapshot] = (),
         budget: object | None = None,
+        seasons: Iterable[SeasonScheduleSnapshot] = (),
+        analytics_inputs: Iterable[AnalyticsInputSnapshot] = (),
     ) -> SchedulerPreview:
         _require_aware(now, "now")
         current = now.astimezone(UTC)
@@ -220,7 +249,7 @@ class SyncScheduler:
         next_by_key = dict(state_by_key)
 
         for policy in sorted(policy_by_scope.values(), key=lambda item: (item.provider_id, item.season_id)):
-            for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES):
+            for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES & set(policy.allowed_work_types)):
                 decision = self._periodic_decision(policy, work_type, state_by_key.get((policy.provider_id, policy.season_id, work_type)), current, gate)
                 if decision.work is not None and executable is not None and work_type not in executable:
                     decision = SchedulerDecision(
@@ -240,6 +269,18 @@ class SyncScheduler:
                 ))
 
         fixture_values = tuple(fixtures)
+        season_values = {(item.provider_id, item.season_id): item for item in seasons}
+        for policy in policy_by_scope.values():
+            season = season_values.get((policy.provider_id, policy.season_id))
+            if season is not None and season.expected_season_start is not None and "season_discovery" in policy.allowed_work_types and season.expected_season_start <= current + timedelta(days=30):
+                # The daily preseason boundary is stable and never bypasses Q01.
+                decision = self._periodic_decision(policy, "season_discovery", state_by_key.get((policy.provider_id, policy.season_id, "season_discovery")), current, gate, interval_override=timedelta(days=1))
+                decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "season_discovery")]
+                decisions.append(decision)
+            if season is not None and "standings_refresh" in policy.allowed_work_types:
+                decision = self._periodic_decision(policy, "standings_refresh", state_by_key.get((policy.provider_id, policy.season_id, "standings_refresh")), current, gate, interval_override=None if season.matchday_today else timedelta(days=1))
+                decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "standings_refresh")]
+                decisions.append(decision)
         for policy in policy_by_scope.values():
             if not any((item.provider_id, item.season_id) == (policy.provider_id, policy.season_id) for item in fixture_values):
                 for work_type in sorted(set(policy.allowed_work_types) & SECTION_7_WORK_TYPES):
@@ -267,6 +308,24 @@ class SyncScheduler:
                     {"provider_id": fixture.provider_id, "season_id": fixture.season_id, "fixture_id": fixture.fixture_id, "work_type": work_type},
                     work_type, None, None, policy.priority, ScheduleDecisionReason.INPUT_UNAVAILABLE.value,
                 ))
+
+        latest_inputs: dict[tuple[int, int, str], AnalyticsInputSnapshot] = {}
+        for item in analytics_inputs:
+            key = (item.provider_id, item.season_id, item.entity_key)
+            if key not in latest_inputs or item.observed_at > latest_inputs[key].observed_at:
+                latest_inputs[key] = item
+        for item in latest_inputs.values():
+            policy = policy_by_scope.get((item.provider_id, item.season_id))
+            if policy is None or "analytics_recalculation" not in policy.allowed_work_types:
+                continue
+            try:
+                gate.before_enqueue(SyncWorkRequest(item.provider_id, item.season_id, "analytics_recalculation"))
+            except SyncPolicyDenied as error:
+                decisions.append(SchedulerDecision({"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key}, "analytics_recalculation", None, item.observed_at, policy.priority, error.reason.value))
+                continue
+            work = RecalculationWork(item.provider_id, item.season_id, "analytics_recalculation", item.entity_key, item.input_version, policy.priority, {"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key, "input_version": item.input_version, "_sync_policy": _policy_fingerprint(policy, "analytics_recalculation")})
+            reason = ScheduleDecisionReason.DUE.value if executable is None or "analytics_recalculation" in executable else ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+            decisions.append(SchedulerDecision(work.scope, work.work_type, work.stable_key(), _closed_boundary(current, timedelta(seconds=60)), policy.priority, reason, work, ApiCost.UNKNOWN))
 
         budget_reason = self._budget_reason(budget, current)
         if budget_reason is not None:
@@ -311,8 +370,10 @@ class SyncScheduler:
             values.append(("overdue_status_check", kickoff + timedelta(minutes=15)))
         if fixture.terminal_observed_at is not None and fixture.result_finalized_at is None and now >= kickoff + timedelta(hours=3):
             values.append(("result_finalization", max(kickoff + timedelta(hours=3), fixture.terminal_observed_at.astimezone(UTC))))
-        if fixture.statistics_eligible_at is not None:
-            values.append(("statistics_retry", fixture.statistics_eligible_at.astimezone(UTC)))
+        if fixture.statistics_eligible_at is not None and not fixture.statistics_completed:
+            retry_offsets = (timedelta(), timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
+            if fixture.statistics_attempts < min(fixture.statistics_max_attempts, len(retry_offsets)):
+                values.append(("statistics_retry", fixture.statistics_eligible_at.astimezone(UTC) + retry_offsets[fixture.statistics_attempts]))
         if fixture.first_terminal_observed_at is not None:
             first = fixture.first_terminal_observed_at.astimezone(UTC)
             values.extend((("correction_check", first + timedelta(hours=24)), ("correction_check", first + timedelta(hours=72))))
@@ -351,6 +412,7 @@ class SyncScheduler:
         state: PeriodicScheduleState | None,
         now: datetime,
         gate: SyncPolicyGate,
+        interval_override: timedelta | None = None,
     ) -> SchedulerDecision:
         try:
             authorization = gate.before_enqueue(SyncWorkRequest(policy.provider_id, policy.season_id, work_type))
@@ -360,7 +422,7 @@ class SyncScheduler:
                 work_type=work_type, stable_key=None, deadline=None, priority=policy.priority, reason=error.reason.value,
             )
 
-        interval = _interval_delta(authorization.refresh_interval)
+        interval = interval_override or _interval_delta(authorization.refresh_interval)
         if state is None:
             deadline = _closed_boundary(now, interval)
             start = deadline - interval
