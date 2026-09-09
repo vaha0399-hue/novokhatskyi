@@ -449,6 +449,7 @@ def test_q05_analytics_policy_rejection_rolls_back_and_same_connection_recovers(
         stale = process.enqueue_due(run_id=run_id, now=now, policies=[old], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
         assert stale.policy_denials == ('version_changed',)
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM ops.sync_scheduler_analytics_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == 0
         fresh = reader.get(provider_id=provider_id, season_id=season_id); assert fresh is not None
         accepted = process.enqueue_due(run_id=run_id, now=now, policies=[fresh], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
         assert len(accepted.enqueue_results) == 1 and accepted.enqueue_results[0].enqueued
