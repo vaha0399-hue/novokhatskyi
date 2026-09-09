@@ -43,12 +43,14 @@ class Q05SchedulerProcess:
                                        executable_work_types=self._registry.available_work_types(), fixtures=fixtures, budget=budget, seasons=seasons, analytics_inputs=analytics_inputs)
 
     def enqueue_due(self, *, run_id: int, now: datetime, policies: Iterable[CompetitionSyncPolicy],
-                    schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None) -> SchedulerRunResult:
+                    schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None,
+                    seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = ()) -> SchedulerRunResult:
         # Preview and its transaction use precisely one materialized snapshot.
         # In particular, a generator must not lose the expected checkpoint on
         # its second traversal.
         policy_values, state_values, fixture_values = tuple(policies), tuple(schedule_state), tuple(fixtures)
-        preview = self.preview(now=now, policies=policy_values, schedule_state=state_values, fixtures=fixture_values, budget=budget)
+        season_values, analytics_values = tuple(seasons), tuple(analytics_inputs)
+        preview = self.preview(now=now, policies=policy_values, schedule_state=state_values, fixtures=fixture_values, budget=budget, seasons=season_values, analytics_inputs=analytics_values)
         state_by_key = {state.key(): state for state in state_values}
         results: list[SchedulerEnqueueResult] = []
         denials: list[str] = []
