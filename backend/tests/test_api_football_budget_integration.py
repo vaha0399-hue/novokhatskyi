@@ -163,6 +163,32 @@ def test_provider_headers_only_reduce_shared_capacity_and_reject_invalid_inputs(
         assert _reserve(second, "operations")[:2] == (False, "provider_daily_exhausted")
 
 
+def test_positive_provider_remaining_is_a_shared_decreasing_cap_and_stale_headers_do_not_credit() -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset(connection, daily=20, minute=20, operations=20, history=0, manual=0, reserve=0)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        connection.execute(
+            "SELECT ops.observe_api_football_budget(%s,%s::jsonb)",
+            (200, '{"x-ratelimit-requests-limit":"100","x-ratelimit-requests-remaining":"2","x-ratelimit-limit":"100","x-ratelimit-remaining":"2"}'),
+        )
+        assert connection.execute(
+            "SELECT provider_daily_remaining,provider_minute_remaining FROM ops.api_football_budget_state"
+        ).fetchone() == (2, 2)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        # A stale response reports an older, larger remaining value.  It can
+        # never replenish an already decremented provider cap.
+        connection.execute(
+            "SELECT ops.observe_api_football_budget(%s,%s::jsonb)",
+            (200, '{"x-ratelimit-requests-limit":"100","x-ratelimit-requests-remaining":"99","x-ratelimit-limit":"100","x-ratelimit-remaining":"99"}'),
+        )
+        assert connection.execute(
+            "SELECT provider_daily_remaining,provider_minute_remaining FROM ops.api_football_budget_state"
+        ).fetchone() == (1, 1)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        assert _reserve(connection, "operations")[:2] == (False, "provider_daily_exhausted")
+
+
 def test_live_and_sync_clients_share_budget_before_http_without_a_held_budget_lock() -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
