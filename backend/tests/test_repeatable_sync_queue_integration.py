@@ -19,6 +19,9 @@ from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLea
 from app.importer.catalogue_bootstrap import CatalogueBootstrapError, PostgresRepository as CatalogueRepository, WorkItem
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
+from app.sync.scheduler import PeriodicScheduleState, SyncScheduler
+from app.sync.scheduler_process import Q05SchedulerProcess
+from app.sync.scheduler_repository import PostgresSchedulerRepository
 from app.sync.worker import RepeatableSyncWorker, WorkResult
 from app.importer.cup_canonical import CupCanonicalSink
 
@@ -387,6 +390,35 @@ def _q05_scheduler_transition(
     ).fetchone()
     assert row is not None
     return None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2])
+
+
+class _Q05Dispatch:
+    def fetch(self, item, authorization):
+        raise AssertionError("scheduler must not fetch")
+
+    def apply_result(self, writer, item, result) -> None:
+        raise AssertionError("scheduler must not write results")
+
+
+def test_q05_preview_fingerprint_survives_process_repository_to_locked_sql() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    now = datetime(2026, 9, 9, 1, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance_id, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        reader = PostgresCompetitionSyncPolicyReader(connection)
+        policy = reader.get(provider_id=provider_id, season_id=season_id)
+        assert policy is not None
+        state = PeriodicScheduleState(provider_id, season_id, "calendar_refresh", now - timedelta(hours=1), now)
+        gate = SyncPolicyGate(reader, now=lambda: now)
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, gate), SyncScheduler(), {"calendar_refresh": _Q05Dispatch()})
+        preview = process.preview(now=now, policies=[policy], schedule_state=[state])
+        assert preview.planned_jobs and preview.planned_jobs[0].scope["_sync_policy"]["version"] == policy.policy_version  # type: ignore[index]
+        connection.execute("UPDATE ops.competition_sync_policies SET priority=priority+1 WHERE provider_id=%s AND season_id=%s", (provider_id, season_id))
+        result = process.enqueue_due(run_id=run_id, now=now, policies=[policy], schedule_state=[state])
+        assert result.policy_denials == ("version_changed",) and result.enqueue_results == ()
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == 0
 
 
 def test_q05_two_schedulers_keep_one_checkpoint_transition_and_stale_candidate_is_safe() -> None:

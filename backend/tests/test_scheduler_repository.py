@@ -38,7 +38,10 @@ class _Connection:
 
 def _work() -> PeriodicWork:
     start = datetime(2026, 9, 8, tzinfo=UTC)
-    return PeriodicWork(7, 101, "calendar_refresh", "season:101", start, start + timedelta(hours=1), 3, {})
+    return PeriodicWork(7, 101, "calendar_refresh", "season:101", start, start + timedelta(hours=1), 3, {
+        "window_start": start.isoformat(), "window_end": (start + timedelta(hours=1)).isoformat(),
+        "_sync_policy": {"provider_id": 7, "season_id": 101, "work_type": "calendar_refresh", "instance_id": 1, "version": 1},
+    })
 
 
 def _state(end: datetime) -> PeriodicScheduleState:

@@ -338,6 +338,10 @@ class RepeatableSyncWorker:
                 raise LeaseLost("repeatable work-item lease was lost before completion")
         return True
 
+    def run_registered_once(self, registry: Any, *, max_attempts: int = 5) -> bool:
+        """Use the same reviewed registry that allowed the producer to enqueue."""
+        return self.run_once(registry.fetch, registry.apply_result, max_attempts=max_attempts)
+
     def _send_heartbeat(self, item: LeasedWorkItem) -> bool:
         with self._heartbeat_connection_factory() as heartbeat_connection:
             with heartbeat_connection.transaction():

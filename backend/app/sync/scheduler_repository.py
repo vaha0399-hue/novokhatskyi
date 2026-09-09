@@ -53,7 +53,10 @@ class PostgresSchedulerSnapshotReader:
         self._connection = connection
 
     def read(self) -> SchedulerMaterializedSnapshot:
-        self._connection.execute("SET TRANSACTION READ ONLY")
+        # Read Committed takes a fresh snapshot per SELECT. The scheduler must
+        # calculate from one materialized view of policy, state, fixtures and
+        # budget, so set this before its first data statement.
+        self._connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         rows = self._connection.execute("SELECT provider_id,season_id FROM ops.competition_sync_policies ORDER BY provider_id,season_id").fetchall()
         policy_reader = PostgresCompetitionSyncPolicyReader(self._connection)
         policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
@@ -95,12 +98,18 @@ class PostgresSchedulerRepository:
             raise ValueError("scheduler checkpoint does not match work scope")
         if expected_state is not None and expected_state.key() != next_state.key():
             raise ValueError("scheduler checkpoint transition changes scope")
-        authorization = self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
+        # Q01 remains an early fail-closed guard. The fingerprint below is the
+        # one captured by preview, however: replacing it with this fresh read
+        # would let a v1 calculation survive a v2 policy change.
+        self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
         scope = dict(work.scope)
-        scope["_sync_policy"] = {
-            "provider_id": work.provider_id, "season_id": work.season_id, "work_type": work.work_type,
-            "instance_id": authorization.policy_instance_id, "version": authorization.policy_version,
-        }
+        fingerprint = scope.get("_sync_policy")
+        if not isinstance(fingerprint, dict) or (
+            fingerprint.get("provider_id"), fingerprint.get("season_id"), fingerprint.get("work_type")
+        ) != (work.provider_id, work.season_id, work.work_type):
+            raise ValueError("scheduler work has no matching preview policy fingerprint")
+        if not isinstance(fingerprint.get("instance_id"), int) or not isinstance(fingerprint.get("version"), int):
+            raise ValueError("scheduler work has malformed preview policy fingerprint")
         try:
             row = self._connection.execute(
                 "SELECT * FROM ops.enqueue_repeatable_sync_work_and_checkpoint("
@@ -123,4 +132,34 @@ class PostgresSchedulerRepository:
             raise
         if row is None:
             raise RuntimeError("scheduler enqueue/checkpoint did not return a result")
+        return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))
+
+    def enqueue_event(self, *, run_id: int, work: PeriodicWork, available_at: datetime) -> SchedulerEnqueueResult:
+        """Atomically mark one fixture/event identity without season checkpoint reuse."""
+        if run_id <= 0:
+            raise ValueError("run id must be positive")
+        self._gate.before_enqueue(SyncWorkRequest(work.provider_id, work.season_id, work.work_type))
+        scope = dict(work.scope)
+        fingerprint = scope.get("_sync_policy")
+        if not isinstance(fingerprint, dict) or (
+            fingerprint.get("provider_id"), fingerprint.get("season_id"), fingerprint.get("work_type")
+        ) != (work.provider_id, work.season_id, work.work_type):
+            raise ValueError("scheduler work has no matching preview policy fingerprint")
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM ops.enqueue_repeatable_sync_work_and_event_checkpoint("
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (run_id, work.stable_key(), Jsonb(scope), work.work_type, work.priority, available_at,
+                 work.stable_key(), work.entity_key, work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",
+                 work.provider_id, work.season_id),
+            ).fetchone()
+        except psycopg.Error as exc:
+            if exc.sqlstate == "55000":
+                message = str(exc)
+                if "policy instance changed" in message:
+                    raise SyncPolicyDenied(PolicyDenialReason.INSTANCE_CHANGED) from exc
+                raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
+            raise
+        if row is None:
+            raise RuntimeError("scheduler event enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))

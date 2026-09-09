@@ -9,6 +9,12 @@ from app.sync.policies import CompetitionSyncPolicy, CoverageObservation, Covera
 from app.sync.scheduler import ApiCost, FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
 
 
+class _Budget:
+    def __init__(self, *, cooldown_until=None, daily_limit=None, daily_used=None, minute_limit=None, minute_used=None) -> None:
+        self.cooldown_until, self.daily_limit, self.daily_used = cooldown_until, daily_limit, daily_used
+        self.minute_limit, self.minute_used = minute_limit, minute_used
+
+
 def _policy(*, provider_id: int = 7, season_id: int = 101, **changes: object) -> CompetitionSyncPolicy:
     values: dict[str, object] = {
         "provider_id": provider_id, "season_id": season_id, "policy_instance_id": 1, "enabled": True,
@@ -172,6 +178,36 @@ def test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler() -> 
     fixture = FixtureScheduleSnapshot(9, 7, 101, now + timedelta(minutes=30), "scheduled")
     preview = SyncScheduler().preview(now=now, policies=[policy], schedule_state=[], fixtures=[fixture], executable_work_types=())
     checks = [item for item in preview.decisions if item.scope.get("fixture_id") == 9]
-    assert {item.work_type for item in checks} == {"schedule_near", "prematch_check"}
-    assert all(item.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value for item in checks)
-    assert all(item.stable_key is not None and item.deadline is not None for item in checks)
+    assert {item.work_type for item in checks} == {"schedule_near", "prematch_check", "overdue_status_check"}
+    due = [item for item in checks if item.work is not None]
+    assert all(item.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value for item in due)
+    assert all(item.stable_key is not None and item.deadline is not None for item in due)
+    assert _decision(preview, "overdue_status_check").reason == ScheduleDecisionReason.INPUT_UNAVAILABLE.value
+
+
+def test_fixture_periodic_keys_are_stable_inside_a_policy_interval() -> None:
+    policy = _policy(allowed_work_types=frozenset({"schedule_near", "live_refresh"}),
+                     coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("schedule_near", "live_refresh")},
+                     refresh_intervals={name: RefreshInterval(3, "hour") for name in ("schedule_near", "live_refresh")})
+    fixture = FixtureScheduleSnapshot(9, 7, 101, datetime(2026, 9, 8, 14, tzinfo=UTC), "in_progress")
+    first = SyncScheduler().preview(now=datetime(2026, 9, 8, 12, 0, tzinfo=UTC), policies=[policy], schedule_state=[], fixtures=[fixture], executable_work_types=())
+    second = SyncScheduler().preview(now=datetime(2026, 9, 8, 12, 1, tzinfo=UTC), policies=[policy], schedule_state=[], fixtures=[fixture], executable_work_types=())
+    assert [(item.work_type, item.stable_key) for item in first.decisions if item.work is not None] == [(item.work_type, item.stable_key) for item in second.decisions if item.work is not None]
+
+
+def test_disabled_fixture_policy_returns_a_sortable_denial() -> None:
+    policy = _policy(enabled=False, allowed_work_types=frozenset({"schedule_near"}),
+                     coverage={"schedule_near": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+                     refresh_intervals={"schedule_near": RefreshInterval(1, "hour")})
+    fixture = FixtureScheduleSnapshot(9, 7, 101, datetime(2026, 9, 8, 14, tzinfo=UTC), "scheduled")
+    preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 12, tzinfo=UTC), policies=[policy], schedule_state=[], fixtures=[fixture])
+    decision = _decision(preview, "schedule_near")
+    assert decision.reason == "disabled" and decision.scope["provider_id"] == 7
+
+
+def test_budget_snapshot_defers_due_work_without_reserving_requests() -> None:
+    now = datetime(2026, 9, 8, 1, tzinfo=UTC)
+    preview = SyncScheduler().preview(now=now, policies=[_policy()], schedule_state=[_state("calendar_refresh"), _state("standings_refresh")],
+                                      budget=_Budget(cooldown_until=now + timedelta(minutes=5)))
+    assert {item.reason for item in preview.decisions} == {ScheduleDecisionReason.BUDGET_COOLDOWN.value}
+    assert preview.planned_jobs == () and preview.api_request_cost.value is ApiCost.UNKNOWN
