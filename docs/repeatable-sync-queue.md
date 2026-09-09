@@ -29,6 +29,27 @@ higher-priority work from starving an old ready item.  Scheduling missed time
 windows is intentionally Q05's responsibility; Q02 only deduplicates windows
 given to it and does not generate per-second catch-up work.
 
+## Q05.1 deterministic scheduler preview
+
+The first scheduler slice calculates `calendar_refresh` and `standings_refresh`
+only. It receives `now`, Q01 policies, and saved schedule state explicitly; it
+performs no database write, enqueue, API call, or budget reservation.
+
+Saved state means "scheduled", not "successfully processed": an adapter will
+save it atomically with enqueue in a later task, while preview never advances
+it. State retains both the immutable end of the last enqueued window and its
+first next deadline. Thus a policy interval change keeps the old first overdue
+deadline and every segment after the saved boundary.
+
+Periodic identities remain Q02 `PeriodicWork` identities. Windows use UTC
+closed boundaries, so keys do not contain the scheduler launch instant and DST
+cannot change them. After downtime, the scheduler emits one continuous window
+from the saved boundary through the latest closed boundary; its deadline is the
+first missed deadline and its scope records `coalesced_windows`. Once that
+candidate and state are saved, the next candidate starts at its exact end, so
+it cannot expand or overlap the immutable enqueued window. API cost is
+`unknown` per planned item until an executor selects a physical request.
+
 ## Q03 leases
 
 The opt-in repeatable worker receives a globally increasing `lease_token` on
