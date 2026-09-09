@@ -437,6 +437,23 @@ def test_q05_analytics_no_handler_and_stale_policy_write_nothing() -> None:
         assert connection.execute("SELECT count(*) FROM ops.sync_scheduler_analytics_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == 0
 
 
+def test_q05_analytics_policy_rejection_rolls_back_and_same_connection_recovers() -> None:
+    assert TEST_DB_URL is not None
+    suffix, now = uuid.uuid4().hex, datetime(2026, 9, 9, 1, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        connection.execute("UPDATE ops.competition_sync_policies SET enabled=true,allowed_work_types=ARRAY['analytics_recalculation'],coverage=%s,refresh_intervals=%s WHERE provider_id=%s AND season_id=%s", (Jsonb({'analytics_recalculation': {'state':'covered','observed_on':'2026-09-09'}}), Jsonb({'analytics_recalculation': {'value':1,'unit':'minute'}}), provider_id, season_id))
+        reader = PostgresCompetitionSyncPolicyReader(connection); old = reader.get(provider_id=provider_id, season_id=season_id); assert old is not None
+        connection.execute("UPDATE ops.competition_sync_policies SET priority=priority+1 WHERE provider_id=%s AND season_id=%s", (provider_id, season_id))
+        process = Q05SchedulerProcess(connection, PostgresSchedulerRepository(connection, SyncPolicyGate(reader, now=lambda: now)), SyncScheduler(), {'analytics_recalculation': _Q05Dispatch()})
+        stale = process.enqueue_due(run_id=run_id, now=now, policies=[old], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
+        assert stale.policy_denials == ('version_changed',)
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+        fresh = reader.get(provider_id=provider_id, season_id=season_id); assert fresh is not None
+        accepted = process.enqueue_due(run_id=run_id, now=now, policies=[fresh], schedule_state=[], analytics_inputs=[AnalyticsInputSnapshot(provider_id, season_id, 'fixture:1', 1, now)])
+        assert len(accepted.enqueue_results) == 1 and accepted.enqueue_results[0].enqueued
+
+
 def test_q05_preview_fingerprint_survives_process_repository_to_locked_sql() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
