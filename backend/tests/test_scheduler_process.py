@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+from datetime import UTC, date, datetime, timedelta
+
+from app.sync.policies import CompetitionSyncPolicy, CoverageObservation, CoverageState, RefreshInterval
+from app.sync.scheduler import PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
+from app.sync.scheduler_process import Q05SchedulerProcess
+from app.sync.scheduler_repository import SchedulerEnqueueResult
+
+
+class _Connection:
+    def __init__(self) -> None:
+        self.transactions = 0
+
+    def transaction(self):
+        self.transactions += 1
+        return nullcontext()
+
+
+class _Repository:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def enqueue_and_advance(self, **kwargs):
+        self.calls.append(kwargs)
+        return SchedulerEnqueueResult(11, True, True)
+
+
+class _Handler:
+    def fetch(self, item, authorization):
+        raise AssertionError("scheduler must not fetch")
+
+    def apply_result(self, writer, item, result):
+        raise AssertionError("scheduler must not import")
+
+
+def _policy() -> CompetitionSyncPolicy:
+    return CompetitionSyncPolicy(
+        provider_id=7, season_id=101, policy_instance_id=1, enabled=True,
+        allowed_work_types=frozenset({"calendar_refresh"}),
+        coverage={"calendar_refresh": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+        refresh_intervals={"calendar_refresh": RefreshInterval(1, "hour")}, priority=3,
+        history_depth_seasons=0, policy_version=1, paused_until=None,
+    )
+
+
+def _state() -> PeriodicScheduleState:
+    start = datetime(2026, 9, 8, tzinfo=UTC)
+    return PeriodicScheduleState(7, 101, "calendar_refresh", start, start + timedelta(hours=1))
+
+
+def test_unavailable_handler_keeps_candidate_visible_but_never_starts_a_transaction() -> None:
+    connection, repository = _Connection(), _Repository()
+    process = Q05SchedulerProcess(connection, repository, SyncScheduler(), {})
+    result = process.enqueue_due(run_id=4, now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()], schedule_state=[_state()])
+    assert result.preview.decisions[0].reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+    assert repository.calls == [] and connection.transactions == 0
+
+
+def test_registered_q03_compatible_handler_allows_only_enqueue_checkpoint_transition() -> None:
+    connection, repository = _Connection(), _Repository()
+    process = Q05SchedulerProcess(connection, repository, SyncScheduler(), {"calendar_refresh": _Handler()})
+    result = process.enqueue_due(run_id=4, now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()], schedule_state=[_state()])
+    assert len(result.enqueue_results) == len(repository.calls) == connection.transactions == 1
+    assert repository.calls[0]["expected_state"] == _state()

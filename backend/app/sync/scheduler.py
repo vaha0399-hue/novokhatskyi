@@ -33,6 +33,7 @@ class ScheduleDecisionReason(StrEnum):
     DUE = "due"
     NOT_DUE = "not_due"
     NOT_IMPLEMENTED = "not_implemented"
+    HANDLER_UNAVAILABLE = "handler_unavailable"
 
 
 class ApiCost(StrEnum):
@@ -98,7 +99,7 @@ class SchedulerPreview:
 
     @property
     def planned_jobs(self) -> tuple[PeriodicWork, ...]:
-        return tuple(item.work for item in self.decisions if item.work is not None)
+        return tuple(item.work for item in self.decisions if item.reason == ScheduleDecisionReason.DUE.value and item.work is not None)
 
 
 class _PolicyReader(CompetitionSyncPolicyReader):
@@ -153,12 +154,14 @@ class SyncScheduler:
         now: datetime,
         policies: Iterable[CompetitionSyncPolicy],
         schedule_state: Iterable[PeriodicScheduleState],
+        executable_work_types: Iterable[str] | None = None,
     ) -> SchedulerPreview:
         _require_aware(now, "now")
         current = now.astimezone(UTC)
         policy_by_scope = self._policies(policies)
         state_by_key = self._state(schedule_state)
         gate = SyncPolicyGate(_PolicyReader(policy_by_scope), now=lambda: current)
+        executable = None if executable_work_types is None else frozenset(executable_work_types)
         decisions: list[SchedulerDecision] = []
         # Preview always returns a complete prospective snapshot.  A skipped or
         # not-due scope remains scheduled at its existing checkpoint; callers
@@ -168,6 +171,11 @@ class SyncScheduler:
         for policy in sorted(policy_by_scope.values(), key=lambda item: (item.provider_id, item.season_id)):
             for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES):
                 decision = self._periodic_decision(policy, work_type, state_by_key.get((policy.provider_id, policy.season_id, work_type)), current, gate)
+                if decision.work is not None and executable is not None and work_type not in executable:
+                    decision = SchedulerDecision(
+                        decision.scope, decision.work_type, decision.stable_key, decision.deadline, decision.priority,
+                        ScheduleDecisionReason.HANDLER_UNAVAILABLE.value, decision.work, decision.api_cost,
+                    )
                 decisions.append(decision)
                 if decision.next_state is not None:
                     next_by_key[decision.next_state.key()] = decision.next_state

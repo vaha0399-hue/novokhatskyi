@@ -136,3 +136,14 @@ def test_preview_does_not_mutate_state_or_reserve_api_budget() -> None:
     assert tuple(state) == original
     assert preview.api_request_cost.value is ApiCost.UNKNOWN
     assert preview.api_request_cost.unknown_jobs == 2
+
+
+def test_preview_keeps_due_candidate_visible_when_handler_is_unavailable() -> None:
+    preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy()],
+                                      schedule_state=[_state("calendar_refresh"), _state("standings_refresh")],
+                                      executable_work_types=())
+    calendar = _decision(preview, "calendar_refresh")
+    assert calendar.work is not None and calendar.stable_key is not None
+    assert calendar.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+    assert calendar.next_state is None
+    assert preview.planned_jobs == ()
