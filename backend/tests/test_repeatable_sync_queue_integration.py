@@ -220,6 +220,110 @@ def test_q01_denial_prevents_postgres_repository_enqueue() -> None:
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (work.stable_key(),)).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("change", ("disable", "version"))
+def test_q05_policy_lock_rechecks_calculation_fingerprint_with_real_connections(change: str) -> None:
+    """A policy update which wins the lock race invalidates the old candidate."""
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id = int(setup.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q05-policy-{suffix}", "Q05 policy lock test"),
+        ).fetchone()[0])
+        country_id = int(setup.execute(
+            "INSERT INTO football.countries(name) VALUES(%s) RETURNING id", (f"Q05 country {suffix}",)
+        ).fetchone()[0])
+        league_id = int(setup.execute(
+            "INSERT INTO football.leagues(name,country_id,competition_type) VALUES(%s,%s,'league') RETURNING id",
+            (f"Q05 league {suffix}", country_id),
+        ).fetchone()[0])
+        setup.execute(
+            "INSERT INTO source.league_provider_refs(provider_id,external_id,league_id) VALUES(%s,%s,%s)",
+            (provider_id, f"q05-{suffix}", league_id),
+        )
+        season_id = int(setup.execute(
+            "INSERT INTO football.seasons(league_id,start_year,label) VALUES(%s,2026,%s) RETURNING id",
+            (league_id, f"Q05 {suffix}"),
+        ).fetchone()[0])
+        setup.execute(
+            "INSERT INTO source.season_provider_refs(provider_id,league_external_id,external_season,season_id) VALUES(%s,%s,2026,%s)",
+            (provider_id, f"q05-{suffix}", season_id),
+        )
+        policy = setup.execute(
+            """INSERT INTO ops.competition_sync_policies(provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals)
+                 VALUES(%s,%s,true,ARRAY['calendar_refresh'],%s,%s)
+                 RETURNING policy_instance_id,policy_version""",
+            (provider_id, season_id,
+             Jsonb({"calendar_refresh": {"state": "covered", "observed_on": "2026-09-08"}}),
+             Jsonb({"calendar_refresh": {"value": 1, "unit": "hour"}})),
+        ).fetchone()
+        assert policy is not None
+        run_id = _run(setup, provider_id, f"q05-policy-run-{suffix}")
+
+    stable_key = f"q05-policy-lock:{change}:{suffix}"
+    scope = Jsonb({"_sync_policy": {
+        "provider_id": provider_id, "season_id": season_id, "work_type": "calendar_refresh",
+        "instance_id": int(policy[0]), "version": int(policy[1]),
+    }})
+    started = threading.Event()
+    backend_pid: list[int] = []
+    outcome: list[str] = []
+
+    def enqueue_from_old_calculation() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as contender:
+            backend_pid.append(int(contender.execute("SELECT pg_backend_pid()").fetchone()[0]))
+            started.set()
+            try:
+                contender.execute(
+                    "SELECT * FROM ops.enqueue_repeatable_sync_work_and_checkpoint("
+                    "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (run_id, stable_key, scope, "calendar_refresh", 0, datetime(2026, 9, 9, tzinfo=UTC),
+                     stable_key, "season:" + str(season_id), "season:" + str(season_id), provider_id, season_id,
+                     None, None, datetime(2026, 9, 9, tzinfo=UTC), datetime(2026, 9, 9, 1, tzinfo=UTC)),
+                ).fetchone()
+                outcome.append("enqueued")
+            except psycopg.Error as exc:
+                outcome.append(exc.sqlstate or "unknown")
+
+    with psycopg.connect(TEST_DB_URL) as policy_writer:
+        policy_writer.execute(
+            "SELECT 1 FROM ops.competition_sync_policies WHERE provider_id=%s AND season_id=%s FOR UPDATE",
+            (provider_id, season_id),
+        )
+        contender = threading.Thread(target=enqueue_from_old_calculation)
+        contender.start()
+        assert started.wait(timeout=2)
+        for _ in range(100):
+            row = policy_writer.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s", (backend_pid[0],)).fetchone()
+            if row is not None and row[0] == "Lock":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("scheduler connection did not block on the policy row")
+        if change == "disable":
+            policy_writer.execute(
+                "UPDATE ops.competition_sync_policies SET enabled=false WHERE provider_id=%s AND season_id=%s",
+                (provider_id, season_id),
+            )
+        else:
+            policy_writer.execute(
+                "UPDATE ops.competition_sync_policies SET priority=priority+1 WHERE provider_id=%s AND season_id=%s",
+                (provider_id, season_id),
+            )
+        policy_writer.commit()
+        contender.join(timeout=5)
+        assert not contender.is_alive()
+
+    assert outcome == ["55000"]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as check:
+        assert check.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (stable_key,)).fetchone()[0] == 0
+        assert check.execute(
+            "SELECT count(*) FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s AND work_type='calendar_refresh'",
+            (provider_id, season_id),
+        ).fetchone()[0] == 0
+
+
 def test_q03_fenced_lease_expiry_quarantine_and_conflicting_recovery() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex

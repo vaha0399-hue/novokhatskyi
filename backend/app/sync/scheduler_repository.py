@@ -6,10 +6,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import psycopg
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.sync.policies import CompetitionSyncPolicy, PostgresCompetitionSyncPolicyReader, SyncPolicyGate, SyncWorkRequest
+from app.sync.policies import (
+    CompetitionSyncPolicy,
+    PolicyDenialReason,
+    PostgresCompetitionSyncPolicyReader,
+    SyncPolicyDenied,
+    SyncPolicyGate,
+    SyncWorkRequest,
+)
 from app.sync.repository import PeriodicWork
 from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState
 
@@ -93,16 +101,26 @@ class PostgresSchedulerRepository:
             "provider_id": work.provider_id, "season_id": work.season_id, "work_type": work.work_type,
             "instance_id": authorization.policy_instance_id, "version": authorization.policy_version,
         }
-        row = self._connection.execute(
-            "SELECT * FROM ops.enqueue_repeatable_sync_work_and_checkpoint("
-            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (run_id, work.stable_key(), Jsonb(scope), work.work_type, work.priority, available_at,
-             work.stable_key(), work.entity_key, work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",
-             work.provider_id, work.season_id,
-             None if expected_state is None else expected_state.last_scheduled_window_end,
-             None if expected_state is None else expected_state.next_deadline,
-             next_state.last_scheduled_window_end, next_state.next_deadline),
-        ).fetchone()
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM ops.enqueue_repeatable_sync_work_and_checkpoint("
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (run_id, work.stable_key(), Jsonb(scope), work.work_type, work.priority, available_at,
+                 work.stable_key(), work.entity_key, work.execution_key or f"entity:{work.provider_id}:{work.season_id}:{work.entity_key}",
+                 work.provider_id, work.season_id,
+                 None if expected_state is None else expected_state.last_scheduled_window_end,
+                 None if expected_state is None else expected_state.next_deadline,
+                 next_state.last_scheduled_window_end, next_state.next_deadline),
+            ).fetchone()
+        except psycopg.Error as exc:
+            if exc.sqlstate == "55000":
+                message = str(exc)
+                if "policy instance changed" in message:
+                    raise SyncPolicyDenied(PolicyDenialReason.INSTANCE_CHANGED) from exc
+                if "policy version changed" in message:
+                    raise SyncPolicyDenied(PolicyDenialReason.VERSION_CHANGED) from exc
+                raise SyncPolicyDenied(PolicyDenialReason.MISSING) from exc
+            raise
         if row is None:
             raise RuntimeError("scheduler enqueue/checkpoint did not return a result")
         return SchedulerEnqueueResult(None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2]))

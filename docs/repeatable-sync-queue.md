@@ -57,6 +57,13 @@ denial, unavailable Q03-compatible handler, stale checkpoint, or transaction
 rollback advances neither queue nor state. The checkpoint is intentionally not
 an execution-success record; Q03 owns that lifecycle on the work item.
 
+The atomic function locks the policy row with `FOR UPDATE` before it touches
+Q02 or the checkpoint. It compares the policy instance and version stored in
+the materialized candidate scope with the locked row, then repeats the Q01
+permissions check. A concurrent policy change therefore invalidates the old
+calculation: it enqueues no item and advances no checkpoint; the next
+scheduler run must calculate a replacement candidate.
+
 Section-7 work types whose fixture/reconciliation/input-version reader is not
 yet connected remain visible in preview as `input_unavailable`; arbitrary
 policy names use `not_implemented`. Neither result causes enqueue or a state
