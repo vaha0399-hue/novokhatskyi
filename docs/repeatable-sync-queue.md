@@ -57,6 +57,12 @@ denial, unavailable Q03-compatible handler, stale checkpoint, or transaction
 rollback advances neither queue nor state. The checkpoint is intentionally not
 an execution-success record; Q03 owns that lifecycle on the work item.
 
+Section-7 work types whose fixture/reconciliation/input-version reader is not
+yet connected remain visible in preview as `input_unavailable`; arbitrary
+policy names use `not_implemented`. Neither result causes enqueue or a state
+advance. In particular, time alone never supplies the football conditions for
+result finalization.
+
 ## Q03 leases
 
 The opt-in repeatable worker receives a globally increasing `lease_token` on

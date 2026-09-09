@@ -26,6 +26,14 @@ from app.sync.repository import PeriodicWork
 CALENDAR_REFRESH = "calendar_refresh"
 STANDINGS_REFRESH = "standings_refresh"
 SUPPORTED_PERIODIC_WORK_TYPES = frozenset((CALENDAR_REFRESH, STANDINGS_REFRESH))
+# These names make the whole Section 7 surface auditable.  Only the first two
+# have a reviewed input adapter in this slice; the rest must remain explicit
+# skips until their D/A readers and Q03 handlers are supplied.
+SECTION_7_WORK_TYPES = frozenset((
+    "season_discovery", "schedule_near", "schedule_far", "prematch_check", "live_refresh",
+    "overdue_status_check", "result_finalization", "statistics_retry", "correction_check",
+    "analytics_recalculation", "quality_sweep",
+))
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -33,6 +41,7 @@ class ScheduleDecisionReason(StrEnum):
     DUE = "due"
     NOT_DUE = "not_due"
     NOT_IMPLEMENTED = "not_implemented"
+    INPUT_UNAVAILABLE = "input_unavailable"
     HANDLER_UNAVAILABLE = "handler_unavailable"
 
 
@@ -183,7 +192,8 @@ class SyncScheduler:
                 decisions.append(SchedulerDecision(
                     scope={"provider_id": policy.provider_id, "season_id": policy.season_id, "work_type": work_type},
                     work_type=work_type, stable_key=None, deadline=None, priority=policy.priority,
-                    reason=ScheduleDecisionReason.NOT_IMPLEMENTED.value,
+                    reason=(ScheduleDecisionReason.INPUT_UNAVAILABLE.value if work_type in SECTION_7_WORK_TYPES
+                            else ScheduleDecisionReason.NOT_IMPLEMENTED.value),
                 ))
 
         decisions.sort(key=lambda item: (int(item.scope["provider_id"]), int(item.scope["season_id"]), item.work_type))

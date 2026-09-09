@@ -123,6 +123,12 @@ def test_policy_gate_keeps_coverage_and_unimplemented_types_explicit() -> None:
     assert _decision(preview, "fixtures_refresh").reason == ScheduleDecisionReason.NOT_IMPLEMENTED.value
 
 
+def test_section_7_type_without_its_saved_fixture_input_is_an_explicit_skip() -> None:
+    policy = _policy(allowed_work_types=frozenset({"prematch_check"}), coverage={"prematch_check": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))}, refresh_intervals={"prematch_check": RefreshInterval(1, "hour")})
+    preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[policy], schedule_state=[])
+    assert _decision(preview, "prematch_check").reason == ScheduleDecisionReason.INPUT_UNAVAILABLE.value
+
+
 def test_two_seasons_have_distinct_q02_periodic_identities() -> None:
     preview = SyncScheduler().preview(now=datetime(2026, 9, 8, 1, tzinfo=UTC), policies=[_policy(season_id=101), _policy(season_id=102)], schedule_state=[_state("calendar_refresh", season_id=101), _state("calendar_refresh", season_id=102)])
     calendar_keys = [item.stable_key for item in preview.decisions if item.work_type == "calendar_refresh"]
