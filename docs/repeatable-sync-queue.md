@@ -83,6 +83,37 @@ materialized snapshot. `--enqueue --run-id <id>` uses that snapshot but ships
 with no handlers; deployment must inject reviewed Q03 handler pairs before it
 can enqueue. The entrypoint never calls the budget reservation function.
 
+## Q05 scheduler verification matrix
+
+This matrix covers calculation and Q02 enqueue eligibility only. It does not
+claim that a D/A handler exists: a missing Q03-compatible handler leaves the
+candidate visible as `handler_unavailable`, and missing saved input is
+`input_unavailable`.
+
+| Section 7 row | Calculation | Exact regression |
+|---|---|---|
+| catalogue/season discovery | weekly policy interval; daily inside the saved preseason horizon | `test_discovery_uses_weekly_policy_interval_outside_preseason`; `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs` |
+| schedule near | policy-aligned calendar window for a saved fixture within seven days | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler`; `test_fixture_periodic_keys_are_stable_inside_a_policy_interval` |
+| schedule far | policy-aligned window for a saved fixture beyond seven days | `test_schedule_far_and_postponed_fixture_candidates_keep_their_event_deadlines` |
+| prematch check | immutable T−60 and T−10 event windows, including a postponed fixture | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler`; `test_schedule_far_and_postponed_fixture_candidates_keep_their_event_deadlines` |
+| live | policy interval only while the saved lifecycle is active | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions`; `test_fixture_periodic_keys_are_stable_inside_a_policy_interval` |
+| overdue status check | kickoff +15 minutes for a nonterminal saved lifecycle | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler` |
+| result finalization | terminal observation plus the kickoff +3-hour football condition | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions` |
+| statistics retry | eligibility offsets 0, 15m, 1h, 6h, 24h; capped retry becomes `retry_exhausted` | `test_statistics_retry_follows_all_configured_offsets_and_signals_exhaustion` |
+| correction check | immutable first-terminal +24h and +72h event windows | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions` |
+| standings | daily control away from a matchday; policy interval on a matchday | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs`; `test_standings_uses_hourly_policy_interval_on_a_matchday` |
+| analytics/scanner | latest saved input version per entity is coalesced to a stable 60-second boundary; version identity is persisted separately | `test_analytics_coalesces_input_events_to_the_newest_version_inside_60_seconds`; `test_q05_process_enqueues_analytics_and_deduplicates_versions`; `test_q05_late_analytics_version_does_not_replace_newer_checkpoint` |
+| quality sweep | daily policy work from the saved season input | `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs` |
+
+The repository boundary is covered by real isolated PostgreSQL sessions:
+`test_q05_two_scheduler_processes_do_not_duplicate_analytics_version`,
+`test_q05_analytics_checkpoint_failure_rolls_back_enqueue_and_retry_is_safe`,
+`test_q05_analytics_no_handler_and_stale_policy_write_nothing`, and
+`test_q05_read_only_snapshot_is_consistent_and_next_snapshot_sees_update`.
+`test_scheduler_cli_passes_materialized_season_and_analytics_inputs` verifies
+that both preview and `--enqueue` receive the same materialized season and
+analytics inputs.
+
 ## Q03 leases
 
 The opt-in repeatable worker receives a globally increasing `lease_token` on
