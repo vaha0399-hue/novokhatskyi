@@ -50,6 +50,13 @@ candidate and state are saved, the next candidate starts at its exact end, so
 it cannot expand or overlap the immutable enqueued window. API cost is
 `unknown` per planned item until an executor selects a physical request.
 
+The opt-in Q05 producer stores this state in `ops.sync_scheduler_checkpoints`.
+For each due candidate it evaluates Q01 again, calls the existing Q02 enqueue
+function, and advances that checkpoint in one short transaction. A policy
+denial, unavailable Q03-compatible handler, stale checkpoint, or transaction
+rollback advances neither queue nor state. The checkpoint is intentionally not
+an execution-success record; Q03 owns that lifecycle on the work item.
+
 ## Q03 leases
 
 The opt-in repeatable worker receives a globally increasing `lease_token` on
