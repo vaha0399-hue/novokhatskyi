@@ -9,9 +9,9 @@ from typing import Any
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.sync.policies import SyncPolicyGate, SyncWorkRequest
+from app.sync.policies import CompetitionSyncPolicy, PostgresCompetitionSyncPolicyReader, SyncPolicyGate, SyncWorkRequest
 from app.sync.repository import PeriodicWork
-from app.sync.scheduler import PeriodicScheduleState
+from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,50 @@ class SchedulerEnqueueResult:
     work_item_id: int | None
     enqueued: bool
     checkpoint_advanced: bool
+
+
+@dataclass(frozen=True)
+class BudgetSnapshot:
+    daily_limit: int | None
+    daily_used: int | None
+    minute_limit: int | None
+    minute_used: int | None
+    cooldown_until: datetime | None
+
+
+@dataclass(frozen=True)
+class SchedulerMaterializedSnapshot:
+    policies: tuple[CompetitionSyncPolicy, ...]
+    checkpoints: tuple[PeriodicScheduleState, ...]
+    fixtures: tuple[FixtureScheduleSnapshot, ...]
+    budget: BudgetSnapshot
+
+
+class PostgresSchedulerSnapshotReader:
+    """One read-only transaction for the exact preview/execute input snapshot."""
+
+    def __init__(self, connection: Connection[Any]) -> None:
+        self._connection = connection
+
+    def read(self) -> SchedulerMaterializedSnapshot:
+        self._connection.execute("SET TRANSACTION READ ONLY")
+        rows = self._connection.execute("SELECT provider_id,season_id FROM ops.competition_sync_policies ORDER BY provider_id,season_id").fetchall()
+        policy_reader = PostgresCompetitionSyncPolicyReader(self._connection)
+        policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
+        checkpoints = tuple(PeriodicScheduleState(int(row[0]), int(row[1]), str(row[2]), row[3], row[4]) for row in self._connection.execute(
+            "SELECT provider_id,season_id,work_type,last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints ORDER BY provider_id,season_id,work_type").fetchall())
+        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], row[8]) for row in self._connection.execute(
+            """SELECT ref.fixture_id,ref.provider_id,fixture.season_id,fixture.kickoff_at,fixture.lifecycle_state::text,
+                      fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,reconciliation.eligible_at
+                 FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+                 LEFT JOIN ops.fixture_reconciliation_state reconciliation ON reconciliation.fixture_id=fixture.id
+                 JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
+                 ORDER BY ref.provider_id,fixture.season_id,ref.fixture_id""").fetchall())
+        row = self._connection.execute("""SELECT config.daily_limit,state.daily_used,config.minute_limit,state.minute_used,state.cooldown_until
+                                          FROM ops.api_football_budget_config config LEFT JOIN ops.api_football_budget_state state ON state.singleton=true
+                                         WHERE config.singleton=true""").fetchone()
+        budget = BudgetSnapshot(None, None, None, None, None) if row is None else BudgetSnapshot(*row)
+        return SchedulerMaterializedSnapshot(tuple(policy for policy in policies if policy is not None), checkpoints, fixtures, budget)
 
 
 class PostgresSchedulerRepository:

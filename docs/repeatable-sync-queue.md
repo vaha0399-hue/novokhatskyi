@@ -63,6 +63,13 @@ policy names use `not_implemented`. Neither result causes enqueue or a state
 advance. In particular, time alone never supplies the football conditions for
 result finalization.
 
+`python -m app.sync.scheduler_main --database-url <url>` is the explicit
+preview entrypoint. It reads policies, checkpoints, saved fixtures and the Q04
+budget/cooldown state in one read-only transaction, then renders that same
+materialized snapshot. `--enqueue --run-id <id>` uses that snapshot but ships
+with no handlers; deployment must inject reviewed Q03 handler pairs before it
+can enqueue. The entrypoint never calls the budget reservation function.
+
 ## Q03 leases
 
 The opt-in repeatable worker receives a globally increasing `lease_token` on
