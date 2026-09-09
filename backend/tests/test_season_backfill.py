@@ -7,6 +7,7 @@ import pytest
 
 from app.api_football import APIFootballResponse
 from app.api_football.errors import APIFootballHTTPError
+from app.importer import season_backfill
 from app.importer.season_backfill import (
     BATCH_SIZE,
     EXPECTED_FIXTURE_COUNT,
@@ -85,6 +86,20 @@ def test_request_is_exactly_one_season_fixtures_call() -> None:
     assert collected.attempts == 1
     assert client.calls == [("/fixtures", REQUEST_PARAMS)]
     assert failures == []
+
+
+def test_importer_managed_retries_disable_client_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def build_client(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(season_backfill.APIFootballClient, "from_environment", build_client)
+
+    season_backfill._backfill_api_client()
+
+    assert captured == {"budget_consumer": "operations", "max_5xx_retries": 0}
 
 
 def test_2025_scope_uses_its_own_params_and_validates_its_own_league_season() -> None:

@@ -7,9 +7,11 @@ from pathlib import Path
 import pytest
 
 from app.importer.statistics_backfill import (
+    DATASET_ATTEMPT_CAP,
     DEFAULT_RUN_ATTEMPT_CAP,
     ENDPOINT,
     FixtureTarget,
+    GLOBAL_RETRY_CAP,
     StatisticsImportScope,
     StatisticsContractError,
     _decimal,
@@ -20,6 +22,7 @@ from app.importer.statistics_backfill import (
     run_statistics_backfill,
     acquire_context_and_lock,
 )
+from app.importer import statistics_backfill
 
 
 SAMPLE = Path(__file__).parents[2] / "samples" / "api-football" / "fixture-statistics.raw.json"
@@ -49,6 +52,23 @@ def test_real_sample_is_complete_and_preserves_typed_values(payload: dict, targe
 def test_request_contract_targets_exactly_one_fixture(target: FixtureTarget) -> None:
     assert ENDPOINT == "/fixtures/statistics"
     assert _params(target.external_id) == {"fixture": 1208021}
+
+
+def test_importer_managed_retries_disable_client_retries_and_keep_campaign_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def build_client(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(statistics_backfill.APIFootballClient, "from_environment", build_client)
+
+    statistics_backfill._backfill_api_client()
+
+    assert captured == {"budget_consumer": "history", "max_5xx_retries": 0}
+    assert (DEFAULT_RUN_ATTEMPT_CAP, DATASET_ATTEMPT_CAP, GLOBAL_RETRY_CAP) == (90, 385, 5)
 
 
 @pytest.mark.parametrize(

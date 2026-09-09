@@ -45,6 +45,14 @@ GLOBAL_RETRY_CAP = 5
 MAX_ATTEMPTS_PER_FIXTURE = 2
 RETRYABLE_HTTP_STATUSES = frozenset({408, 499, 500, 502, 503, 504})
 
+
+def _backfill_api_client() -> APIFootballClient:
+    """Build a retry-free client because this importer counts each attempt."""
+    return APIFootballClient.from_environment(
+        budget_consumer="history",
+        max_5xx_retries=0,
+    )
+
 Sleep = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
 
@@ -908,7 +916,7 @@ def run_statistics_backfill(
     """Run one quota-bounded batch. All unsafe states stop before the next fixture."""
     if not 1 <= max_calls <= DEFAULT_RUN_ATTEMPT_CAP:
         raise ValueError("max_calls must be between 1 and 90")
-    api = client or APIFootballClient.from_environment(budget_consumer="history")
+    api = client or _backfill_api_client()
     protected = (
         "football.fixtures", "football.fixture_availability_snapshots", "football.fixture_player_availability",
         "football.fixture_lineup_snapshots", "football.fixture_lineups", "football.fixture_lineup_players",

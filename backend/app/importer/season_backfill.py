@@ -41,6 +41,14 @@ MAX_API_ATTEMPTS = 3
 RETRYABLE_HTTP_STATUSES = frozenset({408, 500, 502, 503, 504})
 
 
+def _backfill_api_client() -> APIFootballClient:
+    """Build a retry-free client because this importer counts each attempt."""
+    return APIFootballClient.from_environment(
+        budget_consumer="operations",
+        max_5xx_retries=0,
+    )
+
+
 @dataclass(frozen=True)
 class SeasonBackfillScope:
     """Immutable provider scope for one controlled, completed-season import."""
@@ -1223,7 +1231,7 @@ def run_backfill(
     database_url = _database_url()
     # This endpoint discovers fixture metadata.  P04 reserves the history
     # share for actual fixture-statistics calls, not metadata or its retries.
-    api_client = client or APIFootballClient.from_environment(budget_consumer="operations")
+    api_client = client or _backfill_api_client()
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute("SET statement_timeout = '30s'")
         context = acquire_context_and_lock(conn, scope=scope)
