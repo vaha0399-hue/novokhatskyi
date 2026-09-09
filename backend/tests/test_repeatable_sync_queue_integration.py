@@ -22,6 +22,7 @@ from app.sync.repository import PeriodicWork, PostgresSyncRepository, Recalculat
 from app.sync.scheduler import PeriodicScheduleState, SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import PostgresSchedulerRepository
+from app.sync.scheduler_repository import PostgresSchedulerSnapshotReader
 from app.sync.worker import RepeatableSyncWorker, WorkResult
 from app.importer.cup_canonical import CupCanonicalSink
 
@@ -419,6 +420,25 @@ def test_q05_preview_fingerprint_survives_process_repository_to_locked_sql() -> 
         assert result.policy_denials == ("version_changed",) and result.enqueue_results == ()
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == 0
+
+
+def test_q05_read_only_snapshot_is_consistent_and_next_snapshot_sees_update() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, version, _run_id = _q05_scheduler_setup(setup, suffix)
+    with psycopg.connect(TEST_DB_URL) as reader_connection, psycopg.connect(TEST_DB_URL, autocommit=True) as writer:
+        with reader_connection.transaction():
+            snapshot = PostgresSchedulerSnapshotReader(reader_connection).read()
+            assert next(item for item in snapshot.policies if (item.provider_id, item.season_id) == (provider_id, season_id)).policy_version == version
+            writer.execute("UPDATE ops.competition_sync_policies SET priority=priority+1 WHERE provider_id=%s AND season_id=%s", (provider_id, season_id))
+            # A later SELECT in this same transaction must retain the reader's
+            # snapshot, even though another connection has committed v2.
+            assert reader_connection.execute("SELECT policy_version FROM ops.competition_sync_policies WHERE provider_id=%s AND season_id=%s", (provider_id, season_id)).fetchone()[0] == version
+    with psycopg.connect(TEST_DB_URL) as next_reader:
+        with next_reader.transaction():
+            next_snapshot = PostgresSchedulerSnapshotReader(next_reader).read()
+            assert next(item for item in next_snapshot.policies if (item.provider_id, item.season_id) == (provider_id, season_id)).policy_version == version + 1
 
 
 def test_q05_two_schedulers_keep_one_checkpoint_transition_and_stale_candidate_is_safe() -> None:
