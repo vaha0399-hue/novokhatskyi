@@ -189,6 +189,25 @@ def test_positive_provider_remaining_is_a_shared_decreasing_cap_and_stale_header
         assert _reserve(connection, "operations")[:2] == (False, "provider_daily_exhausted")
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        "{}",
+        '{"x-ratelimit-limit":"2","x-ratelimit-remaining":"3"}',
+        '{"x-ratelimit-limit":"not-a-number","x-ratelimit-remaining":"also-bad","retry-after":"invalid"}',
+    ],
+)
+def test_429_always_sets_a_shared_base_cooldown_when_headers_are_unusable(headers: str) -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset(connection, daily=10, minute=10, operations=10, history=0, manual=0, reserve=0)
+        assert _reserve(connection, "operations")[:2] == (True, "reserved")
+        connection.execute("SELECT ops.observe_api_football_budget(429,%s::jsonb)", (headers,))
+        allowed, reason, retry_at = _reserve(connection, "operations")
+        assert (allowed, reason) == (False, "cooldown")
+        assert retry_at is not None and retry_at >= datetime.now(UTC).replace(second=0, microsecond=0) + timedelta(minutes=1)
+
+
 def test_live_and_sync_clients_share_budget_before_http_without_a_held_budget_lock() -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
