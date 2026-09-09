@@ -81,7 +81,7 @@ BEGIN
     END IF;
 
     SELECT item.work_item_id,item.enqueued INTO work_item_id,enqueued FROM ops.enqueue_repeatable_sync_work_item(
-      p_run_id,p_scope_key,p_scope,p_job_type,p_priority,p_available_at,p_stable_key,p_entity_key,p_execution_key);
+      p_run_id,p_scope_key,p_scope,p_job_type,p_priority,p_available_at,p_stable_key,p_entity_key,p_execution_key) AS item;
     INSERT INTO ops.sync_scheduler_checkpoints(provider_id,season_id,work_type,last_scheduled_window_end,next_deadline)
       VALUES(p_provider_id,p_season_id,p_job_type,p_next_last_scheduled_window_end,p_next_deadline)
     ON CONFLICT (provider_id,season_id,work_type) DO UPDATE SET last_scheduled_window_end=EXCLUDED.last_scheduled_window_end,

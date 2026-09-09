@@ -1,5 +1,5 @@
--- Q05 additive schema contract. Two-session behavior is exercised by the
--- manifest-guarded backend integration suite.
+-- Q05 additive schema contract only. Real two-session scheduler behavior is
+-- exercised separately by the manifest-guarded backend integration suite.
 DO $$
 BEGIN
   IF to_regclass('ops.sync_scheduler_checkpoints') IS NULL THEN

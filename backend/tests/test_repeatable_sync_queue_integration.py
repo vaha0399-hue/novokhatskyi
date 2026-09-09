@@ -324,6 +324,168 @@ def test_q05_policy_lock_rechecks_calculation_fingerprint_with_real_connections(
         ).fetchone()[0] == 0
 
 
+def _q05_scheduler_setup(connection: psycopg.Connection, suffix: str) -> tuple[int, int, int, int, int]:
+    provider_id = int(connection.execute(
+        "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+        (f"q05-scheduler-{suffix}", "Q05 scheduler test"),
+    ).fetchone()[0])
+    country_id = int(connection.execute(
+        "INSERT INTO football.countries(name) VALUES(%s) RETURNING id", (f"Q05 scheduler country {suffix}",)
+    ).fetchone()[0])
+    league_id = int(connection.execute(
+        "INSERT INTO football.leagues(name,country_id,competition_type) VALUES(%s,%s,'league') RETURNING id",
+        (f"Q05 scheduler league {suffix}", country_id),
+    ).fetchone()[0])
+    connection.execute(
+        "INSERT INTO source.league_provider_refs(provider_id,external_id,league_id) VALUES(%s,%s,%s)",
+        (provider_id, f"q05-scheduler-{suffix}", league_id),
+    )
+    season_id = int(connection.execute(
+        "INSERT INTO football.seasons(league_id,start_year,label) VALUES(%s,2026,%s) RETURNING id",
+        (league_id, f"Q05 scheduler {suffix}"),
+    ).fetchone()[0])
+    connection.execute(
+        "INSERT INTO source.season_provider_refs(provider_id,league_external_id,external_season,season_id) VALUES(%s,%s,2026,%s)",
+        (provider_id, f"q05-scheduler-{suffix}", season_id),
+    )
+    policy = connection.execute(
+        """INSERT INTO ops.competition_sync_policies(provider_id,season_id,enabled,allowed_work_types,coverage,refresh_intervals)
+             VALUES(%s,%s,true,ARRAY['calendar_refresh'],%s,%s)
+             RETURNING policy_instance_id,policy_version""",
+        (provider_id, season_id,
+         Jsonb({"calendar_refresh": {"state": "covered", "observed_on": "2026-09-08"}}),
+         Jsonb({"calendar_refresh": {"value": 1, "unit": "hour"}})),
+    ).fetchone()
+    assert policy is not None
+    return provider_id, season_id, int(policy[0]), int(policy[1]), _run(connection, provider_id, f"q05-scheduler-run-{suffix}")
+
+
+def _q05_scheduler_transition(
+    connection: psycopg.Connection,
+    *, run_id: int, provider_id: int, season_id: int, policy_instance_id: int, policy_version: int,
+    stable_key: str, window_start: datetime, window_end: datetime,
+    expected_state: tuple[datetime, datetime] | None = None, checkpoint_end: datetime | None = None,
+    next_deadline: datetime | None = None,
+) -> tuple[int | None, bool, bool]:
+    new_boundary = checkpoint_end or window_end
+    scope = Jsonb({
+        "_sync_policy": {
+            "provider_id": provider_id, "season_id": season_id, "work_type": "calendar_refresh",
+            "instance_id": policy_instance_id, "version": policy_version,
+        },
+        "provider_id": provider_id, "season_id": season_id, "work_type": "calendar_refresh",
+        "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
+    })
+    row = connection.execute(
+        "SELECT * FROM ops.enqueue_repeatable_sync_work_and_checkpoint("
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (run_id, stable_key, scope, "calendar_refresh", 0, window_end, stable_key,
+         f"season:{season_id}", f"season:{season_id}", provider_id, season_id,
+         None if expected_state is None else expected_state[0],
+         None if expected_state is None else expected_state[1],
+         new_boundary, next_deadline or new_boundary + timedelta(hours=1)),
+    ).fetchone()
+    assert row is not None
+    return None if row[0] is None else int(row[0]), bool(row[1]), bool(row[2])
+
+
+def test_q05_two_schedulers_keep_one_checkpoint_transition_and_stale_candidate_is_safe() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, instance_id, version, run_id = _q05_scheduler_setup(setup, suffix)
+    start, end = datetime(2026, 9, 9, tzinfo=UTC), datetime(2026, 9, 9, 1, tzinfo=UTC)
+    barrier, outcomes = threading.Barrier(2), []
+
+    def scheduler() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            barrier.wait()
+            outcomes.append(_q05_scheduler_transition(
+                connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+                policy_instance_id=instance_id, policy_version=version,
+                stable_key=f"q05-two-schedulers:{suffix}", window_start=start, window_end=end,
+            ))
+
+    first, second = threading.Thread(target=scheduler), threading.Thread(target=scheduler)
+    first.start(); second.start(); first.join(); second.join()
+    accepted = next(item for item in outcomes if item[1])
+    assert accepted[0] is not None
+    assert sorted((item[1], item[2]) for item in outcomes) == [(False, False), (True, True)]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as check:
+        assert check.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (f"q05-two-schedulers:{suffix}",)).fetchone()[0] == 1
+        assert check.execute(
+            "SELECT last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s AND work_type='calendar_refresh'",
+            (provider_id, season_id),
+        ).fetchone() == (end, end + timedelta(hours=1))
+
+
+def test_q05_rejects_inconsistent_window_without_moving_checkpoint() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, instance_id, version, run_id = _q05_scheduler_setup(connection, suffix)
+        start, end = datetime(2026, 9, 9, tzinfo=UTC), datetime(2026, 9, 9, 1, tzinfo=UTC)
+        first = _q05_scheduler_transition(connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+                                          policy_instance_id=instance_id, policy_version=version,
+                                          stable_key=f"q05-window-first:{suffix}", window_start=start, window_end=end)
+        assert first[0] is not None and first[1:] == (True, True)
+        before = connection.execute(
+            "SELECT last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s AND work_type='calendar_refresh'",
+            (provider_id, season_id),
+        ).fetchone()
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="window must start"):
+            _q05_scheduler_transition(connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+                                      policy_instance_id=instance_id, policy_version=version,
+                                      stable_key=f"q05-window-invalid:{suffix}",
+                                      window_start=end + timedelta(minutes=1), window_end=end + timedelta(hours=1),
+                                      expected_state=(end, end + timedelta(hours=1)), next_deadline=end + timedelta(hours=2))
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="checkpoint end must equal"):
+            _q05_scheduler_transition(connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+                                      policy_instance_id=instance_id, policy_version=version,
+                                      stable_key=f"q05-window-end-invalid:{suffix}",
+                                      window_start=end, window_end=end + timedelta(hours=1),
+                                      expected_state=(end, end + timedelta(hours=1)),
+                                      checkpoint_end=end + timedelta(hours=2), next_deadline=end + timedelta(hours=3))
+        assert connection.execute(
+            "SELECT last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s AND work_type='calendar_refresh'",
+            (provider_id, season_id),
+        ).fetchone() == before
+
+
+def test_q05_checkpoint_failure_rolls_back_enqueue_and_retry_is_safe() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    stable_key = f"q05-rollback:{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, instance_id, version, run_id = _q05_scheduler_setup(connection, suffix)
+        start, end = datetime(2026, 9, 9, tzinfo=UTC), datetime(2026, 9, 9, 1, tzinfo=UTC)
+        connection.execute("CREATE FUNCTION ops.q05_reject_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced checkpoint failure'; END $$")
+        connection.execute("CREATE TRIGGER q05_reject_checkpoint BEFORE INSERT ON ops.sync_scheduler_checkpoints FOR EACH ROW EXECUTE FUNCTION ops.q05_reject_checkpoint()")
+        with pytest.raises(psycopg.errors.RaiseException, match="forced checkpoint failure"):
+            _q05_scheduler_transition(connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+                                      policy_instance_id=instance_id, policy_version=version, stable_key=stable_key,
+                                      window_start=start, window_end=end)
+        assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s", (stable_key,)).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM ops.sync_scheduler_checkpoints WHERE provider_id=%s AND season_id=%s AND work_type='calendar_refresh'",
+            (provider_id, season_id),
+        ).fetchone()[0] == 0
+        connection.execute("DROP TRIGGER q05_reject_checkpoint ON ops.sync_scheduler_checkpoints")
+        connection.execute("DROP FUNCTION ops.q05_reject_checkpoint()")
+        item_id, enqueued, advanced = _q05_scheduler_transition(
+            connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+            policy_instance_id=instance_id, policy_version=version, stable_key=stable_key,
+            window_start=start, window_end=end,
+        )
+        assert item_id is not None and enqueued and advanced
+        assert _q05_scheduler_transition(
+            connection, run_id=run_id, provider_id=provider_id, season_id=season_id,
+            policy_instance_id=instance_id, policy_version=version, stable_key=stable_key,
+            window_start=start, window_end=end,
+        ) == (None, False, False)
+
+
 def test_q03_fenced_lease_expiry_quarantine_and_conflicting_recovery() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex

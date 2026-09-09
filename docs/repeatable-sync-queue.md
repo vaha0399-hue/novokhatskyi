@@ -64,6 +64,12 @@ permissions check. A concurrent policy change therefore invalidates the old
 calculation: it enqueues no item and advances no checkpoint; the next
 scheduler run must calculate a replacement candidate.
 
+The same transition parses the immutable Q02 window from the candidate scope.
+For an existing checkpoint, the queued window must start exactly at the saved
+boundary and its end must equal the new checkpoint boundary. A stale expected
+checkpoint is a no-op; a backward or mismatched window is rejected before Q02
+can enqueue it.
+
 Section-7 work types whose fixture/reconciliation/input-version reader is not
 yet connected remain visible in preview as `input_unavailable`; arbitrary
 policy names use `not_implemented`. Neither result causes enqueue or a state
