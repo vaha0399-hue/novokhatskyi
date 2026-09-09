@@ -62,7 +62,7 @@ class FixtureScheduleSnapshot:
     fixture_id: int
     provider_id: int
     season_id: int
-    kickoff_at: datetime
+    kickoff_at: datetime | None
     lifecycle_state: str
     terminal_observed_at: datetime | None = None
     result_finalized_at: datetime | None = None
@@ -71,12 +71,14 @@ class FixtureScheduleSnapshot:
     statistics_attempts: int = 0
     statistics_max_attempts: int = 5
     statistics_completed: bool = False
+    statistics_retry_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.fixture_id <= 0 or self.provider_id <= 0 or self.season_id <= 0:
             raise ValueError("fixture, provider, and season ids must be positive")
-        _require_aware(self.kickoff_at, "fixture kickoff")
-        for value in (self.terminal_observed_at, self.result_finalized_at, self.first_terminal_observed_at, self.statistics_eligible_at):
+        if self.kickoff_at is not None:
+            _require_aware(self.kickoff_at, "fixture kickoff")
+        for value in (self.terminal_observed_at, self.result_finalized_at, self.first_terminal_observed_at, self.statistics_eligible_at, self.statistics_retry_at):
             if value is not None:
                 _require_aware(value, "fixture schedule timestamp")
         if self.statistics_attempts < 0 or self.statistics_max_attempts < 0:
@@ -199,6 +201,12 @@ def _closed_boundary(now: datetime, interval: timedelta) -> datetime:
     return _EPOCH + ((now - _EPOCH) // interval) * interval
 
 
+def _next_closed_boundary(now: datetime, interval: timedelta) -> datetime:
+    """Return the close of the current window, except at its exact boundary."""
+    boundary = _closed_boundary(now, interval)
+    return boundary if boundary == now else boundary + interval
+
+
 def _scope(policy: CompetitionSyncPolicy, work_type: str, start: datetime, end: datetime, windows: int) -> dict[str, object]:
     return {
         "provider_id": policy.provider_id,
@@ -252,11 +260,7 @@ class SyncScheduler:
         for policy in sorted(policy_by_scope.values(), key=lambda item: (item.provider_id, item.season_id)):
             for work_type in sorted(SUPPORTED_PERIODIC_WORK_TYPES & set(policy.allowed_work_types)):
                 decision = self._periodic_decision(policy, work_type, state_by_key.get((policy.provider_id, policy.season_id, work_type)), current, gate)
-                if decision.work is not None and executable is not None and work_type not in executable:
-                    decision = SchedulerDecision(
-                        decision.scope, decision.work_type, decision.stable_key, decision.deadline, decision.priority,
-                        ScheduleDecisionReason.HANDLER_UNAVAILABLE.value, decision.work, decision.api_cost,
-                    )
+                decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
                 if decision.next_state is not None:
                     next_by_key[decision.next_state.key()] = decision.next_state
@@ -277,14 +281,20 @@ class SyncScheduler:
                 # The daily preseason boundary is stable and never bypasses Q01.
                 decision = self._periodic_decision(policy, "season_discovery", state_by_key.get((policy.provider_id, policy.season_id, "season_discovery")), current, gate, interval_override=timedelta(days=1))
                 decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "season_discovery")]
+                decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
+                if decision.next_state is not None:
+                    next_by_key[decision.next_state.key()] = decision.next_state
             if season is not None and "standings_refresh" in policy.allowed_work_types:
                 decision = self._periodic_decision(policy, "standings_refresh", state_by_key.get((policy.provider_id, policy.season_id, "standings_refresh")), current, gate, interval_override=None if season.matchday_today else timedelta(days=1))
                 decisions = [item for item in decisions if not (item.scope.get("provider_id") == policy.provider_id and item.scope.get("season_id") == policy.season_id and item.work_type == "standings_refresh")]
+                decision = self._apply_handler_gate(decision, executable)
                 decisions.append(decision)
+                if decision.next_state is not None:
+                    next_by_key[decision.next_state.key()] = decision.next_state
         for policy in policy_by_scope.values():
             if not any((item.provider_id, item.season_id) == (policy.provider_id, policy.season_id) for item in fixture_values):
-                for work_type in sorted(set(policy.allowed_work_types) & SECTION_7_WORK_TYPES):
+                for work_type in sorted((set(policy.allowed_work_types) & SECTION_7_WORK_TYPES) - SUPPORTED_PERIODIC_WORK_TYPES - {"analytics_recalculation"}):
                     decisions.append(SchedulerDecision({"provider_id": policy.provider_id, "season_id": policy.season_id, "work_type": work_type}, work_type, None, None, policy.priority, ScheduleDecisionReason.INPUT_UNAVAILABLE.value))
         for fixture in sorted(fixture_values, key=lambda item: (item.provider_id, item.season_id, item.fixture_id)):
             policy = policy_by_scope.get((fixture.provider_id, fixture.season_id))
@@ -329,15 +339,16 @@ class SyncScheduler:
                 decisions.append(SchedulerDecision({"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key}, "analytics_recalculation", None, item.observed_at, policy.priority, error.reason.value))
                 continue
             work = RecalculationWork(item.provider_id, item.season_id, "analytics_recalculation", item.entity_key, item.input_version, policy.priority, {"provider_id": item.provider_id, "season_id": item.season_id, "entity_key": item.entity_key, "input_version": item.input_version, "_sync_policy": _policy_fingerprint(policy, "analytics_recalculation")})
-            reason = ScheduleDecisionReason.DUE.value if executable is None or "analytics_recalculation" in executable else ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
-            decisions.append(SchedulerDecision(work.scope, work.work_type, work.stable_key(), _closed_boundary(current, timedelta(seconds=60)), policy.priority, reason, work, ApiCost.UNKNOWN))
+            deadline = _next_closed_boundary(current, timedelta(seconds=60))
+            reason = ScheduleDecisionReason.DUE.value if deadline <= current else ScheduleDecisionReason.NOT_DUE.value
+            decisions.append(self._apply_handler_gate(SchedulerDecision(work.scope, work.work_type, work.stable_key(), deadline, policy.priority, reason, work, ApiCost.UNKNOWN), executable))
 
         budget_reason = self._budget_reason(budget, current)
         if budget_reason is not None:
             decisions = [
                 SchedulerDecision(item.scope, item.work_type, item.stable_key, item.deadline, item.priority,
                                   budget_reason, item.work, item.api_cost, item.next_state)
-                if item.reason == ScheduleDecisionReason.DUE.value and item.work is not None else item
+                if item.reason == ScheduleDecisionReason.DUE.value and item.work is not None and item.work_type != "analytics_recalculation" else item
                 for item in decisions
             ]
         decisions.sort(key=lambda item: (int(item.scope["provider_id"]), int(item.scope["season_id"]), item.work_type))
@@ -351,22 +362,32 @@ class SyncScheduler:
         cooldown = getattr(budget, "cooldown_until", None)
         if cooldown is not None and cooldown > now:
             return ScheduleDecisionReason.BUDGET_COOLDOWN.value
-        for limit_name, used_name in (("daily_limit", "daily_used"), ("minute_limit", "minute_used")):
+        windows = (
+            ("daily_limit", "daily_used", "daily_window", now.date()),
+            ("minute_limit", "minute_used", "minute_window", _closed_boundary(now, timedelta(minutes=1))),
+        )
+        for limit_name, used_name, window_name, current_window in windows:
+            if getattr(budget, window_name, None) != current_window:
+                continue
             limit, used = getattr(budget, limit_name, None), getattr(budget, used_name, None)
             if limit is not None and used is not None and used >= limit:
                 return ScheduleDecisionReason.BUDGET_EXHAUSTED.value
         return None
 
     def _fixture_deadlines(self, fixture: FixtureScheduleSnapshot, policy: CompetitionSyncPolicy, now: datetime) -> tuple[tuple[str, datetime], ...]:
+        if fixture.kickoff_at is None:
+            # A postponed fixture may deliberately have no replacement time.
+            # Do not invent a near window or any kickoff-relative event.
+            return ()
         kickoff = fixture.kickoff_at.astimezone(UTC)
         def periodic_boundary(work_type: str) -> datetime:
             interval = policy.refresh_intervals.get(work_type)
             return now if interval is None else _closed_boundary(now, _interval_delta(interval))
 
-        values: list[tuple[str, datetime]] = [(
-            "schedule_near" if kickoff <= now + timedelta(days=7) else "schedule_far",
-            periodic_boundary("schedule_near" if kickoff <= now + timedelta(days=7) else "schedule_far"),
-        )]
+        values: list[tuple[str, datetime]] = []
+        if fixture.lifecycle_state in {"scheduled", "postponed"}:
+            schedule_type = "schedule_near" if kickoff <= now + timedelta(days=7) else "schedule_far"
+            values.append((schedule_type, periodic_boundary(schedule_type)))
         if fixture.lifecycle_state in {"scheduled", "postponed"}:
             values.extend((("prematch_check", kickoff - timedelta(minutes=60)), ("prematch_check", kickoff - timedelta(minutes=10))))
         if fixture.lifecycle_state in {"in_progress", "paused", "suspended", "interrupted"}:
@@ -375,7 +396,9 @@ class SyncScheduler:
             values.append(("overdue_status_check", kickoff + timedelta(minutes=15)))
         if fixture.terminal_observed_at is not None and fixture.result_finalized_at is None and now >= kickoff + timedelta(hours=3):
             values.append(("result_finalization", max(kickoff + timedelta(hours=3), fixture.terminal_observed_at.astimezone(UTC))))
-        if fixture.statistics_eligible_at is not None and not fixture.statistics_completed:
+        if fixture.statistics_retry_at is not None and not fixture.statistics_completed:
+            values.append(("statistics_retry", fixture.statistics_retry_at.astimezone(UTC)))
+        elif fixture.statistics_eligible_at is not None and not fixture.statistics_completed:
             retry_offsets = (timedelta(), timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
             if fixture.statistics_attempts < min(fixture.statistics_max_attempts, len(retry_offsets)):
                 values.append(("statistics_retry", fixture.statistics_eligible_at.astimezone(UTC) + retry_offsets[fixture.statistics_attempts]))
@@ -389,7 +412,16 @@ class SyncScheduler:
         # A fixed one-second event window is a Q02 identity, never a launch-time key.
         start = deadline - timedelta(seconds=1)
         return PeriodicWork(policy.provider_id, policy.season_id, work_type, f"fixture:{fixture.fixture_id}", start, deadline, policy.priority,
-                            {"provider_id": policy.provider_id, "season_id": policy.season_id, "fixture_id": fixture.fixture_id, "kickoff_at": fixture.kickoff_at.astimezone(UTC).isoformat(), "work_type": work_type, "window_start": start.isoformat(), "window_end": deadline.isoformat(), "_sync_policy": _policy_fingerprint(policy, work_type)})
+                            {"provider_id": policy.provider_id, "season_id": policy.season_id, "fixture_id": fixture.fixture_id, "kickoff_at": fixture.kickoff_at.astimezone(UTC).isoformat() if fixture.kickoff_at is not None else None, "work_type": work_type, "window_start": start.isoformat(), "window_end": deadline.isoformat(), "_sync_policy": _policy_fingerprint(policy, work_type)})
+
+    @staticmethod
+    def _apply_handler_gate(decision: SchedulerDecision, executable: frozenset[str] | None) -> SchedulerDecision:
+        if decision.work is None or executable is None or decision.work_type in executable:
+            return decision
+        return SchedulerDecision(
+            decision.scope, decision.work_type, decision.stable_key, decision.deadline, decision.priority,
+            ScheduleDecisionReason.HANDLER_UNAVAILABLE.value, decision.work, decision.api_cost,
+        )
 
     @staticmethod
     def _policies(policies: Iterable[CompetitionSyncPolicy]) -> dict[tuple[int, int], CompetitionSyncPolicy]:

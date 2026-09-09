@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from datetime import UTC, date, datetime, timedelta
 
 from app.sync.policies import CompetitionSyncPolicy, CoverageObservation, CoverageState, RefreshInterval
-from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
+from app.sync.scheduler import FixtureScheduleSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SeasonScheduleSnapshot, SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import SchedulerEnqueueResult
 
@@ -105,3 +105,27 @@ def test_due_fixture_events_enqueue_independently_without_a_season_checkpoint() 
     )
     assert len(result.enqueue_results) == len(repository.calls) == connection.transactions == 2
     assert {call["work"].work_type for call in repository.calls} == {"schedule_near", "prematch_check"}
+
+
+def test_empty_registry_blocks_seasonal_overrides_without_advancing_checkpoints() -> None:
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    policy = CompetitionSyncPolicy(
+        provider_id=7, season_id=101, policy_instance_id=1, enabled=True,
+        allowed_work_types=frozenset({"season_discovery", "standings_refresh"}),
+        coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("season_discovery", "standings_refresh")},
+        refresh_intervals={"season_discovery": RefreshInterval(1, "week"), "standings_refresh": RefreshInterval(1, "hour")},
+        priority=3, history_depth_seasons=0, policy_version=1, paused_until=None,
+    )
+    states = [
+        PeriodicScheduleState(7, 101, "season_discovery", now - timedelta(days=2), now - timedelta(days=1)),
+        PeriodicScheduleState(7, 101, "standings_refresh", now - timedelta(hours=2), now - timedelta(hours=1)),
+    ]
+    connection, repository = _Connection(), _Repository()
+    result = Q05SchedulerProcess(connection, repository, SyncScheduler(), {}).enqueue_due(
+        run_id=4, now=now, policies=[policy], schedule_state=states,
+        seasons=[SeasonScheduleSnapshot(7, 101, now + timedelta(days=10), True)],
+    )
+    relevant = [item for item in result.preview.decisions if item.work_type in {"season_discovery", "standings_refresh"}]
+    assert {item.reason for item in relevant} == {ScheduleDecisionReason.HANDLER_UNAVAILABLE.value}
+    assert all(item.next_state is None for item in relevant)
+    assert repository.calls == [] and connection.transactions == 0

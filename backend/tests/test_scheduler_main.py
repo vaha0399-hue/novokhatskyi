@@ -36,7 +36,7 @@ def test_scheduler_cli_passes_materialized_season_and_analytics_inputs(monkeypat
         def __init__(self, _connection) -> None:
             pass
 
-        def read(self) -> SchedulerMaterializedSnapshot:
+        def read(self, **_kwargs) -> SchedulerMaterializedSnapshot:
             return snapshot
 
     class _Process:

@@ -10,9 +10,11 @@ from app.sync.scheduler import AnalyticsInputSnapshot, ApiCost, FixtureScheduleS
 
 
 class _Budget:
-    def __init__(self, *, cooldown_until=None, daily_limit=None, daily_used=None, minute_limit=None, minute_used=None) -> None:
+    def __init__(self, *, cooldown_until=None, daily_limit=None, daily_used=None, minute_limit=None, minute_used=None,
+                 daily_window=None, minute_window=None) -> None:
         self.cooldown_until, self.daily_limit, self.daily_used = cooldown_until, daily_limit, daily_used
         self.minute_limit, self.minute_used = minute_limit, minute_used
+        self.daily_window, self.minute_window = daily_window, minute_window
 
 
 def _policy(*, provider_id: int = 7, season_id: int = 101, **changes: object) -> CompetitionSyncPolicy:
@@ -342,5 +344,55 @@ def test_analytics_coalesces_input_events_to_the_newest_version_inside_60_second
     first_job = next(item for item in first.decisions if item.work_type == "analytics_recalculation" and item.work is not None)
     second_job = next(item for item in second.decisions if item.work_type == "analytics_recalculation" and item.work is not None)
     assert first_job.work.scope["input_version"] == 2
-    assert first_job.deadline == datetime(2026, 9, 8, 12, tzinfo=UTC)
+    assert first_job.reason == ScheduleDecisionReason.NOT_DUE.value
+    assert first_job.deadline == datetime(2026, 9, 8, 12, 1, tzinfo=UTC)
     assert first_job.stable_key == second_job.stable_key
+
+
+def test_stale_q04_counters_do_not_block_a_new_budget_window_or_local_analytics() -> None:
+    now = datetime(2026, 9, 8, 12, 1, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"calendar_refresh", "analytics_recalculation"}),
+        coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("calendar_refresh", "analytics_recalculation")},
+        refresh_intervals={"calendar_refresh": RefreshInterval(1, "hour"), "analytics_recalculation": RefreshInterval(1, "minute")},
+    )
+    preview = SyncScheduler().preview(
+        now=now, policies=[policy], schedule_state=[_state("calendar_refresh", now - timedelta(hours=2), next_deadline=now - timedelta(hours=1))],
+        analytics_inputs=[AnalyticsInputSnapshot(7, 101, "fixture:9", 2, now)],
+        budget=_Budget(daily_limit=1, daily_used=1, minute_limit=1, minute_used=1,
+                       daily_window=(now - timedelta(days=1)).date(), minute_window=now - timedelta(minutes=1)),
+    )
+    assert _decision(preview, "calendar_refresh").reason == ScheduleDecisionReason.DUE.value
+    assert _decision(preview, "analytics_recalculation").reason == ScheduleDecisionReason.DUE.value
+
+
+def test_unknown_postponed_kickoff_never_generates_kickoff_relative_work() -> None:
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"schedule_near", "prematch_check", "overdue_status_check"}),
+        coverage={name: CoverageObservation(CoverageState.COVERED, date(2026, 9, 1)) for name in ("schedule_near", "prematch_check", "overdue_status_check")},
+        refresh_intervals={name: RefreshInterval(1, "hour") for name in ("schedule_near", "prematch_check", "overdue_status_check")},
+    )
+    preview = SyncScheduler().preview(
+        now=now, policies=[policy], schedule_state=[],
+        fixtures=[FixtureScheduleSnapshot(9, 7, 101, None, "postponed")],
+    )
+    assert not any(item.work is not None for item in preview.decisions)
+
+
+def test_schedule_near_excludes_old_terminal_fixture_but_keeps_known_postponement() -> None:
+    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    policy = _policy(
+        allowed_work_types=frozenset({"schedule_near"}),
+        coverage={"schedule_near": CoverageObservation(CoverageState.COVERED, date(2026, 9, 1))},
+        refresh_intervals={"schedule_near": RefreshInterval(3, "hour")},
+    )
+    preview = SyncScheduler().preview(
+        now=now, policies=[policy], schedule_state=[],
+        fixtures=[
+            FixtureScheduleSnapshot(9, 7, 101, now - timedelta(days=30), "completed"),
+            FixtureScheduleSnapshot(10, 7, 101, now + timedelta(days=2), "postponed"),
+        ],
+    )
+    scheduled_fixture_ids = {item.work.scope["fixture_id"] for item in preview.decisions if item.work_type == "schedule_near" and item.work is not None}
+    assert scheduled_fixture_ids == {10}

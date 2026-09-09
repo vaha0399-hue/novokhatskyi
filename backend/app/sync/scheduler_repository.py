@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import psycopg
@@ -36,6 +36,8 @@ class BudgetSnapshot:
     minute_limit: int | None
     minute_used: int | None
     cooldown_until: datetime | None
+    daily_window: date | None = None
+    minute_window: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -55,22 +57,26 @@ class PostgresSchedulerSnapshotReader:
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
 
-    def read(self) -> SchedulerMaterializedSnapshot:
+    def read(self, *, now: datetime | None = None) -> SchedulerMaterializedSnapshot:
         # Read Committed takes a fresh snapshot per SELECT. The scheduler must
         # calculate from one materialized view of policy, state, fixtures and
         # budget, so set this before its first data statement.
         self._connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        day_start = datetime.combine(current.date(), time.min, tzinfo=UTC)
+        next_day = day_start + timedelta(days=1)
         rows = self._connection.execute("SELECT provider_id,season_id FROM ops.competition_sync_policies ORDER BY provider_id,season_id").fetchall()
         policy_reader = PostgresCompetitionSyncPolicyReader(self._connection)
         policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
         checkpoints = tuple(PeriodicScheduleState(int(row[0]), int(row[1]), str(row[2]), row[3], row[4]) for row in self._connection.execute(
             "SELECT provider_id,season_id,work_type,last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints ORDER BY provider_id,season_id,work_type").fetchall())
-        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], row[8], int(row[9] or 0), int(row[10] or 0), str(row[11]) == "completed") for row in self._connection.execute(
+        fixtures = tuple(FixtureScheduleSnapshot(int(row[0]), int(row[1]), int(row[2]), row[3], str(row[4]), row[5], row[6], row[7], None, int(row[9] or 0), 5, str(row[10]) == "complete", row[8]) for row in self._connection.execute(
             """SELECT ref.fixture_id,ref.provider_id,fixture.season_id,fixture.kickoff_at,fixture.lifecycle_state::text,
-                      fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,reconciliation.eligible_at,
-                      reconciliation.attempt_count,reconciliation.max_attempts,reconciliation.state::text
+                      fixture.terminal_status_observed_at,fixture.result_finalized_at,reconciliation.terminal_observed_at,
+                      statistics_coverage.next_retry_at,statistics_coverage.attempts,statistics_coverage.coverage_state::text
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
                  LEFT JOIN ops.fixture_reconciliation_state reconciliation ON reconciliation.fixture_id=fixture.id
+                 LEFT JOIN football.fixture_statistics_coverage statistics_coverage ON statistics_coverage.fixture_id=fixture.id
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
                  ORDER BY ref.provider_id,fixture.season_id,ref.fixture_id""").fetchall())
         analytics_inputs = tuple(AnalyticsInputSnapshot(int(row[0]), int(row[1]), f"fixture:{int(row[2])}", int(row[3]), row[4]) for row in self._connection.execute(
@@ -78,8 +84,18 @@ class PostgresSchedulerSnapshotReader:
                  FROM source.fixture_provider_refs ref JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
                 WHERE fixture.last_source_fetch_id IS NOT NULL ORDER BY ref.provider_id,fixture.season_id,fixture.id""").fetchall())
-        seasons = tuple(SeasonScheduleSnapshot(int(row[0]), int(row[1]), None, False) for row in rows)
-        row = self._connection.execute("""SELECT config.daily_limit,state.daily_used,config.minute_limit,state.minute_used,state.cooldown_until
+        seasons = tuple(SeasonScheduleSnapshot(int(row[0]), int(row[1]),
+            None if row[2] is None else datetime.combine(row[2], time.min, tzinfo=UTC), bool(row[3])) for row in self._connection.execute(
+                """SELECT policy.provider_id,policy.season_id,season.starts_on,
+                          coalesce(bool_or(fixture.kickoff_at >= %s AND fixture.kickoff_at < %s
+                              AND fixture.lifecycle_state NOT IN ('cancelled','abandoned')),false)
+                     FROM ops.competition_sync_policies policy
+                     JOIN football.seasons season ON season.id=policy.season_id
+                     LEFT JOIN football.fixtures fixture ON fixture.season_id=season.id
+                    GROUP BY policy.provider_id,policy.season_id,season.starts_on
+                    ORDER BY policy.provider_id,policy.season_id""", (day_start, next_day)).fetchall())
+        row = self._connection.execute("""SELECT config.daily_limit,state.daily_used,config.minute_limit,state.minute_used,state.cooldown_until,
+                                                 state.daily_window,state.minute_window
                                           FROM ops.api_football_budget_config config LEFT JOIN ops.api_football_budget_state state ON state.singleton=true
                                          WHERE config.singleton=true""").fetchone()
         budget = BudgetSnapshot(None, None, None, None, None) if row is None else BudgetSnapshot(*row)

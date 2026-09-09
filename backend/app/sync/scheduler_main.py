@@ -33,7 +33,7 @@ def main() -> None:
         parser.error("--now must include a timezone")
     with psycopg.connect(args.database_url) as connection:
         with connection.transaction():
-            snapshot = PostgresSchedulerSnapshotReader(connection).read()
+            snapshot = PostgresSchedulerSnapshotReader(connection).read(now=now)
         gate = SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: now)
         # This executable deliberately registers no D/A handler. Deployment
         # code must inject reviewed Q03 handler pairs before using --enqueue.
