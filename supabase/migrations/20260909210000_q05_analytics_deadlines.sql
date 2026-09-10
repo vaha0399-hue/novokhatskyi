@@ -3,8 +3,14 @@ BEGIN;
 ALTER TABLE ops.fixture_analytics_recalculation_windows
     ADD COLUMN deadline timestamptz;
 
+ALTER TABLE ops.fixture_analytics_recalculation_windows
+    DISABLE TRIGGER fixture_analytics_recalculation_windows_guard;
+
 UPDATE ops.fixture_analytics_recalculation_windows
    SET deadline=coalesce(source_window_end,window_end);
+
+ALTER TABLE ops.fixture_analytics_recalculation_windows
+    ENABLE TRIGGER fixture_analytics_recalculation_windows_guard;
 
 ALTER TABLE ops.fixture_analytics_recalculation_windows
     ALTER COLUMN deadline SET NOT NULL,

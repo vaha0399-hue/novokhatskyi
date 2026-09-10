@@ -71,7 +71,9 @@ apply_q05_event_checkpoint "$UPGRADE_DB"
 apply_q05_analytics "$UPGRADE_DB"
 apply_q05_analytics_window "$UPGRADE_DB"
 apply_q05_late_analytics_window "$UPGRADE_DB"
+psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_analytics_deadline_upgrade_seed.sql" >/dev/null
 apply_q05_analytics_deadline "$UPGRADE_DB"
+psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_analytics_deadline_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_q03_upgrade_assertions.sql" >/dev/null
 
