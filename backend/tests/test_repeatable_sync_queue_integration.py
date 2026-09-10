@@ -513,6 +513,29 @@ def _q05_snapshot(now: datetime):
             return PostgresSchedulerSnapshotReader(reader).read(now=now)
 
 
+class _PrematchQueryRecordingConnection:
+    def __init__(self, connection: psycopg.Connection) -> None:
+        self._connection = connection
+        self.query: str | None = None
+        self.params: object | None = None
+
+    def execute(self, query, params=None, **kwargs):
+        if (
+            isinstance(query, str)
+            and "jsonb_to_recordset" in query
+            and "source.fixture_schedule_observations" in query
+        ):
+            self.query = query
+            self.params = params
+        return self._connection.execute(query, params, **kwargs)
+
+
+def _plan_nodes(plan: dict[str, object]):
+    yield plan
+    for child in plan.get("Plans", ()):
+        yield from _plan_nodes(child)
+
+
 def _q05_enqueue(process: Q05SchedulerProcess, *, run_id: int, now: datetime, snapshot, provider_id: int, season_id: int):
     matches = lambda item: (item.provider_id, item.season_id) == (provider_id, season_id)
     return process.enqueue_due(
@@ -1061,6 +1084,369 @@ def test_q05_prematch_without_evidence_still_obeys_policy_and_handler_gates() ->
                  AND entity_key=%s""",
             (provider_id, season_id, f"fixture:{fixture_id}"),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("offset_minutes", (60, 10), ids=("t60", "t10"))
+@pytest.mark.parametrize(
+    ("boundary", "observed_delta", "is_fresh"),
+    (
+        ("lower", timedelta(), True),
+        ("lower-outside", -timedelta(microseconds=1), False),
+        ("upper", timedelta(), True),
+        ("upper-outside", timedelta(microseconds=1), False),
+    ),
+)
+def test_q05_prematch_db_boundaries_are_inclusive_for_t60_and_t10(
+    offset_minutes: int,
+    boundary: str,
+    observed_delta: timedelta,
+    is_fresh: bool,
+) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    now = datetime(2026, 9, 12, 12, 0, 0, 123456, tzinfo=UTC)
+    target_deadline = now - timedelta(minutes=5)
+    policy_interval = timedelta(hours=1)
+    kickoff = target_deadline + timedelta(minutes=offset_minutes)
+    observed_at = (
+        target_deadline - policy_interval + observed_delta
+        if boundary.startswith("lower")
+        else now + observed_delta
+    )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(
+            connection,
+            suffix,
+        )
+        _q05_policy(
+            connection,
+            provider_id=provider_id,
+            season_id=season_id,
+            work_types=("prematch_check",),
+        )
+        fixture_id = _q05_fixture(
+            connection,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=f"{offset_minutes}-{boundary}-{suffix}",
+            kickoff_at=kickoff,
+        )
+        fetch_id = _q05_schedule_observation(
+            connection,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=kickoff,
+            observed_at=observed_at,
+        )
+
+        snapshot = _q05_snapshot(now)
+        result = _q05_enqueue(
+            _q05_process(connection, now=now),
+            run_id=run_id,
+            now=now,
+            snapshot=snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+
+        matching = [
+            item
+            for item in result.preview.decisions
+            if item.work_type == "prematch_check"
+            and item.scope.get("fixture_id") == fixture_id
+            and item.deadline == target_deadline
+        ]
+        assert len(matching) == 1
+        decision = matching[0]
+        if is_fresh:
+            assert decision.reason == ScheduleDecisionReason.FRESH_INPUT.value
+            assert decision.scope["confirming_fetch_id"] == fetch_id
+            assert connection.execute(
+                "SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s",
+                (decision.stable_key,),
+            ).fetchone()[0] == 0
+        else:
+            assert decision.reason == ScheduleDecisionReason.DUE.value
+            assert "confirming_fetch_id" not in decision.scope
+            assert connection.execute(
+                "SELECT count(*) FROM ops.sync_work_items WHERE stable_key=%s",
+                (decision.stable_key,),
+            ).fetchone()[0] == 1
+
+
+def test_q05_prematch_fresh_input_survives_restart_after_one_day() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    kickoff = datetime(2026, 9, 12, 15, 0, tzinfo=UTC)
+    observed_at = kickoff - timedelta(minutes=60)
+    first_run_at = kickoff - timedelta(minutes=5)
+    restarted_at = first_run_at + timedelta(days=1)
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(
+            setup,
+            suffix,
+        )
+        _q05_policy(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            work_types=("prematch_check",),
+        )
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff,
+        )
+        confirming_fetch_id = _q05_schedule_observation(
+            setup,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=kickoff,
+            observed_at=observed_at,
+        )
+
+    for scheduler_now in (first_run_at, restarted_at):
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            result = _q05_enqueue(
+                _q05_process(connection, now=scheduler_now),
+                run_id=run_id,
+                now=scheduler_now,
+                snapshot=_q05_snapshot(scheduler_now),
+                provider_id=provider_id,
+                season_id=season_id,
+            )
+            prematch = [
+                item
+                for item in result.preview.decisions
+                if item.work_type == "prematch_check"
+                and item.scope.get("fixture_id") == fixture_id
+            ]
+            assert {item.deadline for item in prematch} == {
+                kickoff - timedelta(minutes=60),
+                kickoff - timedelta(minutes=10),
+            }
+            assert {item.reason for item in prematch} == {
+                ScheduleDecisionReason.FRESH_INPUT.value
+            }
+            assert {
+                item.scope["confirming_fetch_id"] for item in prematch
+            } == {confirming_fetch_id}
+            assert result.enqueue_results == ()
+            assert connection.execute(
+                "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s",
+                (run_id,),
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+                   WHERE provider_id=%s AND season_id=%s
+                     AND work_type='prematch_check' AND entity_key=%s""",
+                (provider_id, season_id, f"fixture:{fixture_id}"),
+            ).fetchone()[0] == 0
+
+
+def test_q05_prematch_reader_query_explain_analyzes_realistic_history() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    kickoff = datetime(2026, 9, 12, 15, 0, tzinfo=UTC)
+    now = kickoff - timedelta(minutes=5)
+    deadline = kickoff - timedelta(minutes=60)
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, _run_id = _q05_scheduler_setup(
+            setup,
+            suffix,
+        )
+        _q05_policy(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            work_types=("prematch_check",),
+        )
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff,
+        )
+        historical_fixture_ids = []
+        for index in range(128):
+            historical_kickoff = kickoff - timedelta(days=index + 2)
+            historical_fixture_ids.append(
+                _q05_fixture(
+                    setup,
+                    provider_id=provider_id,
+                    season_id=season_id,
+                    suffix=f"history-{index}-{suffix}",
+                    kickoff_at=historical_kickoff,
+                    lifecycle_state="completed",
+                    observed_at=historical_kickoff + timedelta(hours=3),
+                )
+            )
+        setup.execute(
+            """WITH inserted_fetch AS (
+                   INSERT INTO source.provider_fetches(
+                       provider_id,endpoint,purpose,request_started_at,
+                       response_received_at,http_status,outcome,normalized_at,
+                       subject_fixture_id
+                   )
+                   SELECT %s,'/fixtures','scheduled_refresh',
+                          %s + fixture.ordinality * interval '1 second'
+                             + series * interval '1 microsecond',
+                          %s + fixture.ordinality * interval '1 second'
+                             + series * interval '1 microsecond',
+                          200,'success',
+                          %s + fixture.ordinality * interval '1 second'
+                             + series * interval '1 microsecond',
+                          fixture.fixture_id
+                     FROM unnest(%s::bigint[]) WITH ORDINALITY
+                          AS fixture(fixture_id, ordinality)
+                    CROSS JOIN generate_series(1,125) AS series
+                   RETURNING id,provider_id,subject_fixture_id,response_received_at
+               )
+               INSERT INTO source.fixture_schedule_observations(
+                   provider_id,fixture_id,source_fetch_id,
+                   observed_kickoff_at,observed_at
+               )
+               SELECT provider_id,subject_fixture_id,id,%s,response_received_at
+                 FROM inserted_fetch""",
+            (
+                provider_id,
+                deadline - timedelta(days=30),
+                deadline - timedelta(days=30),
+                deadline - timedelta(days=30),
+                historical_fixture_ids,
+                kickoff - timedelta(days=30),
+            ),
+        )
+        history = (
+            (32, deadline - timedelta(hours=2), kickoff),
+            (31, deadline - timedelta(minutes=30), kickoff + timedelta(hours=1)),
+            (1, deadline - timedelta(minutes=30), kickoff),
+        )
+        for row_count, first_observed_at, observed_kickoff_at in history:
+            setup.execute(
+                """WITH inserted_fetch AS (
+                       INSERT INTO source.provider_fetches(
+                           provider_id,endpoint,purpose,request_started_at,
+                           response_received_at,http_status,outcome,normalized_at,
+                           subject_fixture_id
+                       )
+                       SELECT %s,'/fixtures','scheduled_refresh',
+                              %s + series * interval '1 microsecond',
+                              %s + series * interval '1 microsecond',
+                              200,'success',
+                              %s + series * interval '1 microsecond',%s
+                         FROM generate_series(1,%s) AS series
+                       RETURNING id,provider_id,response_received_at
+                   )
+                   INSERT INTO source.fixture_schedule_observations(
+                       provider_id,fixture_id,source_fetch_id,
+                       observed_kickoff_at,observed_at
+                   )
+                   SELECT provider_id,%s,id,%s,response_received_at
+                     FROM inserted_fetch""",
+                (
+                    provider_id,
+                    first_observed_at,
+                    first_observed_at,
+                    first_observed_at,
+                    fixture_id,
+                    row_count,
+                    fixture_id,
+                    observed_kickoff_at,
+                ),
+            )
+        setup.execute("ANALYZE source.fixture_schedule_observations")
+        setup.execute("ANALYZE source.provider_fetches")
+        assert setup.execute(
+            """SELECT count(*) FROM source.fixture_schedule_observations
+               WHERE provider_id=%s""",
+            (provider_id,),
+        ).fetchone()[0] == 16_064
+        total_observation_count = int(setup.execute(
+            "SELECT count(*) FROM source.fixture_schedule_observations"
+        ).fetchone()[0])
+
+    with psycopg.connect(TEST_DB_URL) as connection:
+        with connection.transaction():
+            recording = _PrematchQueryRecordingConnection(connection)
+            snapshot = PostgresSchedulerSnapshotReader(recording).read(now=now)
+            target_observations = [
+                item
+                for item in snapshot.prematch_observations
+                if item.provider_id == provider_id and item.fixture_id == fixture_id
+            ]
+            assert len(target_observations) == 1
+            assert recording.query is not None
+            assert recording.params is not None
+            assert connection.execute("SHOW enable_seqscan").fetchone()[0] == "on"
+            explained = connection.execute(
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + recording.query,
+                recording.params,
+            ).fetchone()
+            assert explained is not None
+            document = explained[0][0]
+            nodes = list(_plan_nodes(document["Plan"]))
+            matching_index_nodes = [
+                node
+                for node in nodes
+                if node.get("Index Name")
+                == "fixture_schedule_observations_fixture_time_idx"
+            ]
+            observation_access_nodes = [
+                {
+                    key: node.get(key)
+                    for key in (
+                        "Node Type",
+                        "Relation Name",
+                        "Index Name",
+                        "Plan Rows",
+                        "Actual Rows",
+                        "Actual Loops",
+                        "Rows Removed by Filter",
+                        "Shared Hit Blocks",
+                        "Shared Read Blocks",
+                    )
+                }
+                for node in nodes
+                if node.get("Relation Name") == "fixture_schedule_observations"
+            ]
+            assert len(observation_access_nodes) == 1
+            observation_access = observation_access_nodes[0]
+            assert observation_access["Actual Loops"] == 1
+            assert "Shared Hit Blocks" in observation_access
+            assert "Shared Read Blocks" in observation_access
+            if matching_index_nodes:
+                assert len(matching_index_nodes) == 1
+                assert observation_access["Index Name"] == (
+                    "fixture_schedule_observations_fixture_time_idx"
+                )
+                assert observation_access["Actual Rows"] == 1
+            else:
+                assert observation_access["Node Type"] == "Seq Scan"
+                assert observation_access["Index Name"] is None
+                assert observation_access["Actual Rows"] == total_observation_count
+                assert observation_access["Rows Removed by Filter"] == 0
+            function_scan = next(
+                node for node in nodes if node.get("Node Type") == "Function Scan"
+            )
+            prematch_range_count = len(recording.params[0].obj)
+            assert function_scan["Actual Rows"] == prematch_range_count
+            assert function_scan["Actual Loops"] == 1
+            assert document["Plan"]["Actual Rows"] == len(
+                snapshot.prematch_observations
+            )
+            assert document["Plan"]["Actual Loops"] == 1
+            assert any(
+                "Shared Hit Blocks" in node or "Shared Read Blocks" in node
+                for node in nodes
+            )
+            assert document["Execution Time"] >= 0
 
 
 def test_q05_colliding_analytics_identity_does_not_extend_the_source_deadline() -> None:
