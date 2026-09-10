@@ -142,3 +142,11 @@ dependent enqueue calls and completion use one connection and one transaction:
 the lease guard locks and validates the token before the first domain write.
 Canonical writers used there must accept that connection and must not commit or
 open a separate connection.
+
+Q04 budget denial/unavailability defers the same item until `retry_at` (60s
+fallback), retaining the persisted checkpoint. Fenced deferral atomically
+excludes that claim from the work retry cap; cumulative attempts and physical
+API debits remain. Budget waits alone cannot quarantine an item.
+HTTP 429 uses the same wait path; Q04 remains authoritative for shared cooldown.
+Exhausted 5xx/transport failures use delayed, jittered retries with saved progress
+and the normal bounded attempt cap. Contract failures still quarantine.

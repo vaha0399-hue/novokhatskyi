@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from random import uniform
 from threading import Event, Thread
 from typing import Any, Protocol
 
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
+from app.api_football.budget import APIFootballBudgetError, budget_retry_delay_seconds
+from app.api_football.errors import APIFootballHTTPError
 from app.sync.policies import AuthorizedSyncWork, SyncPolicyDenied, SyncPolicyGate, SyncWorkRequest
 from app.sync.repository import LeasedWorkItem, PostgresSyncRepository
 
@@ -309,6 +312,30 @@ class RepeatableSyncWorker:
         thread.start()
         try:
             result = fetch(item, authorization)
+        except (APIFootballBudgetError, APIFootballHTTPError) as exc:
+            stop.set()
+            thread.join()
+            if failed.is_set():
+                raise LeaseLost("repeatable work-item heartbeat failed") from exc
+            if isinstance(exc, APIFootballBudgetError):
+                deferred = self.repository.defer_for_budget(
+                    item, self._owner, delay=f"{budget_retry_delay_seconds(exc)} seconds",
+                )
+            elif exc.status_code == 429:
+                # The client already recorded the shared cooldown. A later
+                # attempt must pass Q04 reserve again, including Retry-After.
+                deferred = self.repository.defer_for_budget(item, self._owner, delay="60 seconds")
+            elif exc.status_code == 0 or 500 <= exc.status_code < 600:
+                delay = min(60, 2 ** min(item.attempts, 6)) + uniform(0, 1)
+                deferred = self.repository.defer_for_retry(
+                    item, self._owner, delay=f"{delay} seconds", error=f"provider_http_{exc.status_code}",
+                )
+            else:
+                with self._connection.transaction():
+                    deferred = self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            if not deferred:
+                raise LeaseLost("repeatable work-item lease was lost before failure handling") from exc
+            return True
         except Exception as exc:
             stop.set()
             thread.join()

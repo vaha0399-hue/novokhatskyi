@@ -11,6 +11,8 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from app.api_football import APIFootballBudgetDenied, APIFootballBudgetError
+from app.api_football.errors import APIFootballHTTPError
 from app.importer.cup_bootstrap import CupCompetition
 from app.importer.cup_queue import OPERATION as CUP_OPERATION, POLICY_VERSION as CUP_POLICY_VERSION
 from app.importer.cup_queue_repository import PostgresCupQueueRepository
@@ -18,7 +20,7 @@ from app.importer.cup_queue import CupQueueError, CupWorkItem
 from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLeaguePolicy, SeasonalSyncError, SeasonalWorkItem
 from app.importer.catalogue_bootstrap import CatalogueBootstrapError, PostgresRepository as CatalogueRepository, WorkItem
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
-from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
+from app.sync.repository import LeasedWorkItem, PeriodicWork, PostgresSyncRepository, RecalculationWork
 from app.sync.scheduler import AnalyticsInputSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import PostgresSchedulerRepository
@@ -2346,6 +2348,233 @@ def test_q03_real_sessions_fence_old_owner_and_quarantine_attempt_limit() -> Non
         retry_claim = second.execute("SELECT * FROM ops.claim_next_repeatable_sync_work_item_with_lease(%s,%s,%s)", (f"retry-{suffix}", "1 minute", 2)).fetchone()
         assert retry_claim is not None and int(retry_claim[0]) == item_id
         assert int(retry_claim[-1]) > quarantined_token
+
+
+def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    owner = f"q03-budget-{suffix}"
+    persisted_checkpoint = {"page": 7, "cursor": "continued"}
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q03-budget-{suffix}", "Q03 budget deferral"),
+        ).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-budget-{suffix}")
+        item_id, _ = _enqueue(
+            connection, run_id, f"q03-budget:{suffix}", priority=10_500_000,
+            execution_key=f"q03-budget:{suffix}",
+        )
+        connection.execute(
+            "UPDATE ops.sync_work_items SET scope=%s,checkpoint=%s WHERE id=%s",
+            (Jsonb({"_sync_policy": {"provider_id": provider_id, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}),
+             Jsonb({"page": 1}), item_id),
+        )
+        class Gate:
+            def before_enqueue(self, _request): return type("A", (), {"coverage": None, "refresh_interval": None})()
+            def before_execution(self, authorization): return authorization
+
+        worker = RepeatableSyncWorker(
+            connection, Gate(), owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL),
+        )  # type: ignore[arg-type]
+        repository = worker.repository
+
+        # One legitimate failed execution remains counted against max_attempts.
+        first = repository.claim_next(owner, max_attempts=2)
+        assert first is not None and first.id == item_id
+        assert repository.requeue(first, owner, {"page": 2}, "ordinary_retry")
+
+        errors = (
+            APIFootballBudgetDenied("daily", datetime.now(UTC) + timedelta(hours=1)),
+            APIFootballBudgetError("budget unavailable"),
+            APIFootballHTTPError(429),
+            APIFootballBudgetError("budget unavailable"),
+            APIFootballHTTPError(429),
+        )
+        for wait_number, error in enumerate(errors):
+            def fetch(claimed, _authorization):
+                assert connection.info.transaction_status.name == "IDLE"
+                if wait_number == 0:
+                    # Persisted progress may be newer than the claim snapshot.
+                    assert claimed.checkpoint == {"page": 2}
+                    with connection.transaction():
+                        assert repository.checkpoint(claimed, owner, persisted_checkpoint)
+                    assert connection.info.transaction_status.name == "IDLE"
+                raise error
+
+            assert worker.run_once(fetch, lambda *_args: pytest.fail("apply"), max_attempts=2) is True
+            row = connection.execute(
+                "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,available_at > clock_timestamp() "
+                "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+            ).fetchone()
+            assert row == ("pending", persisted_checkpoint, wait_number + 2, 1, "budget_pending", True)
+
+            # The deferred item is not claimable before its due time.
+            not_due = repository.claim_next(f"early-{suffix}", max_attempts=2)
+            assert not_due is None or not_due.id != item_id
+            assert connection.execute(
+                "SELECT status,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
+            ).fetchone() == ("pending", wait_number + 2, 1)
+            connection.execute(
+                "UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,),
+            )
+
+    # A new worker connection resumes the same durable item even though its
+    # cumulative attempt count is already beyond the per-cycle maximum.
+    with psycopg.connect(TEST_DB_URL) as connection:
+        worker = RepeatableSyncWorker(
+            connection, Gate(), owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL),
+        )  # type: ignore[arg-type]
+        observed: list[object] = []
+        assert worker.run_once(
+            lambda item, _authorization: observed.append(item.checkpoint) or WorkResult({"done": True}),
+            lambda *_args: None,
+            max_attempts=2,
+        ) is True
+        connection.commit()
+    assert observed == [persisted_checkpoint]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
+        assert verify.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("succeeded", {"done": True}, 7, 2)
+
+
+def test_q03_budget_defer_stale_or_expired_lease_cannot_mutate_item() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    owner = f"q03-budget-fence-{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q03-budget-fence-{suffix}", "Q03 budget fence"),
+        ).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-budget-fence-{suffix}")
+        item_id, _ = _enqueue(
+            connection, run_id, f"q03-budget-fence:{suffix}", priority=10_400_000,
+            execution_key=f"q03-budget-fence:{suffix}",
+        )
+        repository = PostgresSyncRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: datetime.now(UTC)))
+        item = repository.claim_next(owner, max_attempts=3)
+        assert item is not None and item.id == item_id
+        stale = LeasedWorkItem(
+            item.id, item.run_id, item.scope_key, item.scope, item.checkpoint, item.attempts,
+            item.job_type, item.priority, item.stable_key, item.entity_key, item.execution_key,
+            item.lease_token - 1,
+        )
+        before = connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,lease_owner,lease_token "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone()
+        assert repository.defer_for_budget(stale, owner, delay="1 hour") is False
+        assert connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,lease_owner,lease_token "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == before
+
+        connection.execute(
+            "UPDATE ops.sync_work_items SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=%s", (item_id,),
+        )
+        expired = connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,lease_owner,lease_token "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone()
+        assert repository.defer_for_budget(item, owner, delay="1 hour") is False
+        assert connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,lease_owner,lease_token "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == expired
+        connection.execute(
+            "UPDATE ops.sync_work_items SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL WHERE id=%s",
+            (item_id,),
+        )
+
+
+def test_q03_budget_defer_rolls_back_pending_transition_when_attempt_debit_fails() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    owner = f"q03-budget-rollback-{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q03-budget-rollback-{suffix}", "Q03 budget rollback"),
+        ).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-budget-rollback-{suffix}")
+        item_id, _ = _enqueue(
+            connection, run_id, f"q03-budget-rollback:{suffix}", priority=10_300_000,
+            execution_key=f"q03-budget-rollback:{suffix}",
+        )
+        repository = PostgresSyncRepository(connection, SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: datetime.now(UTC)))
+        item = repository.claim_next(owner, max_attempts=3)
+        assert item is not None and item.id == item_id
+        original_requeue = repository.requeue
+
+        def fail_after_requeue(*args, **kwargs):
+            assert original_requeue(*args, **kwargs)
+            raise RuntimeError("forced attempt debit failure")
+
+        repository.requeue = fail_after_requeue  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="forced attempt debit failure"):
+            repository.defer_for_budget(item, owner, delay="1 hour")
+        assert connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,lease_owner,lease_token "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("running", {}, 1, 1, None, owner, item.lease_token)
+        connection.execute(
+            "UPDATE ops.sync_work_items SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL WHERE id=%s",
+            (item_id,),
+        )
+
+
+def test_q03_transient_http_retries_consume_attempt_budget_and_quarantine_at_limit() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    owner = f"q03-http-retry-{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q03-http-retry-{suffix}", "Q03 HTTP retry"),
+        ).fetchone()[0])
+        run_id = _run(connection, provider_id, f"q03-http-retry-{suffix}")
+        item_id, _ = _enqueue(
+            connection, run_id, f"q03-http-retry:{suffix}", priority=10_200_000,
+            execution_key=f"q03-http-retry:{suffix}",
+        )
+        connection.execute(
+            "UPDATE ops.sync_work_items SET scope=%s,checkpoint=%s WHERE id=%s",
+            (Jsonb({"_sync_policy": {"provider_id": provider_id, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}),
+             Jsonb({"page": 3}), item_id),
+        )
+
+        class Gate:
+            def before_enqueue(self, _request): return type("A", (), {"coverage": None, "refresh_interval": None})()
+            def before_execution(self, authorization): return authorization
+
+        worker = RepeatableSyncWorker(
+            connection, Gate(), owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL),
+        )  # type: ignore[arg-type]
+        for attempt in (1, 2):
+            assert worker.run_once(
+                lambda *_args: (_ for _ in ()).throw(APIFootballHTTPError(503)),
+                lambda *_args: pytest.fail("apply"),
+                max_attempts=2,
+            ) is True
+            assert connection.execute(
+                "SELECT status,checkpoint,attempts,attempts_in_budget,last_error "
+                "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+            ).fetchone() == ("pending", {"page": 3}, attempt, attempt, "provider_http_503")
+            connection.execute(
+                "UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,),
+            )
+
+        claimed = worker.repository.claim_next(f"exhaust-{suffix}", max_attempts=2)
+        assert claimed is None or claimed.id != item_id
+        assert connection.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,quarantine_reason "
+            "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("quarantined", {"page": 3}, 2, 2, "provider_http_503")
 
 
 def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_completion() -> None:

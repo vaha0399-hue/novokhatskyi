@@ -180,6 +180,39 @@ class PostgresSyncRepository:
     def requeue(self, item: LeasedWorkItem, owner: str, checkpoint: Mapping[str, Any], error: str, *, delay: str = "0 seconds", contract_error: bool = False) -> bool:
         return self._mutates("requeue_repeatable_sync_work_item", (item.id, owner, item.lease_token, Jsonb(dict(checkpoint)), error, delay, contract_error))
 
+    def defer_for_budget(self, item: LeasedWorkItem, owner: str, *, delay: str) -> bool:
+        """Budget waits preserve progress and don't exhaust the work retry cap."""
+        return self._defer(item, owner, delay=delay, error="budget_pending", restore_attempt=True)
+
+    def defer_for_retry(self, item: LeasedWorkItem, owner: str, *, delay: str, error: str) -> bool:
+        """Transient failures retain their counted attempt and saved progress."""
+        return self._defer(item, owner, delay=delay, error=error, restore_attempt=False)
+
+    def _defer(self, item: LeasedWorkItem, owner: str, *, delay: str, error: str, restore_attempt: bool) -> bool:
+        with self._connection.transaction():
+            # The existing guard locks first, then rechecks expiry/token. Keep
+            # that lock through both the pending transition and attempt debit.
+            if not self._mutates("guard_repeatable_sync_work_item_lease", (item.id, owner, item.lease_token)):
+                return False
+            row = self._connection.execute(
+                "SELECT checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("deferral lost its locked work item")
+            # Fetch may have checkpointed progress since claim; don't restore
+            # the older checkpoint carried by the LeasedWorkItem snapshot.
+            if not self.requeue(item, owner, row[0], error, delay=delay):
+                return False
+            if restore_attempt:
+                restored = self._connection.execute(
+                    "UPDATE ops.sync_work_items SET attempts_in_budget=attempts_in_budget-1 "
+                    "WHERE id=%s AND attempts_in_budget>0 RETURNING id", (item.id,),
+                ).fetchone()
+                if restored is None:
+                    raise RuntimeError("budget deferral requires a counted claim")
+            # Cumulative attempts and all physical Q04 request debits remain.
+            return True
+
     def retry_quarantined(self, item_id: int) -> bool:
         return self._mutates("retry_quarantined_repeatable_sync_work_item", (item_id,))
 

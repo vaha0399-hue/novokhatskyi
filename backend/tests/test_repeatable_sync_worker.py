@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
+import httpx
 import pytest
 from time import sleep
 
+from app.api_football import APIFootballBudgetDenied, APIFootballBudgetError, APIFootballClient
+from app.api_football.errors import APIFootballHTTPError
 from app.sync.policies import PolicyDenialReason, SyncPolicyDenied
 from app.sync.repository import LeasedWorkItem
 from app.sync.worker import LeaseLost, RepeatableSyncWorker, WorkResult
@@ -66,8 +72,160 @@ class _Gate:
         return authorization
 
 
-def _item():
-    return LeasedWorkItem(1, 1, "scope", {"_sync_policy": {"provider_id": 1, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}, {}, 1, "x", 0, "key", "entity", "exec", 9)
+def _item(*, checkpoint=None):
+    return LeasedWorkItem(1, 1, "scope", {"_sync_policy": {"provider_id": 1, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}, checkpoint or {}, 1, "x", 0, "key", "entity", "exec", 9)
+
+
+class _DenyBudget:
+    def __init__(self, error): self.error = error
+    async def reserve(self, _consumer): raise self.error
+    async def observe(self, *_args): pytest.fail("denied request must not be observed")
+
+
+@pytest.mark.parametrize(
+    ("error_kind", "minimum_delay", "maximum_delay"),
+    (
+        ("denied", 115.0, 120.0),
+        ("unavailable", 60.0, 60.0),
+    ),
+)
+def test_runner_budget_error_defers_without_apply_or_contract_quarantine(
+    error_kind: str, minimum_delay: float, maximum_delay: float,
+) -> None:
+    error = (
+        APIFootballBudgetDenied("daily", datetime.now(UTC) + timedelta(seconds=120))
+        if error_kind == "denied"
+        else APIFootballBudgetError("budget unavailable")
+    )
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    item = _item(checkpoint={"page": 4})
+    worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
+    deferred: list[tuple[object, ...]] = []
+    quarantined: list[tuple[object, ...]] = []
+    worker.repository.defer_for_budget = lambda *args, **kwargs: deferred.append((*args, kwargs["delay"])) or True  # type: ignore[attr-defined,method-assign]
+    worker.repository.requeue = lambda *args, **kwargs: quarantined.append((*args, kwargs)) or True  # type: ignore[method-assign]
+
+    assert worker.run_once(lambda *_: (_ for _ in ()).throw(error), lambda *_: pytest.fail("apply")) is True
+
+    assert len(deferred) == 1
+    assert deferred[0][:2] == (item, "owner")
+    delay = float(str(deferred[0][2]).removesuffix(" seconds"))
+    assert minimum_delay <= delay <= maximum_delay
+    assert quarantined == []
+
+
+def test_runner_budget_denial_from_real_client_happens_before_http_and_defers() -> None:
+    requests: list[httpx.Request] = []
+    error = APIFootballBudgetDenied("daily", datetime.now(UTC) + timedelta(seconds=90))
+    client = APIFootballClient(
+        "test-secret",
+        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200, json={})),
+        budget=_DenyBudget(error),
+        budget_consumer="operations",
+    )
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item(checkpoint={"page": 4})  # type: ignore[method-assign]
+    deferred: list[object] = []
+    worker.repository.defer_for_budget = lambda *args, **_kwargs: deferred.append(args) or True  # type: ignore[attr-defined,method-assign]
+    try:
+        assert worker.run_once(lambda *_: asyncio.run(client.get_once("fixtures")), lambda *_: pytest.fail("apply")) is True
+    finally:
+        asyncio.run(client.aclose())
+    assert requests == []
+    assert len(deferred) == 1
+
+
+@pytest.mark.parametrize("status_code", (200, 429))
+def test_runner_observation_failure_or_429_defers_without_refunding_consumed_reservation(status_code: int) -> None:
+    class ConsumedThenUnavailableBudget:
+        def __init__(self): self.reservations = 0
+        async def reserve(self, _consumer): self.reservations += 1
+        async def observe(self, observed_status, _headers):
+            assert observed_status == status_code
+            if status_code == 200:
+                raise APIFootballBudgetError("observation unavailable")
+
+    requests: list[httpx.Request] = []
+    budget = ConsumedThenUnavailableBudget()
+    client = APIFootballClient(
+        "test-secret",
+        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(status_code, json={})),
+        budget=budget,
+        budget_consumer="operations",
+    )
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    deferred: list[object] = []
+    worker.repository.defer_for_budget = lambda *args, **_kwargs: deferred.append(args) or True  # type: ignore[attr-defined,method-assign]
+    try:
+        assert worker.run_once(lambda *_: asyncio.run(client.get_once("fixtures")), lambda *_: pytest.fail("apply")) is True
+    finally:
+        asyncio.run(client.aclose())
+    assert len(requests) == 1
+    assert budget.reservations == 1
+    assert len(deferred) == 1
+
+
+def test_runner_budget_defer_fails_closed_after_heartbeat_or_lease_loss() -> None:
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory(False), heartbeat_interval=0.001)  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.defer_for_budget = lambda *_args, **_kwargs: pytest.fail("failed heartbeat must not defer")  # type: ignore[attr-defined,method-assign]
+    with pytest.raises(LeaseLost, match="heartbeat"):
+        worker.run_once(
+            lambda *_: (sleep(0.01), (_ for _ in ()).throw(APIFootballBudgetError("unavailable")))[1],
+            lambda *_: pytest.fail("apply"),
+        )
+
+    healthy = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    healthy.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    healthy.repository.defer_for_budget = lambda *_args, **_kwargs: False  # type: ignore[attr-defined,method-assign]
+    with pytest.raises(LeaseLost, match="lease"):
+        healthy.run_once(
+            lambda *_: (_ for _ in ()).throw(APIFootballBudgetError("unavailable")),
+            lambda *_: pytest.fail("apply"),
+        )
+
+
+def test_runner_ordinary_fetch_error_remains_contract_quarantined() -> None:
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item(checkpoint={"page": 4})  # type: ignore[method-assign]
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    worker.repository.requeue = lambda *args, **kwargs: calls.append((args, kwargs)) or True  # type: ignore[method-assign]
+    assert worker.run_once(lambda *_: (_ for _ in ()).throw(ValueError("bad payload")), lambda *_: pytest.fail("apply")) is True
+    assert calls == [((_item(checkpoint={"page": 4}), "owner", {}, "bad payload"), {"contract_error": True})]
+
+
+@pytest.mark.parametrize(("status_code", "transition"), ((429, "budget"), (503, "retry"), (0, "retry"), (400, "contract")))
+def test_runner_classifies_provider_http_failures_without_apply(status_code: int, transition: str) -> None:
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    item = _item(checkpoint={"page": 4})
+    worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    worker.repository.defer_for_budget = lambda *args, **kwargs: calls.append(("budget", args, kwargs)) or True  # type: ignore[method-assign]
+    worker.repository.defer_for_retry = lambda *args, **kwargs: calls.append(("retry", args, kwargs)) or True  # type: ignore[attr-defined,method-assign]
+    worker.repository.requeue = lambda *args, **kwargs: calls.append(("contract", args, kwargs)) or True  # type: ignore[method-assign]
+
+    assert worker.run_once(
+        lambda *_: (_ for _ in ()).throw(APIFootballHTTPError(status_code)),
+        lambda *_: pytest.fail("apply"),
+    ) is True
+
+    assert len(calls) == 1 and calls[0][0] == transition
+    if transition == "budget":
+        assert calls[0][1] == (item, "owner")
+        assert float(str(calls[0][2]["delay"]).removesuffix(" seconds")) == 60
+    elif transition == "retry":
+        assert calls[0][1] == (item, "owner")
+        assert calls[0][2]["error"] == f"provider_http_{status_code}"
+        assert 2 <= float(str(calls[0][2]["delay"]).removesuffix(" seconds")) <= 3
+    else:
+        assert calls[0] == ("contract", (item, "owner", {}, f"API-Football returned HTTP {status_code}."), {"contract_error": True})
 
 
 def test_runner_fetch_is_outside_transaction_and_lost_guard_never_applies() -> None:
