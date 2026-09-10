@@ -21,6 +21,7 @@ readonly Q05_ANALYTICS_MIGRATION="$ROOT_DIR/supabase/migrations/20260909050000_q
 readonly Q05_ANALYTICS_WINDOW_MIGRATION="$ROOT_DIR/supabase/migrations/20260909180000_q05_analytics_window_checkpoints.sql"
 readonly Q05_LATE_ANALYTICS_WINDOW_MIGRATION="$ROOT_DIR/supabase/migrations/20260909200000_q05_late_analytics_windows.sql"
 readonly Q05_ANALYTICS_DEADLINE_MIGRATION="$ROOT_DIR/supabase/migrations/20260909210000_q05_analytics_deadlines.sql"
+readonly Q05_FIXTURE_SCHEDULE_OBSERVATION_MIGRATION="$ROOT_DIR/supabase/migrations/20260910003852_q05_fixture_fetch_observations.sql"
 source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
@@ -31,7 +32,7 @@ cleanup() {
 trap cleanup EXIT
 
 psql_db() { local database="$1"; shift; fa_assert_pg_database "$database"; fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$database" "$@"; }
-apply_before_q02() { local database="$1" migration; while IFS= read -r migration; do psql_db "$database" -f "$migration" >/dev/null; done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' ! -name '20260908020000_repeatable_sync_queue.sql' ! -name '20260908030000_repeatable_sync_work_item_leases.sql' ! -name '20260908040000_q03_lease_hardening.sql' ! -name '20260909010000_q05_scheduler_checkpoints.sql' ! -name '20260909020000_q05_scheduler_policy_lock.sql' ! -name '20260909030000_q05_scheduler_window_checkpoint_contract.sql' ! -name '20260909040000_q05_scheduler_event_checkpoints.sql' ! -name '20260909050000_q05_analytics_enqueue.sql' ! -name '20260909180000_q05_analytics_window_checkpoints.sql' ! -name '20260909200000_q05_late_analytics_windows.sql' ! -name '20260909210000_q05_analytics_deadlines.sql' | LC_ALL=C sort); }
+apply_before_q02() { local database="$1" migration; while IFS= read -r migration; do psql_db "$database" -f "$migration" >/dev/null; done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' ! -name '20260908020000_repeatable_sync_queue.sql' ! -name '20260908030000_repeatable_sync_work_item_leases.sql' ! -name '20260908040000_q03_lease_hardening.sql' ! -name '20260909010000_q05_scheduler_checkpoints.sql' ! -name '20260909020000_q05_scheduler_policy_lock.sql' ! -name '20260909030000_q05_scheduler_window_checkpoint_contract.sql' ! -name '20260909040000_q05_scheduler_event_checkpoints.sql' ! -name '20260909050000_q05_analytics_enqueue.sql' ! -name '20260909180000_q05_analytics_window_checkpoints.sql' ! -name '20260909200000_q05_late_analytics_windows.sql' ! -name '20260909210000_q05_analytics_deadlines.sql' ! -name '20260910003852_q05_fixture_fetch_observations.sql' | LC_ALL=C sort); }
 apply_q03() { local database="$1"; psql_db "$database" -f "$MIGRATION" >/dev/null; psql_db "$database" -f "$LEASE_MIGRATION" >/dev/null; }
 apply_hardening() { local database="$1"; psql_db "$database" -f "$HARDENING_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_assertions.sql" >/dev/null; }
 apply_q05() { local database="$1"; psql_db "$database" -f "$Q05_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/q05_scheduler_assertions.sql" >/dev/null; }
@@ -42,6 +43,7 @@ apply_q05_analytics() { local database="$1"; psql_db "$database" -f "$Q05_ANALYT
 apply_q05_analytics_window() { local database="$1"; psql_db "$database" -f "$Q05_ANALYTICS_WINDOW_MIGRATION" >/dev/null; }
 apply_q05_late_analytics_window() { local database="$1"; psql_db "$database" -f "$Q05_LATE_ANALYTICS_WINDOW_MIGRATION" >/dev/null; }
 apply_q05_analytics_deadline() { local database="$1"; psql_db "$database" -f "$Q05_ANALYTICS_DEADLINE_MIGRATION" >/dev/null; }
+apply_q05_fixture_schedule_observation() { local database="$1"; psql_db "$database" -f "$Q05_FIXTURE_SCHEDULE_OBSERVATION_MIGRATION" >/dev/null; }
 
 mkdir -p "$SOCKET_DIR"
 fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$WORK_DIR/redis.sock" "$CLEAN_DB" "$UPGRADE_DB"
@@ -58,6 +60,8 @@ apply_q05_analytics "$CLEAN_DB"
 apply_q05_analytics_window "$CLEAN_DB"
 apply_q05_late_analytics_window "$CLEAN_DB"
 apply_q05_analytics_deadline "$CLEAN_DB"
+apply_q05_fixture_schedule_observation "$CLEAN_DB"
+psql_db "$CLEAN_DB" -f "$ROOT_DIR/supabase/tests/q05_fixture_schedule_observations_assertions.sql" >/dev/null
 fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$UPGRADE_DB"
 apply_before_q02 "$UPGRADE_DB"
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_upgrade_seed.sql" >/dev/null
@@ -74,6 +78,9 @@ apply_q05_late_analytics_window "$UPGRADE_DB"
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_analytics_deadline_upgrade_seed.sql" >/dev/null
 apply_q05_analytics_deadline "$UPGRADE_DB"
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_analytics_deadline_upgrade_assertions.sql" >/dev/null
+psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_fixture_schedule_observations_upgrade_seed.sql" >/dev/null
+apply_q05_fixture_schedule_observation "$UPGRADE_DB"
+psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_fixture_schedule_observations_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_q03_upgrade_assertions.sql" >/dev/null
 

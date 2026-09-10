@@ -394,6 +394,86 @@ def _q05_fetch(connection: psycopg.Connection, *, provider_id: int, at: datetime
     return int(row[0])
 
 
+def test_fixture_schedule_observation_blocks_concurrent_fetch_time_rewrite() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    observed_at = datetime(2026, 9, 10, 10, 0, tzinfo=UTC)
+    kickoff_at = datetime(2026, 9, 10, 14, 0, tzinfo=UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, *_ = _q05_scheduler_setup(setup, suffix)
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff_at,
+            observed_at=observed_at,
+        )
+        fetch_id = _q05_fetch(
+            setup,
+            provider_id=provider_id,
+            at=observed_at,
+            subject_fixture_id=fixture_id,
+        )
+
+    started = threading.Event()
+    backend_pid: list[int] = []
+    outcome: list[str] = []
+
+    def rewrite_fetch_time() -> None:
+        assert TEST_DB_URL is not None
+        with psycopg.connect(TEST_DB_URL) as contender:
+            backend_pid.append(int(contender.execute("SELECT pg_backend_pid()").fetchone()[0]))
+            started.set()
+            try:
+                contender.execute(
+                    "UPDATE source.provider_fetches SET response_received_at=%s WHERE id=%s",
+                    (observed_at + timedelta(seconds=1), fetch_id),
+                )
+                contender.commit()
+                outcome.append("updated")
+            except psycopg.Error as error:
+                contender.rollback()
+                outcome.append(error.sqlstate or "unknown")
+
+    with psycopg.connect(TEST_DB_URL) as observation_writer:
+        observation_writer.execute(
+            """INSERT INTO source.fixture_schedule_observations(
+                   provider_id,fixture_id,source_fetch_id,observed_kickoff_at,observed_at
+               ) VALUES(%s,%s,%s,%s,%s)""",
+            (provider_id, fixture_id, fetch_id, kickoff_at, observed_at),
+        )
+        contender = threading.Thread(target=rewrite_fetch_time)
+        contender.start()
+        assert started.wait(timeout=2)
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+            for _ in range(100):
+                wait = observer.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                    (backend_pid[0],),
+                ).fetchone()
+                if wait is not None and wait[0] == "Lock":
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("fetch timestamp rewrite did not wait for observation transaction")
+        observation_writer.commit()
+        contender.join(timeout=5)
+        assert not contender.is_alive()
+
+    assert outcome == ["23503"]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as check:
+        assert check.execute(
+            "SELECT response_received_at FROM source.provider_fetches WHERE id=%s",
+            (fetch_id,),
+        ).fetchone()[0] == observed_at
+        assert check.execute(
+            """SELECT count(*) FROM source.fixture_schedule_observations
+               WHERE provider_id=%s AND fixture_id=%s AND source_fetch_id=%s""",
+            (provider_id, fixture_id, fetch_id),
+        ).fetchone()[0] == 1
+
+
 def _q05_policy(connection: psycopg.Connection, *, provider_id: int, season_id: int, work_types: tuple[str, ...]) -> None:
     connection.execute("UPDATE ops.competition_sync_policies SET enabled=true,allowed_work_types=%s,coverage=%s,refresh_intervals=%s WHERE provider_id=%s AND season_id=%s",
                        (list(work_types), Jsonb({name: {"state": "covered", "observed_on": "2026-09-09"} for name in work_types}), Jsonb({name: {"value": 1 if name != "schedule_near" else 3, "unit": "hour"} for name in work_types}), provider_id, season_id))
