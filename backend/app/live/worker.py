@@ -205,6 +205,10 @@ class LiveWorker:
         response = await self._provider.get(
             "/fixtures", params={"id": provider_fixture_id}
         )
+        if self._provider.response_contains_api_key(response.raw_body):
+            raise LiveWorkerError(
+                "provider response contains API key; refusing persistence"
+            )
         observed_at = self._clock()
         fixtures = self._normalize_response(
             response, expected_parameters={"id": str(provider_fixture_id)}
@@ -366,6 +370,10 @@ class LiveWorker:
         request_params = {"live": self._settings.provider_live_parameter}
         request_started_at = self._clock()
         response = await self._provider.get("/fixtures", params=request_params)
+        if self._provider.response_contains_api_key(response.raw_body):
+            raise LiveWorkerError(
+                "provider response contains API key; refusing persistence"
+            )
         observed_at = self._clock()
         fixtures = self._normalize_response(
             response,

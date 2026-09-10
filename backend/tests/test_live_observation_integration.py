@@ -17,9 +17,10 @@ from app.live import (
     LiveReconciliationError,
     LiveResolutionError,
     LiveSettings,
+    bind_live_fixture,
     normalize_live_response,
 )
-from app.live.worker import LiveWorker
+from app.live.worker import LiveWorker, LiveWorkerError
 
 
 TEST_DB_URL = os.environ.get("LIVE_WORKER_TEST_DB_URL")
@@ -36,12 +37,13 @@ def _entry(
     fixture_id: int = PROVIDER_FIXTURE_ID,
     kickoff: str | None = "2027-08-30T15:00:00+00:00",
     home_team_id: int = 140,
+    status: str = "1H",
 ) -> dict:
     return {
         "fixture": {
             "id": fixture_id,
             "date": kickoff,
-            "status": {"short": "1H", "elapsed": 35, "extra": None},
+            "status": {"short": status, "elapsed": 35, "extra": None},
         },
         "league": {"id": 142, "season": 2027},
         "teams": {"home": {"id": home_team_id}, "away": {"id": 165}},
@@ -50,10 +52,12 @@ def _entry(
     }
 
 
-def _response(entries: list[dict]) -> APIFootballResponse:
+def _response(
+    entries: list[dict], *, parameters: dict[str, str] | None = None
+) -> APIFootballResponse:
     payload = {
         "get": "fixtures",
-        "parameters": {"live": "142"},
+        "parameters": parameters or {"live": "142"},
         "errors": [],
         "results": len(entries),
         "paging": {"current": 1, "total": 1},
@@ -146,16 +150,30 @@ async def _seed_fixture(connection: AsyncConnection) -> tuple[int, int]:
 
 
 class _Provider:
-    def __init__(self, responses: list[APIFootballResponse]) -> None:
+    def __init__(
+        self,
+        responses: list[APIFootballResponse],
+        *,
+        credential_results: list[bool] | None = None,
+    ) -> None:
         self._responses = responses
+        self._credential_results = list(credential_results or [])
 
     async def get(self, endpoint: str, *, params: dict | None = None):
         assert endpoint == "/fixtures"
-        assert params == {"live": "142"}
-        return self._responses.pop(0)
+        response = self._responses.pop(0)
+        assert params is not None
+        assert {key: str(value) for key, value in params.items()} == response.data[
+            "parameters"
+        ]
+        return response
 
     def response_contains_api_key(self, body: bytes) -> bool:
-        return False
+        return (
+            self._credential_results.pop(0)
+            if self._credential_results
+            else False
+        )
 
 
 class _RetryStore:
@@ -170,6 +188,18 @@ class _RetryStore:
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("redis write failed after postgres commit")
+        self.applied.append((tuple(active_states), frozenset(finished_fixture_ids)))
+
+
+class _StaticStore:
+    def __init__(self, current=()) -> None:
+        self.current = tuple(current)
+        self.applied = []
+
+    async def active(self):
+        return self.current
+
+    async def apply_poll(self, active_states, *, finished_fixture_ids=()):
         self.applied.append((tuple(active_states), frozenset(finished_fixture_ids)))
 
 
@@ -431,6 +461,83 @@ def test_live_observations_replay_rollback_and_redis_retry(
                 (redis_first_at, 1),
                 (redis_second_at, 1),
             ]
+
+            async def persistence_counts() -> tuple[int, int, int, int]:
+                cursor = await connection.execute(
+                    """SELECT
+                           (SELECT count(*) FROM source.provider_fetches),
+                           (SELECT count(*) FROM source.provider_raw_payloads),
+                           (SELECT count(*) FROM source.fixture_schedule_observations),
+                           (SELECT count(*) FROM ops.fixture_reconciliation_state
+                            WHERE fixture_id=%s)""",
+                    (fixture_id,),
+                )
+                row = await cursor.fetchone()
+                assert row is not None
+                return tuple(int(value) for value in row)  # type: ignore[return-value]
+
+            before_primary_rejection = await persistence_counts()
+            primary_store = _StaticStore()
+            credential_primary = LiveWorker(
+                provider=_Provider(
+                    [_response([_entry(status="FT")])],
+                    credential_results=[True],
+                ),
+                repository=repository,
+                store=primary_store,
+                settings=LiveSettings(
+                    redis_url="redis://unused", league_external_ids=(142,)
+                ),
+                clock=lambda: OBSERVED + timedelta(minutes=5),
+            )
+            with pytest.raises(LiveWorkerError, match="API key"):
+                await credential_primary.poll_once()
+            assert await persistence_counts() == before_primary_rejection
+            assert primary_store.applied == []
+
+            reference = await repository.resolve(fixtures[0])
+            previous_state = bind_live_fixture(
+                fixtures[0], reference, observed_at=redis_second_at
+            )
+            recheck_store = _StaticStore([previous_state])
+            before_recheck_rejection = await persistence_counts()
+            recheck_clock = iter(
+                (
+                    OBSERVED + timedelta(minutes=6),
+                    OBSERVED + timedelta(minutes=6, seconds=1),
+                    OBSERVED + timedelta(minutes=6, seconds=2),
+                )
+            )
+            credential_recheck = LiveWorker(
+                provider=_Provider(
+                        [
+                            _response([]),
+                            _response(
+                                [_entry(status="FT")],
+                                parameters={"id": str(PROVIDER_FIXTURE_ID)},
+                            ),
+                    ],
+                    credential_results=[False, True],
+                ),
+                repository=repository,
+                store=recheck_store,
+                settings=LiveSettings(
+                    redis_url="redis://unused", league_external_ids=(142,)
+                ),
+                clock=lambda: next(recheck_clock),
+                monotonic_clock=lambda: 100.0,
+            )
+            with pytest.raises(LiveWorkerError, match="API key"):
+                await credential_recheck.poll_once()
+            after_recheck_rejection = await persistence_counts()
+            assert after_recheck_rejection == (
+                before_recheck_rejection[0] + 1,
+                before_recheck_rejection[1] + 1,
+                before_recheck_rejection[2],
+                before_recheck_rejection[3],
+            )
+            assert recheck_store.applied == []
+            assert recheck_store.current == (previous_state,)
         finally:
             await connection.close()
 

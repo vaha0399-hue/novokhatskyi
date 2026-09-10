@@ -20,7 +20,7 @@ from app.live import (
     normalize_live_fixture,
 )
 from app.live.repository import FixtureReconciliationTask
-from app.live.worker import LiveWorker, run_supervised
+from app.live.worker import LiveWorker, LiveWorkerError, run_supervised
 
 
 NOW = datetime(2026, 8, 30, 16, 7, tzinfo=UTC)
@@ -94,9 +94,16 @@ def _stored_state(
 
 
 class FakeProvider:
-    def __init__(self, outcomes: list[APIFootballResponse | Exception]) -> None:
+    def __init__(
+        self,
+        outcomes: list[APIFootballResponse | Exception],
+        *,
+        credential_results: list[bool] | None = None,
+    ) -> None:
         self.outcomes = outcomes
         self.calls: list[tuple[str, dict[str, str | int] | None]] = []
+        self.credential_results = list(credential_results or [])
+        self.credential_checks: list[bytes] = []
 
     async def get(
         self, endpoint: str, *, params: dict[str, str | int] | None = None
@@ -109,7 +116,8 @@ class FakeProvider:
 
     def response_contains_api_key(self, body: bytes) -> bool:
         assert body
-        return False
+        self.credential_checks.append(body)
+        return self.credential_results.pop(0) if self.credential_results else False
 
 
 class FakeRepository:
@@ -235,6 +243,60 @@ def test_empty_live_cycle_still_makes_exactly_one_provider_request() -> None:
     assert report.provider_request_count == 1
     assert provider.calls == [("/fixtures", {"live": "39-2"})]
     assert store.applied == [((), frozenset())]
+
+
+def test_primary_live_response_with_api_key_is_rejected_before_side_effects() -> None:
+    response = _response({"live": "39"}, [_terminal_entry()])
+    provider = FakeProvider([response], credential_results=[True])
+    repository = FakeRepository()
+    previous = _stored_state()
+    store = FakeStore([previous])
+    worker = LiveWorker(
+        provider=provider,
+        repository=repository,
+        store=store,
+        settings=_settings(39),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(LiveWorkerError, match="API key"):
+        asyncio.run(worker.poll_once())
+
+    assert provider.credential_checks == [response.raw_body]
+    assert repository.resolved == []
+    assert repository.handed_off == []
+    assert repository.live_responses == []
+    assert store.applied == []
+    assert store.current == (previous,)
+
+
+def test_recheck_response_with_api_key_is_rejected_before_side_effects() -> None:
+    primary = _response({"live": "39"}, [])
+    recheck = _response({"id": "1557383"}, [_terminal_entry()])
+    provider = FakeProvider(
+        [primary, recheck], credential_results=[False, True]
+    )
+    repository = FakeRepository()
+    previous = _stored_state()
+    store = FakeStore([previous])
+    worker = LiveWorker(
+        provider=provider,
+        repository=repository,
+        store=store,
+        settings=_settings(39),
+        clock=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    )
+
+    with pytest.raises(LiveWorkerError, match="API key"):
+        asyncio.run(worker.poll_once())
+
+    assert provider.credential_checks == [primary.raw_body, recheck.raw_body]
+    assert repository.handed_off == []
+    assert len(repository.live_responses) == 1
+    assert repository.live_responses[0][0][0] is primary
+    assert store.applied == []
+    assert store.current == (previous,)
 
 
 def test_ft_in_live_feed_needs_no_additional_provider_request() -> None:
