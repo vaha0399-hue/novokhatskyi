@@ -20,6 +20,10 @@ from app.sync.policies import (
     SyncPolicyGate,
     SyncWorkRequest,
 )
+from app.sync.prematch_freshness import (
+    PrematchFetchObservation,
+    evaluate_prematch_freshness,
+)
 from app.sync.repository import PeriodicWork, RecalculationWork
 
 
@@ -34,6 +38,7 @@ SECTION_7_WORK_TYPES = frozenset((
     "overdue_status_check", "result_finalization", "statistics_retry", "correction_check",
     "analytics_recalculation", "quality_sweep",
 ))
+PREMATCH_EVENT_OFFSETS = (timedelta(minutes=60), timedelta(minutes=10))
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -46,6 +51,7 @@ class ScheduleDecisionReason(StrEnum):
     BUDGET_COOLDOWN = "budget_cooldown"
     BUDGET_EXHAUSTED = "budget_exhausted"
     RETRY_EXHAUSTED = "retry_exhausted"
+    FRESH_INPUT = "fresh_input"
 
 
 class ApiCost(StrEnum):
@@ -193,7 +199,7 @@ def _require_aware(value: datetime, name: str) -> None:
         raise ValueError(f"{name} must be timezone-aware")
 
 
-def _interval_delta(interval: RefreshInterval) -> timedelta:
+def refresh_interval_delta(interval: RefreshInterval) -> timedelta:
     units = {
         "second": timedelta(seconds=interval.value),
         "minute": timedelta(minutes=interval.value),
@@ -254,6 +260,7 @@ class SyncScheduler:
         budget: object | None = None,
         seasons: Iterable[SeasonScheduleSnapshot] = (),
         analytics_inputs: Iterable[AnalyticsInputSnapshot] = (),
+        prematch_observations: Iterable[PrematchFetchObservation] = (),
     ) -> SchedulerPreview:
         _require_aware(now, "now")
         current = now.astimezone(UTC)
@@ -281,6 +288,13 @@ class SyncScheduler:
                 ))
 
         fixture_values = tuple(fixtures)
+        prematch_by_fixture: dict[
+            tuple[int, int], list[PrematchFetchObservation]
+        ] = {}
+        for observation in prematch_observations:
+            prematch_by_fixture.setdefault(
+                (observation.provider_id, observation.fixture_id), []
+            ).append(observation)
         season_values = {(item.provider_id, item.season_id): item for item in seasons}
         for policy in policy_by_scope.values():
             season = season_values.get((policy.provider_id, policy.season_id))
@@ -312,6 +326,36 @@ class SyncScheduler:
                     decisions.append(SchedulerDecision({"provider_id": fixture.provider_id, "fixture_id": fixture.fixture_id, "season_id": fixture.season_id}, work_type, None, deadline, policy.priority, error.reason.value))
                     continue
                 work = self._fixture_work(policy, fixture, work_type, deadline)
+                if work_type == "prematch_check":
+                    interval = policy.refresh_intervals.get(work_type)
+                    if interval is not None:
+                        freshness = evaluate_prematch_freshness(
+                            provider_id=fixture.provider_id,
+                            fixture_id=fixture.fixture_id,
+                            current_kickoff_at=fixture.kickoff_at,
+                            now=current,
+                            deadline=deadline,
+                            policy_interval=refresh_interval_delta(interval),
+                            observations=prematch_by_fixture.get(
+                                (fixture.provider_id, fixture.fixture_id), ()
+                            ),
+                        )
+                        if freshness.fresh_input:
+                            scope = dict(work.scope)
+                            scope["confirming_fetch_id"] = (
+                                freshness.confirming_fetch_id
+                            )
+                            decisions.append(
+                                SchedulerDecision(
+                                    scope,
+                                    work_type,
+                                    work.stable_key(),
+                                    deadline,
+                                    policy.priority,
+                                    ScheduleDecisionReason.FRESH_INPUT.value,
+                                )
+                            )
+                            continue
                 reason = ScheduleDecisionReason.DUE.value if deadline <= current else ScheduleDecisionReason.NOT_DUE.value
                 if executable is not None and work_type not in executable:
                     reason = ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
@@ -394,14 +438,17 @@ class SyncScheduler:
         kickoff = fixture.kickoff_at.astimezone(UTC)
         def periodic_boundary(work_type: str) -> datetime:
             interval = policy.refresh_intervals.get(work_type)
-            return now if interval is None else _closed_boundary(now, _interval_delta(interval))
+            return now if interval is None else _closed_boundary(now, refresh_interval_delta(interval))
 
         values: list[tuple[str, datetime]] = []
         if fixture.lifecycle_state in {"scheduled", "postponed"}:
             schedule_type = "schedule_near" if kickoff <= now + timedelta(days=7) else "schedule_far"
             values.append((schedule_type, periodic_boundary(schedule_type)))
         if fixture.lifecycle_state in {"scheduled", "postponed"}:
-            values.extend((("prematch_check", kickoff - timedelta(minutes=60)), ("prematch_check", kickoff - timedelta(minutes=10))))
+            values.extend(
+                ("prematch_check", kickoff - offset)
+                for offset in PREMATCH_EVENT_OFFSETS
+            )
         if fixture.lifecycle_state in {"in_progress", "paused", "suspended", "interrupted"}:
             values.append(("live_refresh", periodic_boundary("live_refresh")))
         if fixture.lifecycle_state not in {"completed", "cancelled", "abandoned"} and now >= kickoff + timedelta(minutes=15):
@@ -472,7 +519,7 @@ class SyncScheduler:
                 work_type=work_type, stable_key=None, deadline=None, priority=policy.priority, reason=error.reason.value,
             )
 
-        interval = interval_override or _interval_delta(authorization.refresh_interval)
+        interval = interval_override or refresh_interval_delta(authorization.refresh_interval)
         if state is None:
             deadline = _closed_boundary(now, interval)
             start = deadline - interval

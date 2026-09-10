@@ -10,6 +10,7 @@ from typing import Any
 from psycopg import Connection
 
 from app.sync.policies import CompetitionSyncPolicy, SyncPolicyDenied
+from app.sync.prematch_freshness import PrematchFetchObservation
 from app.sync.dispatch import Q03Dispatch, Q03DispatchRegistry
 from app.sync.repository import LeasedWorkItem
 from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot, ScheduleDecisionReason, SchedulerPreview, SyncScheduler
@@ -38,19 +39,21 @@ class Q05SchedulerProcess:
         self._registry = Q03DispatchRegistry(handlers)
 
     def preview(self, *, now: datetime, policies: Iterable[CompetitionSyncPolicy],
-                schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None, seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = ()) -> SchedulerPreview:
+                schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None, seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = (), prematch_observations: Iterable[PrematchFetchObservation] = ()) -> SchedulerPreview:
         return self._scheduler.preview(now=now, policies=policies, schedule_state=schedule_state,
-                                       executable_work_types=self._registry.available_work_types(), fixtures=fixtures, budget=budget, seasons=seasons, analytics_inputs=analytics_inputs)
+                                       executable_work_types=self._registry.available_work_types(), fixtures=fixtures, budget=budget, seasons=seasons, analytics_inputs=analytics_inputs, prematch_observations=prematch_observations)
 
     def enqueue_due(self, *, run_id: int, now: datetime, policies: Iterable[CompetitionSyncPolicy],
                     schedule_state: Iterable[PeriodicScheduleState], fixtures: Iterable[FixtureScheduleSnapshot] = (), budget: object | None = None,
-                    seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = ()) -> SchedulerRunResult:
+                    seasons: Iterable[SeasonScheduleSnapshot] = (), analytics_inputs: Iterable[AnalyticsInputSnapshot] = (),
+                    prematch_observations: Iterable[PrematchFetchObservation] = ()) -> SchedulerRunResult:
         # Preview and its transaction use precisely one materialized snapshot.
         # In particular, a generator must not lose the expected checkpoint on
         # its second traversal.
         policy_values, state_values, fixture_values = tuple(policies), tuple(schedule_state), tuple(fixtures)
         season_values, analytics_values = tuple(seasons), tuple(analytics_inputs)
-        preview = self.preview(now=now, policies=policy_values, schedule_state=state_values, fixtures=fixture_values, budget=budget, seasons=season_values, analytics_inputs=analytics_values)
+        prematch_values = tuple(prematch_observations)
+        preview = self.preview(now=now, policies=policy_values, schedule_state=state_values, fixtures=fixture_values, budget=budget, seasons=season_values, analytics_inputs=analytics_values, prematch_observations=prematch_values)
         state_by_key = {state.key(): state for state in state_values}
         results: list[SchedulerEnqueueResult] = []
         denials: list[str] = []

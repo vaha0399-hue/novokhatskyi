@@ -19,7 +19,7 @@ from app.importer.season_sync import PostgresSeasonalSyncRepository, SeasonalLea
 from app.importer.catalogue_bootstrap import CatalogueBootstrapError, PostgresRepository as CatalogueRepository, WorkItem
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyDenied, SyncPolicyGate
 from app.sync.repository import PeriodicWork, PostgresSyncRepository, RecalculationWork
-from app.sync.scheduler import AnalyticsInputSnapshot, PeriodicScheduleState, SyncScheduler
+from app.sync.scheduler import AnalyticsInputSnapshot, PeriodicScheduleState, ScheduleDecisionReason, SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import PostgresSchedulerRepository
 from app.sync.scheduler_repository import PostgresSchedulerSnapshotReader
@@ -394,6 +394,33 @@ def _q05_fetch(connection: psycopg.Connection, *, provider_id: int, at: datetime
     return int(row[0])
 
 
+def _q05_schedule_observation(
+    connection: psycopg.Connection,
+    *,
+    provider_id: int,
+    fixture_id: int,
+    observed_kickoff_at: datetime | None,
+    observed_at: datetime,
+) -> int:
+    fetch_id = _q05_fetch(
+        connection,
+        provider_id=provider_id,
+        at=observed_at,
+        subject_fixture_id=fixture_id,
+    )
+    connection.execute(
+        "UPDATE source.provider_fetches SET normalized_at=%s WHERE id=%s",
+        (observed_at, fetch_id),
+    )
+    connection.execute(
+        """INSERT INTO source.fixture_schedule_observations(
+               provider_id,fixture_id,source_fetch_id,observed_kickoff_at,observed_at
+           ) VALUES(%s,%s,%s,%s,%s)""",
+        (provider_id, fixture_id, fetch_id, observed_kickoff_at, observed_at),
+    )
+    return fetch_id
+
+
 def test_fixture_schedule_observation_blocks_concurrent_fetch_time_rewrite() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
@@ -495,6 +522,7 @@ def _q05_enqueue(process: Q05SchedulerProcess, *, run_id: int, now: datetime, sn
         fixtures=tuple(item for item in snapshot.fixtures if matches(item)),
         seasons=tuple(item for item in snapshot.seasons if matches(item)),
         analytics_inputs=tuple(item for item in snapshot.analytics_inputs if matches(item)),
+        prematch_observations=snapshot.prematch_observations,
         budget=snapshot.budget,
     )
 
@@ -534,6 +562,26 @@ class _Q05Dispatch:
 
     def apply_result(self, writer, item, result) -> None:
         raise AssertionError("scheduler must not write results")
+
+
+def _q05_process(
+    connection: psycopg.Connection,
+    *,
+    now: datetime,
+    work_types: tuple[str, ...] = ("prematch_check",),
+) -> Q05SchedulerProcess:
+    return Q05SchedulerProcess(
+        connection,
+        PostgresSchedulerRepository(
+            connection,
+            SyncPolicyGate(
+                PostgresCompetitionSyncPolicyReader(connection),
+                now=lambda: now,
+            ),
+        ),
+        SyncScheduler(),
+        {work_type: _Q05Dispatch() for work_type in work_types},
+    )
 
 
 def test_q05_reader_process_empty_registry_blocks_seasonal_override_writes() -> None:
@@ -616,6 +664,403 @@ def test_q05_reader_handles_unknown_postponed_kickoff_and_saved_matchday() -> No
         result = _q05_enqueue(process, run_id=run_id, now=now, snapshot=snapshot, provider_id=provider_id, season_id=season_id)
         assert not any(item.work is not None and item.work.scope.get("fixture_id") == postponed_id for item in result.preview.decisions)
         assert connection.execute("SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+
+
+def test_q05_prematch_fresh_input_skips_queue_and_event_checkpoint() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    kickoff = datetime(2026, 9, 11, 15, 0, tzinfo=UTC)
+    deadline = kickoff - timedelta(minutes=60)
+    now = deadline + timedelta(minutes=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("prematch_check",))
+        fixture_id = _q05_fixture(
+            connection,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff,
+        )
+        confirming_fetch_id = _q05_schedule_observation(
+            connection,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=kickoff,
+            observed_at=deadline - timedelta(minutes=30),
+        )
+        for index in range(12):
+            _q05_schedule_observation(
+                connection,
+                provider_id=provider_id,
+                fixture_id=fixture_id,
+                observed_kickoff_at=kickoff,
+                observed_at=(
+                    deadline
+                    - timedelta(hours=1)
+                    - timedelta(minutes=index + 1)
+                ),
+            )
+            _q05_schedule_observation(
+                connection,
+                provider_id=provider_id,
+                fixture_id=fixture_id,
+                observed_kickoff_at=kickoff + timedelta(hours=1),
+                observed_at=deadline - timedelta(minutes=20, seconds=index),
+            )
+        _q05_schedule_observation(
+            connection,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=kickoff,
+            observed_at=now + timedelta(microseconds=1),
+        )
+        foreign_fixture_id = _q05_fixture(
+            connection,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=f"foreign-{suffix}",
+            kickoff_at=kickoff,
+        )
+        foreign_fetch_id = _q05_schedule_observation(
+            connection,
+            provider_id=provider_id,
+            fixture_id=foreign_fixture_id,
+            observed_kickoff_at=kickoff,
+            observed_at=deadline - timedelta(minutes=25),
+        )
+
+        snapshot = _q05_snapshot(now)
+        fixture_observations = [
+            item
+            for item in snapshot.prematch_observations
+            if item.fixture_id == fixture_id
+        ]
+        assert [item.fetch_id for item in fixture_observations] == [
+            confirming_fetch_id
+        ]
+        assert any(
+            item.fetch_id == foreign_fetch_id
+            for item in snapshot.prematch_observations
+        )
+        observation = fixture_observations[0]
+        assert observation.fetch_successful and observation.fetch_normalized
+        process = _q05_process(connection, now=now)
+        result = _q05_enqueue(
+            process,
+            run_id=run_id,
+            now=now,
+            snapshot=snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        decision = next(
+            item
+            for item in result.preview.decisions
+            if item.work_type == "prematch_check" and item.deadline == deadline
+        )
+        assert decision.reason == ScheduleDecisionReason.FRESH_INPUT.value
+        assert decision.scope["confirming_fetch_id"] == confirming_fetch_id
+        assert result.enqueue_results == ()
+        assert connection.execute(
+            "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s",
+            (run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchone()[0] == 0
+
+
+def test_q05_prematch_materialized_snapshot_preserves_ordinary_enqueue_path() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    kickoff = datetime(2026, 9, 11, 15, 0, tzinfo=UTC)
+    deadline = kickoff - timedelta(minutes=60)
+    now = deadline + timedelta(minutes=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(setup, suffix)
+        _q05_policy(setup, provider_id=provider_id, season_id=season_id, work_types=("prematch_check",))
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff,
+        )
+
+    with (
+        psycopg.connect(TEST_DB_URL) as reader_connection,
+        psycopg.connect(TEST_DB_URL, autocommit=True) as writer,
+    ):
+        with reader_connection.transaction():
+            snapshot = PostgresSchedulerSnapshotReader(reader_connection).read(now=now)
+            assert not any(
+                item.fixture_id == fixture_id
+                for item in snapshot.prematch_observations
+            )
+            confirming_fetch_id = _q05_schedule_observation(
+                writer,
+                provider_id=provider_id,
+                fixture_id=fixture_id,
+                observed_kickoff_at=kickoff,
+                observed_at=deadline - timedelta(minutes=30),
+            )
+            assert reader_connection.execute(
+                """SELECT count(*) FROM source.fixture_schedule_observations
+                   WHERE provider_id=%s AND fixture_id=%s""",
+                (provider_id, fixture_id),
+            ).fetchone()[0] == 0
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        process = _q05_process(connection, now=now)
+        result = _q05_enqueue(
+            process,
+            run_id=run_id,
+            now=now,
+            snapshot=snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        decision = next(
+            item
+            for item in result.preview.decisions
+            if item.work_type == "prematch_check" and item.deadline == deadline
+        )
+        assert decision.reason == ScheduleDecisionReason.DUE.value
+        assert len(result.enqueue_results) == 1
+        assert result.enqueue_results[0].enqueued
+        assert result.enqueue_results[0].checkpoint_advanced
+
+        restarted_snapshot = _q05_snapshot(now)
+        assert any(
+            item.fetch_id == confirming_fetch_id
+            for item in restarted_snapshot.prematch_observations
+        )
+        restarted = _q05_enqueue(
+            process,
+            run_id=run_id,
+            now=now,
+            snapshot=restarted_snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        restarted_decision = next(
+            item
+            for item in restarted.preview.decisions
+            if item.work_type == "prematch_check" and item.deadline == deadline
+        )
+        assert restarted_decision.reason == ScheduleDecisionReason.FRESH_INPUT.value
+        assert restarted_decision.scope["confirming_fetch_id"] == confirming_fetch_id
+        assert restarted.enqueue_results == ()
+        assert connection.execute(
+            "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s",
+            (run_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchone()[0] == 1
+
+
+def test_q05_prematch_reschedule_and_restart_do_not_false_skip_or_duplicate() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    old_kickoff = datetime(2026, 9, 11, 14, 0, tzinfo=UTC)
+    new_kickoff = datetime(2026, 9, 11, 15, 0, tzinfo=UTC)
+    new_t_minus_60 = new_kickoff - timedelta(minutes=60)
+    first_run_at = new_t_minus_60 + timedelta(minutes=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(setup, suffix)
+        _q05_policy(setup, provider_id=provider_id, season_id=season_id, work_types=("prematch_check",))
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=old_kickoff,
+        )
+        _q05_schedule_observation(
+            setup,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=old_kickoff,
+            observed_at=new_t_minus_60 - timedelta(minutes=30),
+        )
+        setup.execute(
+            "UPDATE football.fixtures SET kickoff_at=%s WHERE id=%s",
+            (new_kickoff, fixture_id),
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as first_connection:
+        first_process = _q05_process(first_connection, now=first_run_at)
+        first = _q05_enqueue(
+            first_process,
+            run_id=run_id,
+            now=first_run_at,
+            snapshot=_q05_snapshot(first_run_at),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        first_decision = next(
+            item
+            for item in first.preview.decisions
+            if item.work_type == "prematch_check"
+            and item.deadline == new_t_minus_60
+        )
+        assert first_decision.reason == ScheduleDecisionReason.DUE.value
+        assert len(first.enqueue_results) == 1 and first.enqueue_results[0].enqueued
+
+    restarted_at = first_run_at + timedelta(seconds=1)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as restarted_connection:
+        restarted_process = _q05_process(
+            restarted_connection,
+            now=restarted_at,
+        )
+        repeated = _q05_enqueue(
+            restarted_process,
+            run_id=run_id,
+            now=restarted_at,
+            snapshot=_q05_snapshot(restarted_at),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        assert len(repeated.enqueue_results) == 1
+        assert not repeated.enqueue_results[0].enqueued
+        assert not repeated.enqueue_results[0].checkpoint_advanced
+
+        confirming_fetch_id = _q05_schedule_observation(
+            restarted_connection,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=new_kickoff,
+            observed_at=new_t_minus_60 + timedelta(minutes=20),
+        )
+
+    t_minus_10 = new_kickoff - timedelta(minutes=10)
+    final_run_at = t_minus_10 + timedelta(minutes=5)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as final_connection:
+        final_process = _q05_process(final_connection, now=final_run_at)
+        final = _q05_enqueue(
+            final_process,
+            run_id=run_id,
+            now=final_run_at,
+            snapshot=_q05_snapshot(final_run_at),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        relevant = [
+            item
+            for item in final.preview.decisions
+            if item.work_type == "prematch_check"
+            and item.scope.get("fixture_id") == fixture_id
+        ]
+        assert {item.reason for item in relevant} == {
+            ScheduleDecisionReason.FRESH_INPUT.value
+        }
+        assert {
+            item.scope["confirming_fetch_id"] for item in relevant
+        } == {confirming_fetch_id}
+        assert final.enqueue_results == ()
+        assert final_connection.execute(
+            "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s",
+            (run_id,),
+        ).fetchone()[0] == 1
+        assert final_connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchone()[0] == 1
+        assert final_connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s AND scheduled_window_end=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}", new_t_minus_60),
+        ).fetchone()[0] == 1
+        assert final_connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s AND scheduled_window_end=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}", t_minus_10),
+        ).fetchone()[0] == 0
+
+
+def test_q05_prematch_without_evidence_still_obeys_policy_and_handler_gates() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    kickoff = datetime(2026, 9, 11, 15, 0, tzinfo=UTC)
+    now = kickoff - timedelta(minutes=55)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(connection, suffix)
+        _q05_policy(connection, provider_id=provider_id, season_id=season_id, work_types=("prematch_check",))
+        fixture_id = _q05_fixture(
+            connection,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=kickoff,
+        )
+        connection.execute(
+            """UPDATE ops.competition_sync_policies SET enabled=false
+               WHERE provider_id=%s AND season_id=%s""",
+            (provider_id, season_id),
+        )
+        disabled_snapshot = _q05_snapshot(now)
+        assert not any(
+            item.fixture_id == fixture_id
+            for item in disabled_snapshot.prematch_observations
+        )
+        disabled_process = _q05_process(connection, now=now)
+        disabled = _q05_enqueue(
+            disabled_process,
+            run_id=run_id,
+            now=now,
+            snapshot=disabled_snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        assert any(
+            item.work_type == "prematch_check" and item.reason == "disabled"
+            for item in disabled.preview.decisions
+        )
+        assert disabled.enqueue_results == ()
+
+        connection.execute(
+            """UPDATE ops.competition_sync_policies SET enabled=true
+               WHERE provider_id=%s AND season_id=%s""",
+            (provider_id, season_id),
+        )
+        no_handler_snapshot = _q05_snapshot(now)
+        no_handler_process = _q05_process(connection, now=now, work_types=())
+        no_handler = _q05_enqueue(
+            no_handler_process,
+            run_id=run_id,
+            now=now,
+            snapshot=no_handler_snapshot,
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        assert any(
+            item.work_type == "prematch_check"
+            and item.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value
+            for item in no_handler.preview.decisions
+        )
+        assert no_handler.enqueue_results == ()
+        assert connection.execute(
+            "SELECT count(*) FROM ops.sync_work_items WHERE run_id=%s",
+            (run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s AND work_type='prematch_check'
+                 AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchone()[0] == 0
 
 
 def test_q05_colliding_analytics_identity_does_not_extend_the_source_deadline() -> None:

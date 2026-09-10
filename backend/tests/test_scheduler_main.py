@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.sync import scheduler_main
+from app.sync.prematch_freshness import PrematchFetchObservation
 from app.sync.scheduler import AnalyticsInputSnapshot, ApiCostEstimate, SchedulerPreview, SeasonScheduleSnapshot
 from app.sync.scheduler_process import SchedulerRunResult
 from app.sync.scheduler_repository import BudgetSnapshot, SchedulerMaterializedSnapshot
@@ -28,7 +29,20 @@ def test_scheduler_cli_passes_materialized_season_and_analytics_inputs(monkeypat
     snapshot = SchedulerMaterializedSnapshot(
         policies=(), checkpoints=(), fixtures=(), budget=BudgetSnapshot(10, 1, 5, 1, None),
         seasons=(SeasonScheduleSnapshot(7, 101, now, True),),
-        analytics_inputs=(AnalyticsInputSnapshot(7, 101, "fixture:9", 22, now),), input_gaps=(),
+        analytics_inputs=(AnalyticsInputSnapshot(7, 101, "fixture:9", 22, now),),
+        prematch_observations=(
+            PrematchFetchObservation(
+                provider_id=7,
+                fixture_id=9,
+                fetch_id=23,
+                observed_kickoff_at=now,
+                observed_at=now,
+                endpoint="/fixtures",
+                fetch_successful=True,
+                fetch_normalized=True,
+            ),
+        ),
+        input_gaps=(),
     )
     calls: list[dict[str, object]] = []
 
@@ -67,3 +81,4 @@ def test_scheduler_cli_passes_materialized_season_and_analytics_inputs(monkeypat
     assert len(calls) == 1
     assert calls[0]["seasons"] == snapshot.seasons
     assert calls[0]["analytics_inputs"] == snapshot.analytics_inputs
+    assert calls[0]["prematch_observations"] == snapshot.prematch_observations

@@ -19,7 +19,15 @@ from app.sync.policies import (
     SyncWorkRequest,
 )
 from app.sync.repository import PeriodicWork, RecalculationWork
-from app.sync.scheduler import AnalyticsInputSnapshot, FixtureScheduleSnapshot, PeriodicScheduleState, SeasonScheduleSnapshot
+from app.sync.prematch_freshness import PrematchFetchObservation
+from app.sync.scheduler import (
+    PREMATCH_EVENT_OFFSETS,
+    AnalyticsInputSnapshot,
+    FixtureScheduleSnapshot,
+    PeriodicScheduleState,
+    SeasonScheduleSnapshot,
+    refresh_interval_delta,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,7 @@ class SchedulerMaterializedSnapshot:
     budget: BudgetSnapshot
     seasons: tuple[SeasonScheduleSnapshot, ...]
     analytics_inputs: tuple[AnalyticsInputSnapshot, ...]
+    prematch_observations: tuple[PrematchFetchObservation, ...]
     input_gaps: tuple[str, ...]
 
 
@@ -68,6 +77,11 @@ class PostgresSchedulerSnapshotReader:
         rows = self._connection.execute("SELECT provider_id,season_id FROM ops.competition_sync_policies ORDER BY provider_id,season_id").fetchall()
         policy_reader = PostgresCompetitionSyncPolicyReader(self._connection)
         policies = tuple(policy_reader.get(provider_id=int(row[0]), season_id=int(row[1])) for row in rows)
+        policy_by_scope = {
+            (policy.provider_id, policy.season_id): policy
+            for policy in policies
+            if policy is not None
+        }
         checkpoints = tuple(PeriodicScheduleState(int(row[0]), int(row[1]), str(row[2]), row[3], row[4]) for row in self._connection.execute(
             "SELECT provider_id,season_id,work_type,last_scheduled_window_end,next_deadline FROM ops.sync_scheduler_checkpoints ORDER BY provider_id,season_id,work_type").fetchall())
         fixture_rows = self._connection.execute(
@@ -106,6 +120,83 @@ class PostgresSchedulerSnapshotReader:
                  JOIN ops.competition_sync_policies policy ON policy.provider_id=ref.provider_id AND policy.season_id=fixture.season_id
                 WHERE analytics_window.accepted_at IS NULL
                 ORDER BY ref.provider_id,fixture.season_id,fixture.id,analytics_window.window_end""").fetchall())
+        prematch_ranges = []
+        for fixture in fixtures:
+            policy = policy_by_scope.get((fixture.provider_id, fixture.season_id))
+            interval = (
+                None
+                if policy is None
+                else policy.refresh_intervals.get("prematch_check")
+            )
+            if (
+                fixture.kickoff_at is None
+                or fixture.lifecycle_state not in {"scheduled", "postponed"}
+                or policy is None
+                or "prematch_check" not in policy.allowed_work_types
+                or interval is None
+            ):
+                continue
+            kickoff = fixture.kickoff_at.astimezone(UTC)
+            prematch_ranges.append(
+                {
+                    "provider_id": fixture.provider_id,
+                    "fixture_id": fixture.fixture_id,
+                    "observed_kickoff_at": kickoff.isoformat(),
+                    "observed_after": (
+                        kickoff
+                        - max(PREMATCH_EVENT_OFFSETS)
+                        - refresh_interval_delta(interval)
+                    ).isoformat(),
+                }
+            )
+        prematch_rows = () if not prematch_ranges else self._connection.execute(
+            """WITH candidate AS (
+                    SELECT *
+                      FROM jsonb_to_recordset(%s::jsonb) AS item(
+                          provider_id smallint,
+                          fixture_id bigint,
+                          observed_kickoff_at timestamptz,
+                          observed_after timestamptz
+                      )
+                )
+                SELECT observation.provider_id,
+                       observation.fixture_id,
+                       observation.source_fetch_id,
+                       observation.observed_kickoff_at,
+                       observation.observed_at,
+                       provider_fetch.endpoint,
+                       provider_fetch.outcome='success'::source.fetch_outcome,
+                       provider_fetch.normalized_at IS NOT NULL
+                  FROM candidate
+                  JOIN source.fixture_schedule_observations observation
+                    ON observation.provider_id=candidate.provider_id
+                   AND observation.fixture_id=candidate.fixture_id
+                   AND observation.observed_kickoff_at=candidate.observed_kickoff_at
+                   AND observation.observed_at >= candidate.observed_after
+                   AND observation.observed_at <= %s
+                  JOIN source.provider_fetches provider_fetch
+                    ON provider_fetch.id=observation.source_fetch_id
+                   AND provider_fetch.provider_id=observation.provider_id
+                   AND provider_fetch.response_received_at=observation.observed_at
+                 ORDER BY observation.provider_id,
+                          observation.fixture_id,
+                          observation.observed_at,
+                          observation.source_fetch_id""",
+            (Jsonb(prematch_ranges), current),
+        ).fetchall()
+        prematch_observations = tuple(
+            PrematchFetchObservation(
+                provider_id=int(row[0]),
+                fixture_id=int(row[1]),
+                fetch_id=int(row[2]),
+                observed_kickoff_at=row[3],
+                observed_at=row[4],
+                endpoint=str(row[5]),
+                fetch_successful=bool(row[6]),
+                fetch_normalized=bool(row[7]),
+            )
+            for row in prematch_rows
+        )
         seasons = tuple(SeasonScheduleSnapshot(int(row[0]), int(row[1]),
             None if row[2] is None else datetime.combine(row[2], time.min, tzinfo=UTC), bool(row[3])) for row in self._connection.execute(
                 """SELECT policy.provider_id,policy.season_id,season.starts_on,
@@ -132,8 +223,16 @@ class PostgresSchedulerSnapshotReader:
         gaps = ["season_expected_start_unavailable"]
         if missing_analytics_history is not None and bool(missing_analytics_history[0]):
             gaps.append("analytics_window_history_unavailable")
-        return SchedulerMaterializedSnapshot(tuple(policy for policy in policies if policy is not None), checkpoints, fixtures, budget, seasons, analytics_inputs,
-                                             tuple(gaps))
+        return SchedulerMaterializedSnapshot(
+            tuple(policy for policy in policies if policy is not None),
+            checkpoints,
+            fixtures,
+            budget,
+            seasons,
+            analytics_inputs,
+            prematch_observations,
+            tuple(gaps),
+        )
 
 
 class PostgresSchedulerRepository:
