@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -185,6 +185,55 @@ def test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler() -> 
     assert all(item.reason == ScheduleDecisionReason.HANDLER_UNAVAILABLE.value for item in due)
     assert all(item.stable_key is not None and item.deadline is not None for item in due)
     assert _decision(preview, "overdue_status_check").reason == ScheduleDecisionReason.INPUT_UNAVAILABLE.value
+
+
+def test_prematch_identity_uses_canonical_kickoff_and_keeps_fixture_conflict() -> None:
+    policy = _policy(
+        allowed_work_types=frozenset({"prematch_check"}),
+        coverage={
+            "prematch_check": CoverageObservation(
+                CoverageState.COVERED,
+                date(2026, 9, 1),
+            )
+        },
+        refresh_intervals={"prematch_check": RefreshInterval(1, "hour")},
+    )
+    old_kickoff = datetime(2026, 9, 11, 13, tzinfo=UTC)
+    equivalent_kickoff = datetime(
+        2026,
+        9,
+        11,
+        15,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+    new_kickoff = old_kickoff + timedelta(minutes=50)
+    now = datetime(2026, 9, 11, 12, 55, tzinfo=UTC)
+
+    def colliding_decision(kickoff_at: datetime):
+        preview = SyncScheduler().preview(
+            now=now,
+            policies=[policy],
+            schedule_state=[],
+            fixtures=[
+                FixtureScheduleSnapshot(9, 7, 101, kickoff_at, "scheduled")
+            ],
+        )
+        return next(
+            item
+            for item in preview.decisions
+            if item.work_type == "prematch_check"
+            and item.deadline == datetime(2026, 9, 11, 12, 50, tzinfo=UTC)
+        )
+
+    old_t10 = colliding_decision(old_kickoff)
+    equivalent_old_t10 = colliding_decision(equivalent_kickoff)
+    new_t60 = colliding_decision(new_kickoff)
+
+    assert old_t10.stable_key == equivalent_old_t10.stable_key
+    assert old_t10.stable_key != new_t60.stable_key
+    assert old_t10.work is not None and new_t60.work is not None
+    assert old_t10.work.entity_key == new_t60.work.entity_key == "fixture:9"
+    assert old_t10.work.execution_key == new_t60.work.execution_key
 
 
 def test_fixture_periodic_keys_are_stable_inside_a_policy_interval() -> None:

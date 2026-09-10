@@ -1013,6 +1013,144 @@ def test_q05_prematch_reschedule_and_restart_do_not_false_skip_or_duplicate() ->
         ).fetchone()[0] == 0
 
 
+def test_q05_prematch_reschedule_collision_creates_distinct_work_and_checkpoint() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    old_kickoff = datetime(2026, 9, 11, 13, 0, tzinfo=UTC)
+    new_kickoff = old_kickoff + timedelta(minutes=50)
+    colliding_deadline = old_kickoff - timedelta(minutes=10)
+    scheduler_now = colliding_deadline + timedelta(minutes=5)
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _instance, _version, run_id = _q05_scheduler_setup(
+            setup,
+            suffix,
+        )
+        _q05_policy(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            work_types=("prematch_check",),
+        )
+        fixture_id = _q05_fixture(
+            setup,
+            provider_id=provider_id,
+            season_id=season_id,
+            suffix=suffix,
+            kickoff_at=old_kickoff,
+        )
+        _q05_schedule_observation(
+            setup,
+            provider_id=provider_id,
+            fixture_id=fixture_id,
+            observed_kickoff_at=old_kickoff,
+            observed_at=old_kickoff - timedelta(minutes=90),
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as old_connection:
+        old_result = _q05_enqueue(
+            _q05_process(old_connection, now=scheduler_now),
+            run_id=run_id,
+            now=scheduler_now,
+            snapshot=_q05_snapshot(scheduler_now),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        old_t10 = next(
+            item
+            for item in old_result.preview.decisions
+            if item.work_type == "prematch_check"
+            and item.scope.get("fixture_id") == fixture_id
+            and item.deadline == colliding_deadline
+        )
+        assert old_t10.reason == ScheduleDecisionReason.DUE.value
+        assert len(old_result.enqueue_results) == 1
+        assert old_result.enqueue_results[0].enqueued
+        assert old_result.enqueue_results[0].checkpoint_advanced
+        old_connection.execute(
+            "UPDATE football.fixtures SET kickoff_at=%s WHERE id=%s",
+            (new_kickoff, fixture_id),
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as moved_connection:
+        moved_result = _q05_enqueue(
+            _q05_process(moved_connection, now=scheduler_now),
+            run_id=run_id,
+            now=scheduler_now,
+            snapshot=_q05_snapshot(scheduler_now),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        new_t60 = next(
+            item
+            for item in moved_result.preview.decisions
+            if item.work_type == "prematch_check"
+            and item.scope.get("fixture_id") == fixture_id
+            and item.deadline == colliding_deadline
+        )
+        assert new_t60.reason == ScheduleDecisionReason.DUE.value
+        assert new_t60.stable_key != old_t10.stable_key
+        assert len(moved_result.enqueue_results) == 1
+        assert moved_result.enqueue_results[0].enqueued
+        assert moved_result.enqueue_results[0].checkpoint_advanced
+
+        work_rows = moved_connection.execute(
+            """SELECT stable_key,entity_key,execution_key,scope->>'kickoff_at'
+                 FROM ops.sync_work_items
+                WHERE run_id=%s AND job_type='prematch_check'
+                ORDER BY id""",
+            (run_id,),
+        ).fetchall()
+        assert len(work_rows) == 2
+        assert work_rows[0][0] != work_rows[1][0]
+        assert {row[1] for row in work_rows} == {f"fixture:{fixture_id}"}
+        assert {row[2] for row in work_rows} == {
+            f"entity:{provider_id}:{season_id}:fixture:{fixture_id}"
+        }
+        assert {row[3] for row in work_rows} == {
+            old_kickoff.isoformat(),
+            new_kickoff.isoformat(),
+        }
+        checkpoints = moved_connection.execute(
+            """SELECT stable_key,scheduled_window_end
+                 FROM ops.sync_scheduler_event_checkpoints
+                WHERE provider_id=%s AND season_id=%s
+                  AND work_type='prematch_check' AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchall()
+        assert len(checkpoints) == 2
+        assert {row[0] for row in checkpoints} == {
+            old_t10.stable_key,
+            new_t60.stable_key,
+        }
+        assert {row[1] for row in checkpoints} == {colliding_deadline}
+
+    restarted_at = scheduler_now + timedelta(seconds=1)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as restarted_connection:
+        restarted = _q05_enqueue(
+            _q05_process(restarted_connection, now=restarted_at),
+            run_id=run_id,
+            now=restarted_at,
+            snapshot=_q05_snapshot(restarted_at),
+            provider_id=provider_id,
+            season_id=season_id,
+        )
+        assert len(restarted.enqueue_results) == 1
+        assert not restarted.enqueue_results[0].enqueued
+        assert not restarted.enqueue_results[0].checkpoint_advanced
+        assert restarted_connection.execute(
+            """SELECT count(*) FROM ops.sync_work_items
+               WHERE run_id=%s AND job_type='prematch_check'""",
+            (run_id,),
+        ).fetchone()[0] == 2
+        assert restarted_connection.execute(
+            """SELECT count(*) FROM ops.sync_scheduler_event_checkpoints
+               WHERE provider_id=%s AND season_id=%s
+                 AND work_type='prematch_check' AND entity_key=%s""",
+            (provider_id, season_id, f"fixture:{fixture_id}"),
+        ).fetchone()[0] == 2
+
+
 def test_q05_prematch_without_evidence_still_obeys_policy_and_handler_gates() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex

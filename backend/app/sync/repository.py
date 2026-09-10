@@ -47,6 +47,7 @@ class PeriodicWork:
     priority: int
     scope: Mapping[str, Any]
     execution_key: str | None = None
+    event_identity_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.window_start.tzinfo is None or self.window_start.utcoffset() is None:
@@ -55,10 +56,14 @@ class PeriodicWork:
             raise ValueError("window end must be timezone-aware")
         if self.window_start >= self.window_end:
             raise ValueError("periodic window start must precede its end")
+        if self.event_identity_at is not None and (
+            self.event_identity_at.tzinfo is None
+            or self.event_identity_at.utcoffset() is None
+        ):
+            raise ValueError("event identity time must be timezone-aware")
 
     def stable_key(self) -> str:
-        return _stable_key(
-            "periodic",
+        components: tuple[str | int, ...] = (
             _part(self.work_type, "work type"),
             self.provider_id,
             self.season_id,
@@ -66,6 +71,9 @@ class PeriodicWork:
             self.window_start.astimezone(UTC).isoformat(),
             self.window_end.astimezone(UTC).isoformat(),
         )
+        if self.event_identity_at is not None:
+            components += (self.event_identity_at.astimezone(UTC).isoformat(),)
+        return _stable_key("periodic", *components)
 
 
 @dataclass(frozen=True)

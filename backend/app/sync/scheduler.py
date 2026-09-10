@@ -472,7 +472,8 @@ class SyncScheduler:
         # A fixed one-second event window is a Q02 identity, never a launch-time key.
         start = deadline - timedelta(seconds=1)
         return PeriodicWork(policy.provider_id, policy.season_id, work_type, f"fixture:{fixture.fixture_id}", start, deadline, policy.priority,
-                            {"provider_id": policy.provider_id, "season_id": policy.season_id, "fixture_id": fixture.fixture_id, "kickoff_at": fixture.kickoff_at.astimezone(UTC).isoformat() if fixture.kickoff_at is not None else None, "work_type": work_type, "window_start": start.isoformat(), "window_end": deadline.isoformat(), "_sync_policy": _policy_fingerprint(policy, work_type)})
+                            {"provider_id": policy.provider_id, "season_id": policy.season_id, "fixture_id": fixture.fixture_id, "kickoff_at": fixture.kickoff_at.astimezone(UTC).isoformat() if fixture.kickoff_at is not None else None, "work_type": work_type, "window_start": start.isoformat(), "window_end": deadline.isoformat(), "_sync_policy": _policy_fingerprint(policy, work_type)},
+                            event_identity_at=fixture.kickoff_at if work_type == "prematch_check" else None)
 
     @staticmethod
     def _apply_handler_gate(decision: SchedulerDecision, executable: frozenset[str] | None) -> SchedulerDecision:
