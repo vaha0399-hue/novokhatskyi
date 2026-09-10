@@ -24,6 +24,7 @@ from psycopg.types.json import Jsonb
 from app.api_football import APIFootballResponse
 from app.importer.canary import _normalize_standings, parse_datetime
 from app.importer.fixture_status_contract import FixtureStatusObservation, validate_fixture_status_response
+from app.importer.fixture_schedule_observations import record_fixture_schedule_observations
 from app.importer.season_backfill import PROVIDER_CODE, SeasonBackfillScope, SeasonContext, StoredFetch, _resolve_venue
 from app.importer.season_bootstrap import (
     BaseRequest,
@@ -906,7 +907,7 @@ def import_validated_base(
             conn, context=context, records=validated.fixtures, seen_at=fixture_item.response_received_at
         )
         if venue_ids is not None:
-            _bulk_insert_initial_fixtures(
+            fixture_ids = _bulk_insert_initial_fixtures(
                 conn, context=context, fetch=fetch, records=validated.fixtures, venue_ids=venue_ids
             )
         else:
@@ -925,6 +926,16 @@ def import_validated_base(
                     (provider_id, fixture_ids[status.external_fixture_id], status.status_code,
                      fetch.response_received_at, fetch.fetch_id),
                 )
+        record_fixture_schedule_observations(
+            conn,
+            provider_id=provider_id,
+            source_fetch_id=fetch.fetch_id,
+            observed_at=fetch.response_received_at,
+            kickoff_by_fixture_id={
+                fixture_ids[record.external_id]: record.kickoff_at
+                for record in validated.fixtures
+            },
+        )
         _normalize_standings(conn, provider_id=provider_id, season_id=season_id, fetch_id=fetch_ids["/standings"], captured_at=by_endpoint["/standings"].response_received_at, payload=validated.standings_payload)
         conn.execute("UPDATE source.provider_fetches SET normalized_at=coalesce(normalized_at,clock_timestamp()) WHERE id=ANY(%s)", (list(fetch_ids.values()),))
         return context

@@ -19,6 +19,9 @@ from app.importer.active_season import (
     verify_active_season,
 )
 from app.importer.canary import parse_datetime
+from app.importer.fixture_schedule_observations import (
+    FixtureScheduleObservationConflict,
+)
 from app.importer.season_bootstrap import CollectedBaseResponse
 
 
@@ -28,6 +31,12 @@ pytestmark = pytest.mark.skipif(
 )
 SAMPLES = Path(__file__).parents[2] / "samples" / "api-football" / "pro-canary-2026-08-29"
 SCOPE = ActiveSeasonScope(league_external_id=39, season_start_year=2026, expected_fixture_count=380)
+SINGLE_FIXTURE_SCOPE = ActiveSeasonScope(
+    league_external_id=141,
+    season_start_year=2026,
+    expected_fixture_count=380,
+    require_complete_schedule=False,
+)
 
 
 def _response(payload: dict) -> APIFootballResponse:
@@ -93,6 +102,64 @@ def _partial_collected(received_at: datetime) -> tuple[CollectedBaseResponse, ..
     return tuple(transformed)
 
 
+def _single_fixture_collected(received_at: datetime) -> tuple[CollectedBaseResponse, ...]:
+    """A partial one-fixture calendar derived from retained provider bytes."""
+    original = _collected(received_at)
+    transformed: list[CollectedBaseResponse] = []
+    for item, request in zip(
+        original, base_requests(SINGLE_FIXTURE_SCOPE), strict=True
+    ):
+        payload = copy.deepcopy(item.response.data)
+        payload["parameters"] = {
+            key: str(value) for key, value in request.params.items()
+        }
+        if request.endpoint == "/leagues":
+            payload["response"][0]["league"].update(
+                {"id": 141, "name": "Observation Test League"}
+            )
+        elif request.endpoint == "/standings":
+            payload["response"][0]["league"].update(
+                {"id": 141, "name": "Observation Test League"}
+            )
+        elif request.endpoint == "/fixtures":
+            fixture = next(
+                fixture
+                for fixture in payload["response"]
+                if fixture["fixture"]["status"]["short"] == "NS"
+            )
+            fixture["fixture"]["id"] += 2_000_000
+            fixture["league"].update(
+                {"id": 141, "name": "Observation Test League"}
+            )
+            payload["response"] = [fixture]
+            payload["results"] = 1
+        transformed.append(
+            CollectedBaseResponse(
+                request=request,
+                response=_response(payload),
+                request_started_at=item.request_started_at,
+                response_received_at=item.response_received_at,
+            )
+        )
+    return tuple(transformed)
+
+
+def _with_fixture_kickoff(
+    collected: tuple[CollectedBaseResponse, ...], kickoff: str
+) -> tuple[CollectedBaseResponse, ...]:
+    changed = list(collected)
+    fixture_item = changed[3]
+    payload = copy.deepcopy(fixture_item.response.data)
+    payload["response"][0]["fixture"]["date"] = kickoff
+    changed[3] = CollectedBaseResponse(
+        request=fixture_item.request,
+        response=_response(payload),
+        request_started_at=fixture_item.request_started_at,
+        response_received_at=fixture_item.response_received_at,
+    )
+    return tuple(changed)
+
+
 def test_partial_calendar_is_upserted_without_claiming_a_full_schedule() -> None:
     assert TEST_DB_URL is not None
     partial_scope = ActiveSeasonScope(140, 2026, 380, require_complete_schedule=False)
@@ -131,6 +198,146 @@ def test_partial_calendar_is_upserted_without_claiming_a_full_schedule() -> None
 
         assert (full.fixture_count, full.fixture_mapping_count) == (380, 380)
         conn.rollback()
+
+
+def test_calendar_observation_replay_conflict_and_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    received_at = datetime.now(UTC)
+    collected = _single_fixture_collected(received_at)
+    raw_kickoff = collected[3].response.data["response"][0]["fixture"]["date"]
+    expected_kickoff = parse_datetime(raw_kickoff)
+    original_persist_fetch = active_season._persist_fetch
+
+    with psycopg.connect(TEST_DB_URL) as conn:
+        context = import_active_base(
+            conn, collected=collected, scope=SINGLE_FIXTURE_SCOPE
+        )
+        fixture_row = conn.execute(
+            """SELECT fixture.id, fixture.kickoff_at, provider_fetch.id
+               FROM source.fixture_provider_refs ref
+               JOIN football.fixtures fixture ON fixture.id=ref.fixture_id
+               JOIN source.provider_fetches provider_fetch
+                 ON provider_fetch.id=fixture.last_source_fetch_id
+               WHERE ref.provider_id=%s AND fixture.season_id=%s""",
+            (context.provider_id, context.season_id),
+        ).fetchone()
+        assert fixture_row is not None
+        fixture_id, canonical_kickoff, fixture_fetch_id = fixture_row
+        assert canonical_kickoff == expected_kickoff
+        assert conn.execute(
+            """SELECT provider_id, fixture_id, source_fetch_id,
+                      observed_kickoff_at, observed_at
+               FROM source.fixture_schedule_observations
+               WHERE provider_id=%s AND fixture_id=%s""",
+            (context.provider_id, fixture_id),
+        ).fetchall() == [
+            (
+                context.provider_id,
+                fixture_id,
+                fixture_fetch_id,
+                expected_kickoff,
+                received_at,
+            )
+        ]
+        conn.commit()
+
+        def reuse_fixture_fetch(
+            connection: psycopg.Connection,
+            *,
+            provider_id: int,
+            collected: CollectedBaseResponse,
+            season_id: int,
+            retention_class: str = "standard",
+        ) -> int:
+            if collected.request.endpoint == "/fixtures":
+                return fixture_fetch_id
+            return original_persist_fetch(
+                connection,
+                provider_id=provider_id,
+                collected=collected,
+                season_id=season_id,
+                retention_class=retention_class,
+            )
+
+        monkeypatch.setattr(active_season, "_persist_fetch", reuse_fixture_fetch)
+        replay = import_active_base(
+            conn, collected=collected, scope=SINGLE_FIXTURE_SCOPE
+        )
+        assert replay.season_id == context.season_id
+        assert conn.execute(
+            """SELECT count(*) FROM source.fixture_schedule_observations
+               WHERE provider_id=%s AND fixture_id=%s""",
+            (context.provider_id, fixture_id),
+        ).fetchone()[0] == 1
+        conn.commit()
+
+        conflicting_kickoff = "2027-06-01T18:30:00+00:00"
+        with pytest.raises(
+            FixtureScheduleObservationConflict,
+            match="conflicting fixture schedule observation",
+        ):
+            import_active_base(
+                conn,
+                collected=_with_fixture_kickoff(collected, conflicting_kickoff),
+                scope=SINGLE_FIXTURE_SCOPE,
+            )
+        assert conn.execute(
+            "SELECT kickoff_at FROM football.fixtures WHERE id=%s", (fixture_id,)
+        ).fetchone()[0] == expected_kickoff
+        assert conn.execute(
+            """SELECT observed_kickoff_at FROM source.fixture_schedule_observations
+               WHERE provider_id=%s AND fixture_id=%s""",
+            (context.provider_id, fixture_id),
+        ).fetchall() == [(expected_kickoff,)]
+
+        monkeypatch.setattr(active_season, "_persist_fetch", original_persist_fetch)
+        rollback_received_at = received_at + timedelta(minutes=1)
+        rollback_collected = _with_fixture_kickoff(
+            _single_fixture_collected(rollback_received_at),
+            "2027-06-02T19:15:00+00:00",
+        )
+        rollback_kickoff = parse_datetime(
+            rollback_collected[3].response.data["response"][0]["fixture"]["date"]
+        )
+
+        def fail_after_observation(*args: object, **kwargs: object) -> None:
+            assert conn.execute(
+                """SELECT observation.observed_kickoff_at,
+                          observation.observed_at,
+                          provider_fetch.normalized_at
+                   FROM source.fixture_schedule_observations observation
+                   JOIN source.provider_fetches provider_fetch
+                     ON provider_fetch.id=observation.source_fetch_id
+                   WHERE observation.provider_id=%s
+                     AND observation.fixture_id=%s
+                     AND observation.observed_at=%s""",
+                (context.provider_id, fixture_id, rollback_received_at),
+            ).fetchone() == (rollback_kickoff, rollback_received_at, None)
+            raise RuntimeError("forced failure after calendar observation")
+
+        monkeypatch.setattr(active_season, "_normalize_standings", fail_after_observation)
+        with pytest.raises(RuntimeError, match="forced failure after calendar observation"):
+            import_active_base(
+                conn,
+                collected=rollback_collected,
+                scope=SINGLE_FIXTURE_SCOPE,
+            )
+        assert conn.execute(
+            "SELECT kickoff_at FROM football.fixtures WHERE id=%s", (fixture_id,)
+        ).fetchone()[0] == expected_kickoff
+        assert conn.execute(
+            """SELECT count(*) FROM source.fixture_schedule_observations
+               WHERE provider_id=%s AND fixture_id=%s""",
+            (context.provider_id, fixture_id),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            """SELECT count(*) FROM source.provider_fetches
+               WHERE provider_id=%s AND endpoint='/fixtures'
+                 AND response_received_at=%s""",
+            (context.provider_id, rollback_received_at),
+        ).fetchone()[0] == 0
 
 
 def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -288,6 +495,20 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
         assert postponed is not None
         postponed_fixture_id, lifecycle, kickoff_at, status_code = postponed
         assert (lifecycle, kickoff_at, status_code) == ("postponed", None, "PST")
+        assert conn.execute(
+            """SELECT observation.observed_kickoff_at, observation.observed_at,
+                      provider_fetch.endpoint, provider_fetch.normalized_at IS NOT NULL
+               FROM source.fixture_schedule_observations observation
+               JOIN source.provider_fetches provider_fetch
+                 ON provider_fetch.id=observation.source_fetch_id
+               WHERE observation.fixture_id=%s AND observation.observed_at=%s""",
+            (postponed_fixture_id, first_received_at + timedelta(minutes=2)),
+        ).fetchone() == (
+            None,
+            first_received_at + timedelta(minutes=2),
+            "/fixtures",
+            True,
+        )
 
         rescheduled_collected = list(_collected(first_received_at + timedelta(minutes=3)))
         rescheduled_payload = copy.deepcopy(rescheduled_collected[3].response.data)
@@ -321,4 +542,18 @@ def test_real_epl_2026_active_base_is_idempotent(monkeypatch: pytest.MonkeyPatch
             "scheduled",
             parse_datetime(rescheduled_kickoff_raw),
             "NS",
+        )
+        assert conn.execute(
+            """SELECT observation.observed_kickoff_at, observation.observed_at,
+                      provider_fetch.endpoint, provider_fetch.normalized_at IS NOT NULL
+               FROM source.fixture_schedule_observations observation
+               JOIN source.provider_fetches provider_fetch
+                 ON provider_fetch.id=observation.source_fetch_id
+               WHERE observation.fixture_id=%s AND observation.observed_at=%s""",
+            (postponed_fixture_id, first_received_at + timedelta(minutes=3)),
+        ).fetchone() == (
+            parse_datetime(rescheduled_kickoff_raw),
+            first_received_at + timedelta(minutes=3),
+            "/fixtures",
+            True,
         )
