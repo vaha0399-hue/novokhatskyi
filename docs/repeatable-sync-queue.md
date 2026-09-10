@@ -85,6 +85,11 @@ can enqueue. The entrypoint never calls the budget reservation function.
 
 ## Q05 scheduler verification matrix
 
+Accepted 2026-09-10 on `7abccb1`; prematch 6/6. Independent review: APPROVE / CLEAR.
+Final isolated checks: queue 67, calendar 23, live 2, statistics 1+8, DB/Redis 30;
+backend 481 passed / 145 skipped; clean/upgrade and synthetic backup/restore passed.
+This is implementation acceptance, not production deployment.
+
 This matrix covers calculation and Q02 enqueue eligibility only. It does not
 claim that a D/A handler exists: a missing Q03-compatible handler leaves the
 candidate visible as `handler_unavailable`, and missing saved input is
@@ -95,7 +100,7 @@ candidate visible as `handler_unavailable`, and missing saved input is
 | catalogue/season discovery | weekly policy interval; daily inside the saved preseason horizon | `test_discovery_uses_weekly_policy_interval_outside_preseason`; `test_discovery_quality_and_standings_modes_calculate_from_saved_season_inputs` |
 | schedule near | policy-aligned calendar window for a saved fixture within seven days | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler`; `test_fixture_periodic_keys_are_stable_inside_a_policy_interval` |
 | schedule far | policy-aligned window for a saved fixture beyond seven days | `test_schedule_far_and_postponed_fixture_candidates_keep_their_event_deadlines` |
-| prematch check | T−60 and T−10 deadlines from the saved kickoff; a matching successful normalized `/fixtures` observation inside inclusive `[deadline − policy interval, now]` produces `fresh_input` without queue/checkpoint writes, while absent proof retains the Q01 → handler → Q02 path. Open blocker: the deadline-only Q02 identity collides when a +50-minute reschedule makes old T−10 equal new T−60 | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler`; `test_q05_prematch_db_boundaries_are_inclusive_for_t60_and_t10`; `test_q05_prematch_materialized_snapshot_preserves_ordinary_enqueue_path`; `test_q05_prematch_reschedule_and_restart_do_not_false_skip_or_duplicate`; `test_q05_prematch_fresh_input_survives_restart_after_one_day`; `test_q05_prematch_without_evidence_still_obeys_policy_and_handler_gates`; `test_q05_prematch_reader_query_explain_analyzes_realistic_history` |
+| prematch check | T−60 and T−10 deadlines from the saved kickoff; a matching successful normalized `/fixtures` observation inside inclusive `[deadline − policy interval, now]` produces `fresh_input` without queue/checkpoint writes, while absent proof retains the Q01 → handler → Q02 path. Identity includes UTC kickoff; rescheduled events with equal deadlines remain distinct while sharing the fixture execution/conflict key. | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler`; `test_q05_prematch_db_boundaries_are_inclusive_for_t60_and_t10`; `test_q05_prematch_materialized_snapshot_preserves_ordinary_enqueue_path`; `test_q05_prematch_reschedule_and_restart_do_not_false_skip_or_duplicate`; `test_q05_prematch_reschedule_collision_creates_distinct_work_and_checkpoint`; `test_prematch_identity_uses_canonical_kickoff_and_keeps_fixture_conflict`; `test_q05_prematch_fresh_input_survives_restart_after_one_day`; `test_q05_prematch_without_evidence_still_obeys_policy_and_handler_gates`; `test_q05_prematch_reader_query_explain_analyzes_realistic_history` |
 | live | policy interval only while the saved lifecycle is active | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions`; `test_fixture_periodic_keys_are_stable_inside_a_policy_interval` |
 | overdue status check | kickoff +15 minutes for a nonterminal saved lifecycle | `test_fixture_snapshot_calculates_section_7_deadlines_without_a_handler` |
 | result finalization | terminal observation plus the kickoff +3-hour football condition | `test_live_finalization_and_correction_deadlines_require_saved_football_conditions` |
