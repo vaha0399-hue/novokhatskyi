@@ -80,7 +80,10 @@ async def _returning_id(connection: AsyncConnection, query: str, params: tuple) 
 async def _seed_scheduled_fixture(connection: AsyncConnection) -> int:
     provider_id = await _returning_id(
         connection,
-        "INSERT INTO source.providers(code,name) VALUES('api-football','API-Football') RETURNING id",
+        """INSERT INTO source.providers(code,name)
+           VALUES('api-football','API-Football')
+           ON CONFLICT(code) DO UPDATE SET name=excluded.name
+           RETURNING id""",
         (),
     )
     country_id = await _returning_id(
@@ -239,7 +242,9 @@ def test_terminal_handoff_schedules_existing_ops_reconciliation_without_finalizi
                 None,
             )
             fetch_count_cursor = await connection.execute(
-                "SELECT count(*) FROM source.provider_fetches"
+                """SELECT count(*) FROM source.provider_fetches
+                   WHERE subject_fixture_id=ANY(%s)""",
+                ([fixture_id, failure_fixture_id],),
             )
             assert await fetch_count_cursor.fetchone() == (0,)
             assert first.fixture_id == second.fixture_id == fixture_id

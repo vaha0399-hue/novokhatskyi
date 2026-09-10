@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ def _entry(status: str = "1H") -> dict:
     return {
         "fixture": {
             "id": 1557383,
+            "date": "2026-08-30T15:00:00+00:00",
             "status": {"short": status, "long": "status", "elapsed": 45, "extra": 2},
         },
         "league": {"id": 39, "season": 2026},
@@ -69,6 +71,14 @@ def test_current_score_and_time_use_only_live_fields() -> None:
     assert (fixture.score.home, fixture.score.away) == (2, 1)
     assert fixture.elapsed_minute == 45
     assert fixture.added_time == 2
+    assert fixture.kickoff_at == datetime(2026, 8, 30, 15, tzinfo=UTC)
+
+
+def test_unknown_live_kickoff_is_preserved_as_null() -> None:
+    entry = _entry()
+    entry["fixture"]["date"] = None
+
+    assert normalize_live_fixture(entry).kickoff_at is None
 
 
 def test_final_result_reads_period_scores_only_after_ft() -> None:
@@ -144,6 +154,7 @@ def test_expected_league_scope_fails_closed() -> None:
         (("fixture", "status", "short", "LIVE"), "unsupported live fixture status"),
         (("goals", "home", None, -1), "goals.home"),
         (("fixture", "status", "elapsed", True), "fixture.status.elapsed"),
+        (("fixture", "date", None, "not-a-date"), "fixture.date"),
         (("teams", "away", "id", 40), "teams must be distinct"),
     ],
 )

@@ -46,7 +46,8 @@ for migration in \
   "$ROOT_DIR/supabase/migrations/20260822010000_fix_standings_child_guard.sql" \
   "$ROOT_DIR/supabase/migrations/20260822210000_multi_competition_foundation.sql" \
   "$ROOT_DIR/supabase/migrations/20260823010000_historical_lineups_foundation.sql" \
-  "$ROOT_DIR/supabase/migrations/20260829010000_sync_control_plane_foundation.sql"
+  "$ROOT_DIR/supabase/migrations/20260829010000_sync_control_plane_foundation.sql" \
+  "$ROOT_DIR/supabase/migrations/20260910003852_q05_fixture_fetch_observations.sql"
 do
   psql_db -f "$migration" >/dev/null
 done
@@ -54,4 +55,6 @@ done
 env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
   FA_TEST_RESOURCE_MANIFEST="$FA_TEST_RESOURCE_MANIFEST" \
   LIVE_WORKER_TEST_DB_URL="postgresql://postgres@/$DATABASE?host=$SOCKET_DIR&port=$PORT" \
-  uv run --directory "$ROOT_DIR/backend" pytest -q tests/test_live_terminal_repository_integration.py
+  uv run --directory "$ROOT_DIR/backend" pytest -q \
+    tests/test_live_observation_integration.py \
+    tests/test_live_terminal_repository_integration.py

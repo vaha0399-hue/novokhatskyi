@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Collection
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -13,6 +13,9 @@ from psycopg import AsyncConnection, Connection
 from psycopg.types.json import Jsonb
 
 from app.api_football import APIFootballResponse
+from app.importer.fixture_schedule_observations import (
+    record_fixture_schedule_observations_async,
+)
 
 from .models import (
     CanonicalFixtureReference,
@@ -20,7 +23,7 @@ from .models import (
     ProviderFinalResult,
     ProviderLiveFixture,
 )
-from .normalizer import normalize_final_result
+from .normalizer import LiveNormalizationError, normalize_final_result, normalize_live_fixture
 
 
 PROVIDER_CODE = "api-football"
@@ -132,6 +135,164 @@ class AsyncPostgresLiveRepository:
             _RESOLUTION_SQL, _resolution_parameters(fixture)
         )
         return _resolved_reference(fixture, await cursor.fetchone())
+
+    @staticmethod
+    def _validate_live_response(
+        response: APIFootballResponse,
+        fixtures: Sequence[ProviderLiveFixture],
+        *,
+        request_params: Mapping[str, str],
+        request_started_at: datetime,
+        response_received_at: datetime,
+    ) -> None:
+        if request_started_at.tzinfo is None or response_received_at.tzinfo is None:
+            raise LiveReconciliationError("live response timestamps are invalid")
+        if response_received_at < request_started_at:
+            raise LiveReconciliationError("live response timestamps are invalid")
+        payload = response.data
+        entries = payload.get("response")
+        if (
+            response.status_code != 200
+            or payload.get("get") != "fixtures"
+            or payload.get("parameters") != dict(request_params)
+            or payload.get("errors") not in ({}, [], None)
+            or payload.get("paging") != {"current": 1, "total": 1}
+            or not isinstance(entries, list)
+            or payload.get("results") != len(entries)
+        ):
+            raise LiveReconciliationError("live response envelope is invalid")
+        try:
+            raw_payload = json.loads(response.raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise LiveReconciliationError("live raw response is invalid JSON") from error
+        if raw_payload != payload:
+            raise LiveReconciliationError("live parsed response does not match raw bytes")
+        try:
+            response_fixtures = tuple(normalize_live_fixture(entry) for entry in entries)
+        except LiveNormalizationError as error:
+            raise LiveReconciliationError(str(error)) from error
+        if tuple(fixtures) != response_fixtures:
+            raise LiveReconciliationError(
+                "normalized fixture membership does not match the live response"
+            )
+
+    async def _provider_id(self) -> int:
+        cursor = await self._connection.execute(
+            "SELECT id FROM source.providers WHERE code=%s", (PROVIDER_CODE,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise LiveResolutionError("api-football provider mapping is missing")
+        return int(row[0])
+
+    async def _persist_successful_fixture_fetch(
+        self,
+        *,
+        provider_id: int,
+        response: APIFootballResponse,
+        request_params: Mapping[str, str],
+        purpose: str,
+        request_started_at: datetime,
+        response_received_at: datetime,
+        subject_fixture_id: int | None = None,
+        subject_season_id: int | None = None,
+    ) -> int:
+        params = dict(request_params)
+        params_bytes = json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+        paging = response.data["paging"]
+        cursor = await self._connection.execute(
+            """INSERT INTO source.provider_fetches(
+                       provider_id,endpoint,request_params,request_params_sha256,purpose,
+                       request_started_at,response_received_at,http_status,outcome,
+                       provider_results,paging_current,paging_total,content_sha256,
+                       subject_fixture_id,subject_season_id
+                   ) VALUES(%s,'/fixtures',%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s)
+                   RETURNING id""",
+            (
+                provider_id,
+                Jsonb(params),
+                hashlib.sha256(params_bytes).digest(),
+                purpose,
+                request_started_at,
+                response_received_at,
+                response.status_code,
+                response.data["results"],
+                paging["current"],
+                paging["total"],
+                hashlib.sha256(response.raw_body).digest(),
+                subject_fixture_id,
+                subject_season_id,
+            ),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        fetch_id = int(row[0])
+        await self._connection.execute(
+            """INSERT INTO source.provider_raw_payloads(
+                       fetch_id,inline_body,content_type,byte_count,retention_class,expires_at
+                   ) VALUES(%s,%s,'application/json',%s,'standard',%s)""",
+            (
+                fetch_id,
+                response.raw_body,
+                len(response.raw_body),
+                response_received_at + timedelta(days=30),
+            ),
+        )
+        return fetch_id
+
+    async def _mark_fetch_normalized(
+        self, source_fetch_id: int, normalized_at: datetime
+    ) -> None:
+        await self._connection.execute(
+            "UPDATE source.provider_fetches SET normalized_at=%s WHERE id=%s",
+            (normalized_at, source_fetch_id),
+        )
+
+    async def persist_live_response(
+        self,
+        response: APIFootballResponse,
+        fixtures: Sequence[ProviderLiveFixture],
+        *,
+        request_params: Mapping[str, str],
+        request_started_at: datetime,
+        response_received_at: datetime,
+    ) -> int:
+        """Persist one normalized live response without creating fixture mappings."""
+        self._validate_live_response(
+            response,
+            fixtures,
+            request_params=request_params,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+        )
+        async with self._connection.transaction():
+            provider_id = await self._provider_id()
+            resolved = [await self.resolve(fixture) for fixture in fixtures]
+            kickoff_by_fixture_id = {
+                reference.fixture_id: fixture.kickoff_at
+                for fixture, reference in zip(fixtures, resolved, strict=True)
+            }
+            if len(kickoff_by_fixture_id) != len(fixtures):
+                raise LiveResolutionError(
+                    "live response maps multiple provider fixtures to one canonical fixture"
+                )
+            fetch_id = await self._persist_successful_fixture_fetch(
+                provider_id=provider_id,
+                response=response,
+                request_params=request_params,
+                purpose="scheduled_refresh",
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+            )
+            await record_fixture_schedule_observations_async(
+                self._connection,
+                provider_id=provider_id,
+                source_fetch_id=fetch_id,
+                observed_at=response_received_at,
+                kickoff_by_fixture_id=kickoff_by_fixture_id,
+            )
+            await self._mark_fetch_normalized(fetch_id, response_received_at)
+            return fetch_id
 
     async def ensure_terminal_reconciliation(
         self,
@@ -325,6 +486,14 @@ class AsyncPostgresLiveRepository:
             raise LiveReconciliationError("reconciliation raw response is invalid JSON") from error
         if raw_payload != payload:
             raise LiveReconciliationError("reconciliation parsed response does not match raw bytes")
+        try:
+            response_fixture = normalize_live_fixture(entries[0])
+        except LiveNormalizationError as error:
+            raise LiveReconciliationError(str(error)) from error
+        if response_fixture != fixture:
+            raise LiveReconciliationError(
+                "reconciliation normalized fixture does not match the response"
+            )
 
     async def persist_reconciliation_response(
         self,
@@ -358,55 +527,29 @@ class AsyncPostgresLiveRepository:
             if reference.fixture_id != task.fixture_id or reference.season_id != season_id:
                 raise LiveReconciliationError("reconciliation response mapping changed")
             params = {"id": str(task.provider_fixture_id)}
-            params_bytes = json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
-            paging = response.data["paging"]
-            fetch_cursor = await self._connection.execute(
-                """INSERT INTO source.provider_fetches(
-                           provider_id,endpoint,request_params,request_params_sha256,purpose,
-                           request_started_at,response_received_at,http_status,outcome,
-                           provider_results,paging_current,paging_total,content_sha256,
-                           subject_fixture_id,subject_season_id
-                       ) VALUES(%s,'/fixtures',%s,%s,'postmatch_reconciliation',%s,%s,%s,
-                                'success',%s,%s,%s,%s,%s,%s)
-                       RETURNING id""",
-                (
-                    provider_id,
-                    Jsonb(params),
-                    hashlib.sha256(params_bytes).digest(),
-                    request_started_at,
-                    response_received_at,
-                    response.status_code,
-                    response.data["results"],
-                    paging["current"],
-                    paging["total"],
-                    hashlib.sha256(response.raw_body).digest(),
-                    task.fixture_id,
-                    season_id,
-                ),
+            fetch_id = await self._persist_successful_fixture_fetch(
+                provider_id=provider_id,
+                response=response,
+                request_params=params,
+                purpose="postmatch_reconciliation",
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+                subject_fixture_id=task.fixture_id,
+                subject_season_id=season_id,
             )
-            fetch_row = await fetch_cursor.fetchone()
-            assert fetch_row is not None
-            fetch_id = int(fetch_row[0])
-            await self._connection.execute(
-                """INSERT INTO source.provider_raw_payloads(
-                           fetch_id,inline_body,content_type,byte_count,retention_class,expires_at
-                       ) VALUES(%s,%s,'application/json',%s,'standard',%s)""",
-                (
-                    fetch_id,
-                    response.raw_body,
-                    len(response.raw_body),
-                    response_received_at + timedelta(days=30),
-                ),
-            )
-            await self._connection.execute(
-                "UPDATE source.provider_fetches SET normalized_at=%s WHERE id=%s",
-                (response_received_at, fetch_id),
+            await record_fixture_schedule_observations_async(
+                self._connection,
+                provider_id=provider_id,
+                source_fetch_id=fetch_id,
+                observed_at=response_received_at,
+                kickoff_by_fixture_id={task.fixture_id: fixture.kickoff_at},
             )
             if result is None:
                 await self._connection.execute(
                     "SELECT * FROM ops.record_fixture_reconciliation_attempt(%s,%s,%s)",
                     (task.fixture_id, fetch_id, next_attempt_at),
                 )
+                await self._mark_fetch_normalized(fetch_id, response_received_at)
                 return
             await self._connection.execute(
                 """SELECT * FROM ops.finalize_fixture_result(
@@ -443,6 +586,7 @@ class AsyncPostgresLiveRepository:
                    WHERE provider_id=%s AND fixture_id=%s""",
                 (response_received_at, provider_id, task.fixture_id),
             )
+            await self._mark_fetch_normalized(fetch_id, response_received_at)
 
     async def record_reconciliation_failure(
         self,

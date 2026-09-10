@@ -124,6 +124,7 @@ class FakeRepository:
         self.handed_off: list[int] = []
         self.handoff_error: Exception | None = None
         self.due_task = due_task
+        self.live_responses: list[tuple] = []
         self.persisted: list[tuple] = []
         self.failures: list[dict] = []
 
@@ -147,6 +148,9 @@ class FakeRepository:
         if self.due_task and self.due_task.fixture_id not in exclude_fixture_ids:
             return self.due_task
         return None
+
+    async def persist_live_response(self, *args, **kwargs):
+        self.live_responses.append((args, kwargs))
 
     async def persist_reconciliation_response(self, *args, **kwargs):
         self.persisted.append((args, kwargs))
@@ -184,7 +188,8 @@ def _settings(*league_ids: int) -> LiveSettings:
 
 
 def test_poll_once_makes_one_scoped_request_and_publishes_current_score() -> None:
-    provider = FakeProvider([_response({"live": "39"}, [_entry()])])
+    response = _response({"live": "39"}, [_entry()])
+    provider = FakeProvider([response])
     repository = FakeRepository()
     store = FakeStore()
     worker = LiveWorker(
@@ -200,6 +205,15 @@ def test_poll_once_makes_one_scoped_request_and_publishes_current_score() -> Non
     assert report.provider_request_count == 1
     assert provider.calls == [("/fixtures", {"live": "39"})]
     assert repository.resolved == [1557383]
+    assert len(repository.live_responses) == 1
+    live_args, live_kwargs = repository.live_responses[0]
+    assert live_args[0] is response
+    assert [fixture.external_fixture_id for fixture in live_args[1]] == [1557383]
+    assert live_kwargs == {
+        "request_params": {"live": "39"},
+        "request_started_at": NOW,
+        "response_received_at": NOW,
+    }
     state = store.applied[0][0][0]
     assert (state.score.home, state.score.away) == (2, 1)
     assert store.applied[0][1] == frozenset()

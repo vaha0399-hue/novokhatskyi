@@ -69,6 +69,16 @@ class LiveRepository(Protocol):
         observed_at: datetime,
     ) -> CanonicalFixtureReference: ...
 
+    async def persist_live_response(
+        self,
+        response: APIFootballResponse,
+        fixtures: Sequence[ProviderLiveFixture],
+        *,
+        request_params: Mapping[str, str],
+        request_started_at: datetime,
+        response_received_at: datetime,
+    ) -> int: ...
+
     async def next_due_reconciliation(
         self,
         *,
@@ -191,6 +201,7 @@ class LiveWorker:
         provider_fixture_id: int,
         previous: LiveFixtureState,
     ) -> tuple[LiveFixtureState | None, int | None]:
+        request_started_at = self._clock()
         response = await self._provider.get(
             "/fixtures", params={"id": provider_fixture_id}
         )
@@ -208,12 +219,23 @@ class LiveWorker:
                 previous,
                 observed_at=observed_at,
             )
-            return None, fixture_id
-
-        reference = await self._repository.resolve(fixture)
-        if previous.fixture_id != reference.fixture_id:
-            raise LiveWorkerError("live recheck resolved a different canonical fixture")
-        return bind_live_fixture(fixture, reference, observed_at=observed_at), None
+            result = (None, fixture_id)
+        else:
+            reference = await self._repository.resolve(fixture)
+            if previous.fixture_id != reference.fixture_id:
+                raise LiveWorkerError("live recheck resolved a different canonical fixture")
+            result = (
+                bind_live_fixture(fixture, reference, observed_at=observed_at),
+                None,
+            )
+        await self._repository.persist_live_response(
+            response,
+            fixtures,
+            request_params={"id": str(provider_fixture_id)},
+            request_started_at=request_started_at,
+            response_received_at=observed_at,
+        )
+        return result
 
     async def _process_disappeared_candidate(
         self,
@@ -341,9 +363,9 @@ class LiveWorker:
         ):
             raise LiveWorkerError("Redis live state escaped the configured league scope")
 
-        response = await self._provider.get(
-            "/fixtures", params={"live": self._settings.provider_live_parameter}
-        )
+        request_params = {"live": self._settings.provider_live_parameter}
+        request_started_at = self._clock()
+        response = await self._provider.get("/fixtures", params=request_params)
         observed_at = self._clock()
         fixtures = self._normalize_response(
             response,
@@ -375,6 +397,14 @@ class LiveWorker:
                     bind_live_fixture(fixture, reference, observed_at=observed_at)
                 )
             self._terminal_recheck_due_at.pop(fixture.external_fixture_id, None)
+
+        await self._repository.persist_live_response(
+            response,
+            fixtures,
+            request_params=request_params,
+            request_started_at=request_started_at,
+            response_received_at=observed_at,
+        )
 
         disappeared_ids = sorted(
             set(previous_by_provider).difference(current_provider_ids)

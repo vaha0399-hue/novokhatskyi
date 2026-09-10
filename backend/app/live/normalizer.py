@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+from datetime import datetime
 from typing import Any
 
 from .models import LiveFixtureStatus, LiveScore, ProviderFinalResult, ProviderLiveFixture
@@ -44,6 +45,20 @@ def _optional_non_negative_int(value: Any, field: str) -> int | None:
     return _non_negative_int(value, field)
 
 
+def _optional_datetime(value: Any, field: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise LiveNormalizationError(f"{field} must be an ISO-8601 string or null")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise LiveNormalizationError(f"{field} must be an ISO-8601 datetime") from error
+    if parsed.tzinfo is None:
+        raise LiveNormalizationError(f"{field} must include a timezone")
+    return parsed
+
+
 def normalize_live_fixture(item: object) -> ProviderLiveFixture:
     """Normalize one fixture using goals and status fields only.
 
@@ -74,6 +89,7 @@ def normalize_live_fixture(item: object) -> ProviderLiveFixture:
         season_start_year=_positive_int(league.get("season"), "league.season"),
         home_external_team_id=home_team_id,
         away_external_team_id=away_team_id,
+        kickoff_at=_optional_datetime(fixture.get("date"), "fixture.date"),
         status=STATUS_MAP[status_code],
         score=LiveScore(
             home=_non_negative_int(goals.get("home"), "goals.home"),

@@ -40,6 +40,7 @@ class ProviderLiveFixture:
     season_start_year: int
     home_external_team_id: int
     away_external_team_id: int
+    kickoff_at: datetime | None
     status: LiveFixtureStatus
     score: LiveScore
     elapsed_minute: int | None
