@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -535,6 +536,216 @@ def test_spool_recovery_rejects_mismatched_physical_raw_without_marking_durable(
             "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
         ).fetchone()[0] == 1
         assert not (request_directory / ".durable").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("purpose", "research"),
+        ("retention_class", "contract_sample"),
+        ("normalization_version", "fixtures-v2"),
+    ),
+    ids=("purpose", "retention_class", "normalization_version"),
+)
+def test_spool_recovery_rejects_mismatched_metadata(tmp_path: Path, field: str, value: str) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+        item = PostgresSyncRepository(setup, gate).claim_next(f"q06-metadata-{field}-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        fixture_id, _team_id = _q06_subjects(setup, provider_id, season_id, suffix)
+        capture = _capture(
+            endpoint="/fixtures/statistics",
+            params={"fixture": fixture_id},
+            scope={"fixture_id": fixture_id, "season_id": season_id},
+        )
+
+        persisted = ProviderProvenance(setup, response_contains_api_key=lambda _body: False).persist(
+            item,
+            authorization,
+            (capture,),
+        )
+        mismatch = dataclasses.replace(capture, **{field: value})
+        assert field in {"purpose", "retention_class", "normalization_version"}
+        if field == "purpose":
+            assert mismatch.purpose == value
+            assert mismatch.retention_class == capture.retention_class
+            assert mismatch.normalization_version == capture.normalization_version
+        elif field == "retention_class":
+            assert mismatch.retention_class == value
+            assert mismatch.purpose == capture.purpose
+            assert mismatch.normalization_version == capture.normalization_version
+        else:
+            assert mismatch.normalization_version == value
+            assert mismatch.purpose == capture.purpose
+            assert mismatch.retention_class == capture.retention_class
+
+        spool = RawSpool(tmp_path / "spool")
+        request_directory = spool.work_item_request_directory(
+            work_item_id=item.id, attempt=item.attempts, request_number=1,
+        )
+        physical_request_id = f"work-item-{item.id}:attempt-{item.attempts}:request-000001"
+        spool.stage(
+            request_directory,
+            RawSpoolArtifact(
+                BaseRequest(mismatch.endpoint, dict(mismatch.params)),
+                mismatch.response,
+                mismatch.request_started_at,
+                mismatch.response_received_at,
+                dict(capture.scope),
+                item.id,
+                item.attempts,
+                mismatch.normalization_version,
+                mismatch.purpose,
+                mismatch.retention_class,
+                physical_request_id,
+            ),
+        )
+
+        with psycopg.connect(TEST_DB_URL) as recovery_connection:
+            assert recovery_connection.info.transaction_status.name == "IDLE"
+            recorder = ProviderProvenance(
+                recovery_connection, response_contains_api_key=lambda _body: False, spool=spool,
+            )
+            with pytest.raises(ProvenanceError, match="does not match"):
+                recorder.recover_spooled_raw(item, authorization)
+            assert recovery_connection.info.transaction_status.name == "IDLE"
+
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        source_rows = setup.execute(
+            """
+            SELECT provider_fetch.id,provider_fetch.request_scope->>'physical_request_id',
+                   provider_fetch.purpose,provider_fetch.request_scope->'scope',provider_fetch.subject_fixture_id,
+                   provider_fetch.subject_season_id,provider_fetch.subject_team_id,
+                   provider_fetch.normalization_version,provider_fetch.request_started_at,
+                   provider_fetch.response_received_at,provider_raw_payloads.inline_body,provider_raw_payloads.retention_class
+              FROM source.provider_fetches provider_fetch
+              JOIN source.provider_raw_payloads
+              ON source.provider_raw_payloads.fetch_id=provider_fetch.id
+             WHERE provider_fetch.sync_work_item_id=%s
+               AND provider_fetch.request_scope->>'physical_request_id'=%s
+             LIMIT 2
+            """,
+            (item.id, physical_request_id),
+        ).fetchone()
+        assert source_rows is not None
+        fetch_id = source_rows[0]
+        assert source_rows[1] == physical_request_id
+        assert source_rows[2] == capture.purpose
+        assert source_rows[3] == capture.scope
+        assert source_rows[4] == fixture_id
+        assert source_rows[5] == season_id
+        assert source_rows[6] is None
+        assert source_rows[7] == capture.normalization_version
+        assert source_rows[8] == capture.request_started_at
+        assert source_rows[9] == capture.response_received_at
+        assert source_rows[10] == capture.response.raw_body
+        assert source_rows[11] == capture.retention_class
+
+        assert setup.execute(
+            "SELECT inline_body FROM source.provider_raw_payloads WHERE fetch_id=%s", (fetch_id,),
+        ).fetchone()[0] == capture.response.raw_body
+        assert not (request_directory / ".durable").exists()
+        loaded = spool.load(request_directory, BaseRequest(capture.endpoint, dict(capture.params)))
+        assert loaded is not None
+        assert loaded.response.raw_body == capture.response.raw_body
+
+        assert setup.execute(
+            """
+            SELECT count(*) FROM source.provider_raw_payloads payload
+             JOIN source.provider_fetches provider_fetch ON provider_fetch.id=payload.fetch_id
+             WHERE provider_fetch.id=%s
+            """,
+            (fetch_id,),
+        ).fetchone()[0] == 1
+
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as normal_connection:
+            normal_recorder = ProviderProvenance(normal_connection, response_contains_api_key=lambda _body: False)
+            with pytest.raises(ProvenanceError, match="does not match"):
+                normal_recorder.persist(item, authorization, (mismatch,))
+
+        assert setup.execute(
+            "SELECT sync_work_item_id, count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s GROUP BY sync_work_item_id",
+            (item.id,),
+        ).fetchone() == (item.id, 1)
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s AND request_scope->>'physical_request_id'=%s",
+            (item.id, physical_request_id),
+        ).fetchone()[0] == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads payload JOIN source.provider_fetches provider_fetch ON provider_fetch.id=payload.fetch_id WHERE provider_fetch.id=%s",
+            (fetch_id,),
+        ).fetchone()[0] == 1
+
+
+def test_spool_recovery_with_matching_metadata_returns_existing_fetch_and_markers(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+        item = PostgresSyncRepository(setup, gate).claim_next(f"q06-match-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        capture = _capture(purpose="research", retention_class="contract_sample")
+        persisted = ProviderProvenance(setup, response_contains_api_key=lambda _body: False).persist(
+            item,
+            authorization,
+            (capture,),
+        )
+
+        spool = RawSpool(tmp_path / "spool")
+        request_directory = spool.work_item_request_directory(
+            work_item_id=item.id, attempt=item.attempts, request_number=1,
+        )
+        spool.stage(
+            request_directory,
+            RawSpoolArtifact(
+                BaseRequest(capture.endpoint, dict(capture.params)),
+                capture.response,
+                capture.request_started_at,
+                capture.response_received_at,
+                dict(capture.scope or item.scope),
+                item.id,
+                item.attempts,
+                capture.normalization_version,
+                capture.purpose,
+                capture.retention_class,
+                f"work-item-{item.id}:attempt-{item.attempts}:request-000001",
+            ),
+        )
+
+        with psycopg.connect(TEST_DB_URL) as recovery_connection:
+            assert recovery_connection.info.transaction_status.name == "IDLE"
+            recorder = ProviderProvenance(recovery_connection, response_contains_api_key=lambda _body: False, spool=spool)
+            recovered = recorder.recover_spooled_raw(item, authorization)
+            assert tuple(value.fetch_id for value in recovered) == (persisted[0].fetch_id,)
+            assert recovery_connection.info.transaction_status.name == "IDLE"
+            assert (request_directory / ".durable").exists()
+
+        row = setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0]
+        assert row == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
+        ).fetchone()[0] == 1
+
+        with psycopg.connect(TEST_DB_URL) as second_recovery_connection:
+            recorder = ProviderProvenance(
+                second_recovery_connection, response_contains_api_key=lambda _body: False, spool=spool,
+            )
+            assert recorder.recover_spooled_raw(item, authorization) == ()
+            assert (request_directory / ".durable").exists()
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
+        ).fetchone()[0] == 1
 
 
 def test_real_q03_runner_replays_raw_with_source_links_and_atomic_completion() -> None:
