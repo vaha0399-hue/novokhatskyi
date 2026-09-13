@@ -30,6 +30,9 @@ class RawSpoolArtifact:
     work_item_id: int | None = None
     work_item_attempt: int | None = None
     normalization_version: str | None = None
+    purpose: str | None = None
+    retention_class: str | None = None
+    physical_request_id: str | None = None
 
 
 class RawSpool:
@@ -113,6 +116,16 @@ class RawSpool:
             raise RawSpoolError("raw spool work provenance is incomplete")
         if artifact.normalization_version is not None and not artifact.normalization_version.strip():
             raise RawSpoolError("raw spool normalization version is invalid")
+        if artifact.purpose is not None and artifact.purpose not in {
+            "bootstrap", "scheduled_refresh", "prematch", "postmatch_reconciliation", "research",
+        }:
+            raise RawSpoolError("raw spool purpose is invalid")
+        if artifact.retention_class is not None and artifact.retention_class not in {
+            "standard", "anomaly", "prediction_input", "contract_sample",
+        }:
+            raise RawSpoolError("raw spool retention class is invalid")
+        if artifact.physical_request_id is not None and not artifact.physical_request_id.strip():
+            raise RawSpoolError("raw spool physical request identity is invalid")
         metadata: dict[str, Any] = {
             "endpoint": artifact.request.endpoint,
             "parameters": dict(artifact.request.params),
@@ -129,12 +142,24 @@ class RawSpool:
             metadata["work_item_attempt"] = artifact.work_item_attempt
         if artifact.normalization_version is not None:
             metadata["normalization_version"] = artifact.normalization_version
+        if artifact.purpose is not None:
+            metadata["purpose"] = artifact.purpose
+        if artifact.retention_class is not None:
+            metadata["retention_class"] = artifact.retention_class
+        if artifact.physical_request_id is not None:
+            metadata["physical_request_id"] = artifact.physical_request_id
         # A raw body is durable only once both files are atomically present.
         # Replacing an existing artifact is forbidden: one capture generation
         # represents a coherent source observation.
         if raw_path.exists() or request_path.exists():
             loaded = self.load(directory, artifact.request)
-            if loaded.response.raw_body != raw:
+            if (
+                loaded is None
+                or loaded.response.raw_body != raw
+                or loaded.purpose != artifact.purpose
+                or loaded.retention_class != artifact.retention_class
+                or loaded.physical_request_id != artifact.physical_request_id
+            ):
                 raise RawSpoolError("capture generation already contains a different provider response")
             return
         self._write_atomic(raw_path, raw)
@@ -182,6 +207,19 @@ class RawSpool:
         normalization_version = metadata.get("normalization_version")
         if normalization_version is not None and (not isinstance(normalization_version, str) or not normalization_version.strip()):
             raise RawSpoolError("raw spool normalization version is invalid")
+        purpose = metadata.get("purpose")
+        if purpose is not None and purpose not in {
+            "bootstrap", "scheduled_refresh", "prematch", "postmatch_reconciliation", "research",
+        }:
+            raise RawSpoolError("raw spool purpose is invalid")
+        retention_class = metadata.get("retention_class")
+        if retention_class is not None and retention_class not in {
+            "standard", "anomaly", "prediction_input", "contract_sample",
+        }:
+            raise RawSpoolError("raw spool retention class is invalid")
+        physical_request_id = metadata.get("physical_request_id")
+        if physical_request_id is not None and (not isinstance(physical_request_id, str) or not physical_request_id.strip()):
+            raise RawSpoolError("raw spool physical request identity is invalid")
         return RawSpoolArtifact(
             request,
             APIFootballResponse(payload, raw, 200, {}),
@@ -191,6 +229,9 @@ class RawSpool:
             work_item_id,
             work_item_attempt,
             normalization_version,
+            purpose,
+            retention_class,
+            physical_request_id,
         )
 
     def work_item_artifacts(self, *, work_item_id: int) -> tuple[tuple[Path, RawSpoolArtifact], ...]:
@@ -224,6 +265,11 @@ class RawSpool:
                     or not request_directory.name.removeprefix("request-").isdecimal()
                 ):
                     raise RawSpoolError("unsafe raw spool work request directory")
+                durable_marker = request_directory / ".durable"
+                if durable_marker.exists():
+                    if not durable_marker.is_file() or durable_marker.is_symlink():
+                        raise RawSpoolError("unsafe raw spool durable marker")
+                    continue
                 metadata_files = [
                     path for path in request_directory.iterdir()
                     if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")

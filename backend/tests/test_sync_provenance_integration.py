@@ -62,13 +62,15 @@ def _capture(
     params: dict[str, object] | None = None,
     payload: dict[str, object] | None = None,
     scope: dict[str, object] | None = None,
+    purpose: str = "scheduled_refresh",
+    retention_class: str = "standard",
 ) -> RawFetchCapture:
     now = datetime.now(UTC)
     return RawFetchCapture(
         endpoint, params or {"league": 39}, _response(payload or {
             "get": "fixtures", "parameters": {"league": "39"}, "errors": {}, "results": 0,
             "paging": {"current": 1, "total": 1}, "response": [],
-        }), now, now, "fixtures-v1", scope=scope,
+        }), now, now, "fixtures-v1", purpose=purpose, retention_class=retention_class, scope=scope,
     )
 
 
@@ -300,7 +302,7 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
             heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
             provenance=first_recorder,
         )
-        capture = _capture()
+        capture = _capture(purpose="research", retention_class="contract_sample")
         fail_function = f"ops.q06_spool_fail_{suffix}"
         fail_trigger = f"q06_spool_fail_{suffix}"
         connection.execute(
@@ -314,7 +316,7 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
         try:
             with pytest.raises(psycopg.errors.RaiseException, match="precommit raw persistence failure"):
                 first_worker.run_once(
-                    lambda *_args: WorkResult({}, raw_fetches=(capture,)),
+                    lambda *_args: WorkResult({}, raw_fetches=(capture, capture)),
                     lambda *_args: (_ for _ in ()).throw(AssertionError("domain write must not run")),
                 )
         finally:
@@ -330,6 +332,16 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
                 self.http_calls = 0
 
             def replay(self, item, _authorization, recorder):
+                with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+                    assert observer.execute(
+                        "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+                    ).fetchone()[0] == 2
+                assert all(
+                    (spool.work_item_request_directory(
+                        work_item_id=work_item_id, attempt=1, request_number=request_number,
+                    ) / ".durable").is_file()
+                    for request_number in (1, 2)
+                )
                 saved = recorder.latest_replay(item, endpoint="/fixtures", params={"league": 39})
                 assert saved is not None
                 return WorkResult({}, source_fetch_ids=(saved.fetch_id,), replay_normalization_version="fixtures-v2")
@@ -342,29 +354,48 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
                 pass
 
         dispatch = SpoolReplayDispatch()
-        second_recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
-        second_worker = RepeatableSyncWorker(
-            connection, gate, owner,
-            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
-            provenance=second_recorder,
-        )
-        assert second_worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
+        with psycopg.connect(TEST_DB_URL) as recovery_connection:
+            second_recorder = ProviderProvenance(
+                recovery_connection, response_contains_api_key=lambda _body: False, spool=spool,
+            )
+            second_worker = RepeatableSyncWorker(
+                recovery_connection, gate, owner,
+                heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                provenance=second_recorder,
+            )
+            assert second_worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
         assert dispatch.http_calls == 0
         row = connection.execute(
             """SELECT provider_fetch.sync_work_item_attempt,provider_fetch.normalization_version,
-                      provider_fetch.request_started_at,provider_fetch.response_received_at,raw.inline_body
+                      provider_fetch.purpose,payload.retention_class,provider_fetch.request_started_at,
+                      provider_fetch.response_received_at,provider_fetch.request_scope->>'physical_request_id',payload.inline_body
                  FROM source.provider_fetches provider_fetch
-                 JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
-                WHERE provider_fetch.sync_work_item_id=%s""",
+                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                WHERE provider_fetch.sync_work_item_id=%s ORDER BY provider_fetch.id""",
             (work_item_id,),
-        ).fetchone()
-        assert row == (
-            1,
-            capture.normalization_version,
-            capture.request_started_at,
-            capture.response_received_at,
-            capture.response.raw_body,
-        )
+        ).fetchall()
+        assert row == [
+            (
+                1,
+                capture.normalization_version,
+                "research",
+                "contract_sample",
+                capture.request_started_at,
+                capture.response_received_at,
+                f"work-item-{work_item_id}:attempt-1:request-000001",
+                capture.response.raw_body,
+            ),
+            (
+                1,
+                capture.normalization_version,
+                "research",
+                "contract_sample",
+                capture.request_started_at,
+                capture.response_received_at,
+                f"work-item-{work_item_id}:attempt-1:request-000002",
+                capture.response.raw_body,
+            ),
+        ]
 
 
 def test_real_q03_runner_replays_raw_with_source_links_and_atomic_completion() -> None:
