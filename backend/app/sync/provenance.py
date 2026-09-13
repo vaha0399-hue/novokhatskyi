@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from psycopg import Connection
@@ -175,6 +176,8 @@ class ProviderProvenance:
     ) -> tuple[PersistedRawFetch, ...]:
         if not captures:
             return ()
+        if self._spool is not None:
+            self._spool.set_purge_verifier(lambda path: self._spool_candidate_is_safe(path, item, authorization))
         if self._connection.info.transaction_status != TransactionStatus.IDLE:
             raise ProvenanceError("raw persistence requires an idle database connection")
         # Use the client-owned detector before making any filesystem or
@@ -215,6 +218,7 @@ class ProviderProvenance:
         """Commit verified pre-DB spool captures before a replay hook can choose HTTP."""
         if self._spool is None:
             return ()
+        self._spool.set_purge_verifier(lambda path: self._spool_candidate_is_safe(path, item, authorization))
         if self._connection.info.transaction_status != TransactionStatus.IDLE:
             raise ProvenanceError("spool recovery requires an idle database connection")
         staged: list[object] = []
@@ -250,6 +254,57 @@ class ProviderProvenance:
         for directory in set(staged):
             self._spool.mark_durable(directory)
         return tuple(recovered)
+
+    def _spool_candidate_is_safe(
+        self, directory: object, item: LeasedWorkItem, authorization: AuthorizedSyncWork,
+    ) -> bool:
+        """Read-only proof that a durable local copy is safe to evict."""
+        if self._spool is None or not isinstance(directory, Path):
+            return False
+        try:
+            metadata_files = [
+                path for path in directory.iterdir()
+                if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
+            ]
+            if len(metadata_files) != 1:
+                return False
+            metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+            endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
+            if not isinstance(endpoint, str) or not isinstance(params, Mapping):
+                return False
+            artifact = self._spool.load(directory, BaseRequest(endpoint, dict(params)))
+            if artifact is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
+                return False
+            capture = RawFetchCapture(
+                artifact.request.endpoint, dict(artifact.request.params), artifact.response,
+                artifact.request_started_at, artifact.response_received_at,
+                artifact.normalization_version or "legacy", artifact.purpose or "scheduled_refresh",
+                artifact.retention_class or "standard", artifact.scope,
+            )
+            results, paging_current, paging_total = _response_summary(capture.response)
+            scope = {
+                "scope_key": item.scope_key, "job_type": item.job_type,
+                "scope": _safe_mapping(capture.scope or item.scope),
+                "physical_request_id": artifact.physical_request_id,
+            }
+            subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope["scope"])
+            expires_at = (
+                None if capture.retention_class == "contract_sample"
+                else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
+            )
+            with self._connection.transaction():
+                status = self._connection.execute(
+                    "SELECT status FROM ops.sync_work_items WHERE id=%s", (item.id,),
+                ).fetchone()
+                if status is None or status[0] != "succeeded":
+                    return False
+                return self._matching_physical_request(
+                    item, authorization, capture, artifact.work_item_attempt, artifact.physical_request_id,
+                    results, paging_current, paging_total, scope, subject_fixture_id,
+                    subject_season_id, subject_team_id, expires_at,
+                ) is not None
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError):
+            return False
 
     def _persist_database(
         self,
