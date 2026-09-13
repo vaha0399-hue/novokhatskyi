@@ -333,10 +333,13 @@ class RepeatableSyncWorker:
             result = replay(item, authorization, self._provenance) if self._provenance is not None and callable(replay) else None
             if result is None:
                 result = fetch(item, authorization)
+                if result.source_fetch_ids or result.replayed_fetch_ids or result.replay_normalization_version is not None:
+                    raise RuntimeError("ordinary fetch results cannot supply existing source fetch provenance")
             else:
                 if (
                     result.raw_fetches
                     or not result.source_fetch_ids
+                    or result.replayed_fetch_ids
                     or not isinstance(result.replay_normalization_version, str)
                     or not result.replay_normalization_version.strip()
                 ):

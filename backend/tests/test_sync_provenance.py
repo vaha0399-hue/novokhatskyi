@@ -277,6 +277,51 @@ def test_q06_runner_rejects_fresh_raw_mixed_with_existing_source_ids() -> None:
     assert provenance.verified == []
 
 
+@pytest.mark.parametrize(
+    "result_fields",
+    (
+        {"source_fetch_ids": (73,)},
+        {"replayed_fetch_ids": (73,)},
+        {"replay_normalization_version": "fixtures-v2"},
+    ),
+    ids=("source-ids", "replayed-ids", "replay-version"),
+)
+def test_q06_runner_rejects_existing_provenance_from_ordinary_fetch(result_fields) -> None:
+    from app.sync.worker import RepeatableSyncWorker, WorkResult
+
+    connection = _Connection()
+    provenance = _Provenance()
+    worker = RepeatableSyncWorker(
+        connection, _Gate(), "owner", heartbeat_connection_factory=lambda: _Connection(), provenance=provenance,
+    )  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+
+    assert worker.run_once(
+        lambda *_: WorkResult({}, **result_fields),
+        lambda *_: pytest.fail("ordinary existing provenance reached the domain writer"),
+    ) is True
+    assert provenance.persisted == []
+    assert provenance.verified == []
+    assert provenance.reprocessed == []
+
+
+def test_q06_runner_allows_internal_work_without_raw_or_source_provenance() -> None:
+    from app.sync.worker import RepeatableSyncWorker, WorkResult
+
+    connection = _Connection()
+    provenance = _Provenance()
+    worker = RepeatableSyncWorker(
+        connection, _Gate(), "owner", heartbeat_connection_factory=lambda: _Connection(), provenance=provenance,
+    )  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    applied: list[bool] = []
+
+    assert worker.run_once(lambda *_: WorkResult({"done": True}), lambda *_: applied.append(True)) is True
+    assert applied == [True]
+    assert provenance.persisted == []
+    assert provenance.verified == []
+
+
 def test_q06_runner_prefers_verified_replay_over_another_provider_call() -> None:
     from app.sync.dispatch import Q03DispatchRegistry
     from app.sync.worker import RepeatableSyncWorker, WorkResult
