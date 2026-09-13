@@ -250,6 +250,24 @@ class ProviderProvenance:
             if row is None:
                 raise ProvenanceError("team provenance subject is outside the authorized work scope")
 
+        for capture, _, _ in captures:
+            subject_fixture_id, subject_season_id, subject_team_id = _subjects(
+                self._effective_scope(capture, item),
+            )
+            row = self._connection.execute(
+                """SELECT source.q06_fetch_subject_matches_request(%s,%s,%s,%s,%s,%s)""",
+                (
+                    provider_id,
+                    capture.endpoint,
+                    Jsonb(_safe_mapping(capture.params)),
+                    subject_fixture_id,
+                    subject_season_id,
+                    subject_team_id,
+                ),
+            ).fetchone()
+            if row is None or row[0] is not True:
+                raise ProvenanceError("capture subject does not match endpoint request parameters")
+
     def persist(
         self, item: LeasedWorkItem, authorization: AuthorizedSyncWork, captures: Sequence[RawFetchCapture],
     ) -> tuple[PersistedRawFetch, ...]:

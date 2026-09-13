@@ -140,11 +140,11 @@ def _q06_subjects(
     ).fetchone()[0])
     connection.execute(
         "INSERT INTO source.fixture_provider_refs(provider_id,external_id,fixture_id) VALUES(%s,%s,%s)",
-        (provider_id, f"q06-subject-fixture-{suffix}", fixture_id),
+        (provider_id, str(fixture_id), fixture_id),
     )
     connection.execute(
         "INSERT INTO source.team_provider_refs(provider_id,external_id,team_id) VALUES(%s,%s,%s)",
-        (provider_id, f"q06-subject-team-{suffix}", home_id),
+        (provider_id, str(home_id), home_id),
     )
     return fixture_id, home_id
 
@@ -1259,16 +1259,29 @@ def test_recorder_persists_fixture_season_and_team_subjects() -> None:
         assert item is not None and item.id == work_item_id
         authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
         fixture_id, team_id = _q06_subjects(connection, provider_id, season_id, suffix)
+        league_external_id, external_season = connection.execute(
+            "SELECT league_external_id,external_season FROM source.season_provider_refs WHERE provider_id=%s AND season_id=%s",
+            (provider_id, season_id),
+        ).fetchone()
+        fixture_external_id = connection.execute(
+            "SELECT external_id FROM source.fixture_provider_refs WHERE provider_id=%s AND fixture_id=%s",
+            (provider_id, fixture_id),
+        ).fetchone()[0]
+        team_external_id = connection.execute(
+            "SELECT external_id FROM source.team_provider_refs WHERE provider_id=%s AND team_id=%s",
+            (provider_id, team_id),
+        ).fetchone()[0]
         provenance = ProviderProvenance(connection, response_contains_api_key=lambda _body: False)
 
         persisted = provenance.persist(
             item,
             authorization,
             (
-                _capture(endpoint="/standings", params={"league": 39, "season": 2026}, scope={"season_id": season_id}),
-                _capture(endpoint="/fixtures/statistics", params={"fixture": 42}, scope={"fixture_id": fixture_id, "season_id": season_id}),
-                _capture(endpoint="/fixtures/lineups", params={"fixture": 42}, scope={"fixture_id": fixture_id, "season_id": season_id}),
-                _capture(endpoint="/teams/statistics", params={"team": 7, "season": 2026}, scope={"team_id": team_id, "season_id": season_id}),
+                _capture(endpoint="/standings", params={"league": league_external_id, "season": external_season}, scope={"season_id": season_id}),
+                _capture(endpoint="/fixtures/statistics", params={"fixture": fixture_external_id}, scope={"fixture_id": fixture_id, "season_id": season_id}),
+                _capture(endpoint="/fixtures/lineups", params={"fixture": fixture_external_id}, scope={"fixture_id": fixture_id, "season_id": season_id}),
+                _capture(endpoint="/teams/statistics", params={"team": team_external_id, "league": league_external_id, "season": external_season}, scope={"team_id": team_id, "season_id": season_id}),
+                _capture(endpoint="/fixtures", params={"ids": fixture_external_id}, scope={"season_id": season_id}),
             ),
         )
 
@@ -1281,7 +1294,69 @@ def test_recorder_persists_fixture_season_and_team_subjects() -> None:
             ("/fixtures/statistics", fixture_id, season_id, None),
             ("/fixtures/lineups", fixture_id, season_id, None),
             ("/teams/statistics", None, season_id, team_id),
+            ("/fixtures", None, season_id, None),
         ]
+
+
+def test_q06_subject_request_binding_rejects_same_scope_mismatches_before_mutation(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-subject-request-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        fixture_id, team_id = _q06_subjects(connection, provider_id, season_id, f"first-{suffix}")
+        other_fixture_id, other_team_id = _q06_subjects(connection, provider_id, season_id, f"second-{suffix}")
+        league_external_id, external_season = connection.execute(
+            "SELECT league_external_id,external_season FROM source.season_provider_refs WHERE provider_id=%s AND season_id=%s",
+            (provider_id, season_id),
+        ).fetchone()
+        other_fixture_external_id = connection.execute(
+            "SELECT external_id FROM source.fixture_provider_refs WHERE provider_id=%s AND fixture_id=%s",
+            (provider_id, other_fixture_id),
+        ).fetchone()[0]
+        other_team_external_id = connection.execute(
+            "SELECT external_id FROM source.team_provider_refs WHERE provider_id=%s AND team_id=%s",
+            (provider_id, other_team_id),
+        ).fetchone()[0]
+        mismatches = (
+            _capture(
+                endpoint="/fixtures/statistics",
+                params={"fixture": other_fixture_external_id},
+                scope={"fixture_id": fixture_id, "season_id": season_id},
+            ),
+            _capture(
+                endpoint="/teams/statistics",
+                params={"team": other_team_external_id, "league": league_external_id, "season": external_season},
+                scope={"team_id": team_id, "season_id": season_id},
+            ),
+            _capture(
+                endpoint="/standings",
+                params={"league": f"{league_external_id}-other", "season": external_season},
+                scope={"season_id": season_id},
+            ),
+            _capture(
+                endpoint="/fixtures",
+                params={"ids": "999999999"},
+                scope={"season_id": season_id},
+            ),
+        )
+
+        for capture in mismatches:
+            spool = RawSpool(tmp_path / uuid.uuid4().hex)
+            with pytest.raises(ProvenanceError, match="does not match endpoint request parameters"):
+                ProviderProvenance(
+                    connection,
+                    response_contains_api_key=lambda _body: False,
+                    spool=spool,
+                ).persist(item, authorization, (capture,))
+            assert not spool.root.exists()
+
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s",
+            (item.id,),
+        ).fetchone()[0] == 0
 
 
 def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: Path) -> None:

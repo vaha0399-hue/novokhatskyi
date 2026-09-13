@@ -26,6 +26,7 @@ readonly Q06_MIGRATION="$ROOT_DIR/supabase/migrations/20260910120000_q06_raw_rep
 readonly Q06_REPLAY_MIGRATION="$ROOT_DIR/supabase/migrations/20260913020412_q06_replay_immutability.sql"
 readonly Q06_OUTCOME_MIGRATION="$ROOT_DIR/supabase/migrations/20260913023034_q06_fetch_outcome_immutability.sql"
 readonly Q06_PHYSICAL_REQUEST_MIGRATION="$ROOT_DIR/supabase/migrations/20260913025605_q06_physical_request_identity.sql"
+readonly Q06_SUBJECT_REQUEST_MIGRATION="$ROOT_DIR/supabase/migrations/20260913233531_q06_subject_request_binding.sql"
 source "$ROOT_DIR/scripts/lib/isolated-test-resource.sh"
 
 cleanup() {
@@ -36,7 +37,7 @@ cleanup() {
 trap cleanup EXIT
 
 psql_db() { local database="$1"; shift; fa_assert_pg_database "$database"; fa_pg_client "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U postgres -d "$database" "$@"; }
-apply_before_q02() { local database="$1" migration; while IFS= read -r migration; do psql_db "$database" -f "$migration" >/dev/null; done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' ! -name '20260908020000_repeatable_sync_queue.sql' ! -name '20260908030000_repeatable_sync_work_item_leases.sql' ! -name '20260908040000_q03_lease_hardening.sql' ! -name '20260909010000_q05_scheduler_checkpoints.sql' ! -name '20260909020000_q05_scheduler_policy_lock.sql' ! -name '20260909030000_q05_scheduler_window_checkpoint_contract.sql' ! -name '20260909040000_q05_scheduler_event_checkpoints.sql' ! -name '20260909050000_q05_analytics_enqueue.sql' ! -name '20260909180000_q05_analytics_window_checkpoints.sql' ! -name '20260909200000_q05_late_analytics_windows.sql' ! -name '20260909210000_q05_analytics_deadlines.sql' ! -name '20260910003852_q05_fixture_fetch_observations.sql' ! -name '20260910120000_q06_raw_replay_provenance.sql' ! -name '20260913020412_q06_replay_immutability.sql' ! -name '20260913023034_q06_fetch_outcome_immutability.sql' ! -name '20260913025605_q06_physical_request_identity.sql' | LC_ALL=C sort); }
+apply_before_q02() { local database="$1" migration; while IFS= read -r migration; do psql_db "$database" -f "$migration" >/dev/null; done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' ! -name '20260908020000_repeatable_sync_queue.sql' ! -name '20260908030000_repeatable_sync_work_item_leases.sql' ! -name '20260908040000_q03_lease_hardening.sql' ! -name '20260909010000_q05_scheduler_checkpoints.sql' ! -name '20260909020000_q05_scheduler_policy_lock.sql' ! -name '20260909030000_q05_scheduler_window_checkpoint_contract.sql' ! -name '20260909040000_q05_scheduler_event_checkpoints.sql' ! -name '20260909050000_q05_analytics_enqueue.sql' ! -name '20260909180000_q05_analytics_window_checkpoints.sql' ! -name '20260909200000_q05_late_analytics_windows.sql' ! -name '20260909210000_q05_analytics_deadlines.sql' ! -name '20260910003852_q05_fixture_fetch_observations.sql' ! -name '20260910120000_q06_raw_replay_provenance.sql' ! -name '20260913020412_q06_replay_immutability.sql' ! -name '20260913023034_q06_fetch_outcome_immutability.sql' ! -name '20260913025605_q06_physical_request_identity.sql' ! -name '20260913233531_q06_subject_request_binding.sql' | LC_ALL=C sort); }
 apply_q03() { local database="$1"; psql_db "$database" -f "$MIGRATION" >/dev/null; psql_db "$database" -f "$LEASE_MIGRATION" >/dev/null; }
 apply_hardening() { local database="$1"; psql_db "$database" -f "$HARDENING_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_assertions.sql" >/dev/null; }
 apply_q05() { local database="$1"; psql_db "$database" -f "$Q05_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/q05_scheduler_assertions.sql" >/dev/null; }
@@ -52,6 +53,7 @@ apply_q06() { local database="$1"; psql_db "$database" -f "$Q06_MIGRATION" >/dev
 apply_q06_replay() { local database="$1"; psql_db "$database" -f "$Q06_REPLAY_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/q06_replay_immutability_assertions.sql" >/dev/null; }
 apply_q06_outcome() { local database="$1"; psql_db "$database" -f "$Q06_OUTCOME_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/q06_fetch_outcome_immutability_assertions.sql" >/dev/null; }
 apply_q06_physical_request() { local database="$1"; psql_db "$database" -f "$Q06_PHYSICAL_REQUEST_MIGRATION" >/dev/null; }
+apply_q06_subject_request() { local database="$1"; psql_db "$database" -f "$Q06_SUBJECT_REQUEST_MIGRATION" >/dev/null; psql_db "$database" -f "$ROOT_DIR/supabase/tests/q06_subject_request_binding_assertions.sql" >/dev/null; }
 
 mkdir -p "$SOCKET_DIR"
 fa_initialize_test_resource "$WORK_DIR" "$SOCKET_DIR" "$PORT" "$WORK_DIR/redis.sock" "$CLEAN_DB" "$UPGRADE_DB"
@@ -73,6 +75,7 @@ apply_q06 "$CLEAN_DB"
 apply_q06_replay "$CLEAN_DB"
 apply_q06_outcome "$CLEAN_DB"
 apply_q06_physical_request "$CLEAN_DB"
+apply_q06_subject_request "$CLEAN_DB"
 psql_db "$CLEAN_DB" -f "$ROOT_DIR/supabase/tests/q05_fixture_schedule_observations_assertions.sql" >/dev/null
 fa_pg_client "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" -U postgres "$UPGRADE_DB"
 apply_before_q02 "$UPGRADE_DB"
@@ -96,6 +99,8 @@ apply_q06 "$UPGRADE_DB"
 apply_q06_replay "$UPGRADE_DB"
 apply_q06_outcome "$UPGRADE_DB"
 apply_q06_physical_request "$UPGRADE_DB"
+psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q06_subject_request_binding_upgrade_seed.sql" >/dev/null
+apply_q06_subject_request "$UPGRADE_DB"
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/q05_fixture_schedule_observations_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_upgrade_assertions.sql" >/dev/null
 psql_db "$UPGRADE_DB" -f "$ROOT_DIR/supabase/tests/repeatable_sync_queue_q03_upgrade_assertions.sql" >/dev/null
