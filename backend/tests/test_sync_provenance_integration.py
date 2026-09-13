@@ -488,6 +488,66 @@ def test_q06_cleanup_rejects_remaining_metadata_that_differs_from_journal(
         assert {path.name: path.read_bytes() for path in quarantine.iterdir()} == before
 
 
+def test_q06_cleanup_accepts_matching_remaining_metadata_and_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    root = tmp_path / "spool"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as first:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(first, suffix)
+        item = PostgresSyncRepository(first, gate).claim_next(f"q06-journal-match-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        spool = RawSpool(root)
+        capture = _capture()
+        persisted = ProviderProvenance(first, response_contains_api_key=lambda _body: False, spool=spool).persist(
+            item, authorization, (capture,),
+        )
+        directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
+        first.execute(
+            "UPDATE ops.sync_work_items SET status='succeeded', lease_owner=NULL, lease_expires_at=NULL, finished_at=clock_timestamp() WHERE id=%s",
+            (item.id,),
+        )
+        original_unlink = Path.unlink
+
+        def interrupt_first_unlink(_path: Path, *_args: object, **_kwargs: object) -> None:
+            raise OSError("unlink interrupted")
+
+        monkeypatch.setattr(Path, "unlink", interrupt_first_unlink)
+        with pytest.raises(OSError, match="unlink interrupted"):
+            spool.purge_generation(directory)
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+
+        quarantine = next(directory.parent.glob(".purging-*"))
+        metadata_path = quarantine / "fixtures.request.json"
+        journal_path = quarantine / ".cleanup-proof.json"
+        assert metadata_path.read_bytes() == journal_path.read_bytes()
+        before = first.execute(
+            """SELECT provider_fetch.id,payload.inline_body,provider_fetch.normalization_version
+                 FROM source.provider_fetches provider_fetch
+                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                WHERE provider_fetch.id=%s""",
+            (persisted[0].fetch_id,),
+        ).fetchone()
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as second:
+        restarted = RawSpool(root, max_bytes=1)
+        ProviderProvenance(second, response_contains_api_key=lambda _body: False, spool=restarted)
+        restarted.enforce_limit()
+        restarted.enforce_limit()
+
+        assert not quarantine.exists()
+        assert not directory.exists()
+        assert second.execute(
+            """SELECT provider_fetch.id,payload.inline_body,provider_fetch.normalization_version
+                 FROM source.provider_fetches provider_fetch
+                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                WHERE provider_fetch.id=%s""",
+            (persisted[0].fetch_id,),
+        ).fetchone() == before
+
+
 def test_q06_legacy_durable_artifact_without_cleanup_manifest_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
