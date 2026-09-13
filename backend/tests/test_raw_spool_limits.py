@@ -344,3 +344,74 @@ def test_restart_finishes_cleanup_after_each_unlink_interruption(
     restarted = RawSpool(tmp_path / "spool", max_bytes=1, purge_verifier=lambda _directory: True)
     restarted.enforce_limit()
     assert not quarantines[0].exists()
+
+
+def test_cleanup_journal_hard_link_is_counted_once_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "spool"
+    spool = RawSpool(root, purge_verifier=lambda _directory: True)
+    artifact = _artifact(work_item_id=503, request_number=1)
+    directory = spool.work_item_request_directory(work_item_id=503, attempt=1, request_number=1)
+    spool.stage(directory, artifact)
+    spool.mark_durable(directory)
+    original_size = spool._size_unlocked()
+    original_unlink = Path.unlink
+
+    def interrupt_first_unlink(_path: Path, *_args: Any, **_kwargs: Any) -> None:
+        raise OSError("unlink interrupted")
+
+    monkeypatch.setattr(Path, "unlink", interrupt_first_unlink)
+    with pytest.raises(OSError, match="unlink interrupted"):
+        spool.purge_generation(directory)
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    quarantine = next(directory.parent.glob(".purging-*"))
+    metadata = quarantine / "fixtures.request.json"
+    journal = quarantine / ".cleanup-proof.json"
+    assert (metadata.stat().st_dev, metadata.stat().st_ino) == (journal.stat().st_dev, journal.stat().st_ino)
+    assert spool._size_unlocked() == original_size
+
+    restarted = RawSpool(root, max_bytes=original_size, purge_verifier=lambda _directory: False)
+    restarted.enforce_limit()
+    assert quarantine.is_dir()
+
+
+@pytest.mark.parametrize("failure", ("journal-fsync", "rmdir"))
+def test_cleanup_failure_after_journal_unlink_keeps_empty_quarantine_for_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    root = tmp_path / "spool"
+    spool = RawSpool(root, purge_verifier=lambda _directory: True)
+    artifact = _artifact(work_item_id=504, request_number=1)
+    directory = spool.work_item_request_directory(work_item_id=504, attempt=1, request_number=1)
+    spool.stage(directory, artifact)
+    spool.mark_durable(directory)
+    original_fsync = spool._fsync_directory
+    original_rmdir = Path.rmdir
+
+    def fail_after_journal_unlink(path: Path) -> None:
+        if path.name.startswith(".purging-") and not (path / ".cleanup-proof.json").exists():
+            raise OSError("post-journal fsync interrupted")
+        original_fsync(path)
+
+    def fail_empty_quarantine_rmdir(path: Path) -> None:
+        if path.name.startswith(".purging-") and not any(path.iterdir()):
+            raise OSError("post-journal rmdir interrupted")
+        original_rmdir(path)
+
+    if failure == "journal-fsync":
+        monkeypatch.setattr(spool, "_fsync_directory", fail_after_journal_unlink)
+        expected = "post-journal fsync interrupted"
+    else:
+        monkeypatch.setattr(Path, "rmdir", fail_empty_quarantine_rmdir)
+        expected = "post-journal rmdir interrupted"
+    with pytest.raises(OSError, match=expected):
+        spool.purge_generation(directory)
+
+    monkeypatch.setattr(Path, "rmdir", original_rmdir)
+    quarantine = next(directory.parent.glob(".purging-*"))
+    assert not any(quarantine.iterdir())
+    assert not directory.exists()
+    RawSpool(root, purge_verifier=lambda _directory: False).enforce_limit()
+    assert not quarantine.exists()

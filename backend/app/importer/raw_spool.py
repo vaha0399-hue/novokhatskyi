@@ -460,14 +460,31 @@ class RawSpool:
     def _size_unlocked(self) -> int:
         if not self._root.exists():
             return 0
-        return sum(path.stat().st_size for path in self._root.rglob("*") if path.name != ".spool.lock" and path.is_file() and not path.is_symlink())
+        seen: set[tuple[int, int]] = set()
+        total = 0
+        for path in self._root.rglob("*"):
+            if path.name == ".spool.lock" or not path.is_file() or path.is_symlink():
+                continue
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if identity not in seen:
+                seen.add(identity)
+                total += stat.st_size
+        return total
 
     def _directory_size_unlocked(self, directory: Path) -> int:
-        return sum(
-            path.stat().st_size
-            for path in directory.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        )
+        inodes: dict[tuple[int, int], tuple[int, int, int]] = {}
+        for path in directory.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            size, links_inside, link_count = inodes.get(identity, (stat.st_size, 0, stat.st_nlink))
+            inodes[identity] = (size, links_inside + 1, link_count)
+        # Bytes are releasable only when every hard link to the inode belongs
+        # to this candidate.  This prevents capacity accounting from assuming
+        # that a link retained elsewhere will be freed.
+        return sum(size for size, links_inside, link_count in inodes.values() if links_inside == link_count)
 
     def _repeatable_identity_unlocked(self, directory: Path) -> tuple[int, int, int | None] | None:
         """Return the identity encoded by a known Q06 directory, if any."""
@@ -677,7 +694,12 @@ class RawSpool:
             # so the normal name can be restored.  Once it exists, recovery
             # must retain the quarantine and re-run DB proof before each later
             # unlink; a marker itself is never sufficient proof.
-            if renamed and quarantine.exists() and not (quarantine / self._CLEANUP_PROOF).exists():
+            if (
+                renamed
+                and quarantine.exists()
+                and not (quarantine / self._CLEANUP_PROOF).exists()
+                and any(quarantine.iterdir())
+            ):
                 quarantine.rename(directory)
                 self._fsync_directory(directory.parent)
 

@@ -283,6 +283,16 @@ class ProviderProvenance:
             proof_exists = proof.exists()
             if proof.exists():
                 metadata = self._spool._cleanup_proof_metadata_unlocked(directory)  # type: ignore[attr-defined]
+                remaining_metadata = [
+                    path for path in directory.iterdir() if path.name.endswith(".request.json")
+                ]
+                for metadata_path in remaining_metadata:
+                    if not metadata_path.is_file() or metadata_path.is_symlink():
+                        yield False
+                        return
+                    if json.loads(metadata_path.read_text(encoding="utf-8")) != metadata:
+                        yield False
+                        return
             else:
                 metadata_files = [
                     path for path in directory.iterdir()
