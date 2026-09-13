@@ -179,12 +179,76 @@ class ProviderProvenance:
     def _effective_scope(self, capture: RawFetchCapture, item: LeasedWorkItem) -> dict[str, Any]:
         return _safe_mapping(capture.scope if capture.scope is not None else item.scope)
 
+    def _validate_scope_provenance(
+        self,
+        capture: RawFetchCapture,
+        item: LeasedWorkItem,
+        authorization: AuthorizedSyncWork,
+    ) -> None:
+        capture_subjects = _subjects(self._effective_scope(capture, item))
+        item_subjects = _subjects(_safe_mapping(item.scope))
+        subject_fields = ("subject_fixture_id", "subject_season_id", "subject_team_id")
+
+        item_season_id = item_subjects[1]
+        authorized_season_id = authorization.request.season_id
+        if item_season_id is not None and item_season_id != authorized_season_id:
+            raise ProvenanceError("work item scope subject_season_id does not match authorization")
+        if capture_subjects[1] is not None and capture_subjects[1] != authorized_season_id:
+            raise ProvenanceError("capture scope subject_season_id does not match authorization")
+
+        for field, capture_subject_id, item_subject_id in zip(
+            subject_fields, capture_subjects, item_subjects, strict=True,
+        ):
+            if item_subject_id is not None and capture_subject_id != item_subject_id:
+                raise ProvenanceError(f"capture scope {field} does not match work item scope")
+
     def _contains_configured_credential(self, capture: RawFetchCapture, scope: Mapping[str, Any]) -> bool:
         metadata = json.dumps(
             {"parameters": _safe_mapping(capture.params), "scope": scope},
             sort_keys=True, separators=(",", ":"),
         ).encode()
         return self._response_contains_api_key(capture.response.raw_body + b"\n" + metadata)
+
+    def _validate_authorized_subjects(
+        self,
+        item: LeasedWorkItem,
+        authorization: AuthorizedSyncWork,
+        captures: Sequence[tuple[RawFetchCapture, int, str]],
+    ) -> None:
+        if not captures:
+            return
+        subject_sets = {_subjects(_safe_mapping(item.scope))}
+        subject_sets.update(_subjects(self._effective_scope(capture, item)) for capture, _, _ in captures)
+        fixture_ids = {subjects[0] for subjects in subject_sets if subjects[0] is not None}
+        team_ids = {subjects[2] for subjects in subject_sets if subjects[2] is not None}
+        provider_id = authorization.request.provider_id
+        season_id = authorization.request.season_id
+
+        for fixture_id in fixture_ids:
+            row = self._connection.execute(
+                """SELECT fixture.season_id
+                     FROM football.fixtures fixture
+                     JOIN source.fixture_provider_refs ref
+                       ON ref.fixture_id=fixture.id AND ref.provider_id=%s
+                    WHERE fixture.id=%s
+                    FOR SHARE OF fixture,ref""",
+                (provider_id, fixture_id),
+            ).fetchone()
+            if row is None or int(row[0]) != season_id:
+                raise ProvenanceError("fixture provenance subject is outside the authorized work scope")
+
+        for team_id in team_ids:
+            row = self._connection.execute(
+                """SELECT season_team.team_id
+                     FROM football.season_teams season_team
+                     JOIN source.team_provider_refs ref
+                       ON ref.team_id=season_team.team_id AND ref.provider_id=%s
+                    WHERE season_team.season_id=%s AND season_team.team_id=%s
+                    FOR SHARE OF season_team,ref""",
+                (provider_id, season_id, team_id),
+            ).fetchone()
+            if row is None:
+                raise ProvenanceError("team provenance subject is outside the authorized work scope")
 
     def persist(
         self, item: LeasedWorkItem, authorization: AuthorizedSyncWork, captures: Sequence[RawFetchCapture],
@@ -193,20 +257,19 @@ class ProviderProvenance:
             return ()
         if self._connection.info.transaction_status != TransactionStatus.IDLE:
             raise ProvenanceError("raw persistence requires an idle database connection")
-        # Use the client-owned detector before making any filesystem or
-        # database mutation. Its error deliberately contains no raw content.
-        for capture in captures:
-            try:
-                contains_credential = self._contains_configured_credential(capture, self._effective_scope(capture, item))
-            except Exception:
-                raise ProvenanceError("provider response credential check failed") from None
-            if contains_credential:
-                raise ProvenanceError("provider response contains configured credential")
-        staged: list[object] = []
         database_captures: list[tuple[RawFetchCapture, int, str]] = []
         for request_number, capture in enumerate(captures, start=1):
             physical_request_id = _physical_request_id(item.id, item.attempts, request_number)
             database_captures.append((capture, item.attempts, physical_request_id))
+        # Validate every capture before making any filesystem or database
+        # mutation. The client-owned detector error deliberately contains no
+        # raw content. A committed preflight keeps the connection IDLE while
+        # staging, because spool eviction must inspect committed DB state.
+        self._validate_captures(item, authorization, database_captures)
+        with self._connection.transaction():
+            self._validate_authorized_subjects(item, authorization, database_captures)
+        staged: list[object] = []
+        for request_number, (capture, _, physical_request_id) in enumerate(database_captures, start=1):
             if self._spool is not None:
                 directory = self._spool.work_item_request_directory(
                     work_item_id=item.id, attempt=item.attempts, request_number=request_number,
@@ -219,7 +282,11 @@ class ProviderProvenance:
                 )
                 self._spool.stage(directory, artifact)
                 staged.append(directory)
-        persisted = self._persist_database(item, authorization, database_captures)
+        # Recheck under locks in the raw insert transaction so a relationship
+        # changed after preflight cannot become durable provenance.
+        with self._connection.transaction():
+            self._validate_authorized_subjects(item, authorization, database_captures)
+            persisted = self._persist_database_rows(item, authorization, database_captures)
         for directory in set(staged):
             assert self._spool is not None
             self._spool.mark_durable(directory)  # database bytes now survive spool eviction
@@ -261,7 +328,8 @@ class ProviderProvenance:
         # marked durable.  Every recovery capture follows the same insert and
         # full conflict comparison as an ordinary fresh persistence.
         with self._connection.transaction():
-            self._validate_captures(item, recoverable)
+            self._validate_captures(item, authorization, recoverable)
+            self._validate_authorized_subjects(item, authorization, recoverable)
             recovered.extend(self._persist_database_rows(item, authorization, recoverable))
         for directory in set(staged):
             self._spool.mark_durable(directory)
@@ -476,26 +544,18 @@ class ProviderProvenance:
             # The only errors this level may handle are from the DB context;
             # errors from the unlink body were already re-raised above.
             raise
-    def _persist_database(
+    def _validate_captures(
         self,
         item: LeasedWorkItem,
         authorization: AuthorizedSyncWork,
         captures: Sequence[tuple[RawFetchCapture, int, str]],
-    ) -> tuple[PersistedRawFetch, ...]:
-        self._validate_captures(item, captures)
-        # This transaction intentionally ends before the Q03 lease guard and
-        # domain writer.  A later normalization rollback cannot erase evidence.
-        with self._connection.transaction():
-            return self._persist_database_rows(item, authorization, captures)
-
-    def _validate_captures(
-        self, item: LeasedWorkItem, captures: Sequence[tuple[RawFetchCapture, int, str]],
     ) -> None:
         for capture, source_attempt, physical_request_id in captures:
             if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or source_attempt < 1:
                 raise ProvenanceError("source work-item attempt must be a positive integer")
             if not isinstance(physical_request_id, str) or not physical_request_id.strip():
                 raise ProvenanceError("physical request identity is required")
+            self._validate_scope_provenance(capture, item, authorization)
             try:
                 contains_credential = self._contains_configured_credential(capture, self._effective_scope(capture, item))
             except Exception:
@@ -669,6 +729,7 @@ class ProviderProvenance:
                     WHERE provider_fetch.sync_work_item_id=%s AND provider_fetch.endpoint=%s
                       AND provider_fetch.request_params_sha256=%s AND provider_fetch.outcome='success'
                       AND payload.purged_at IS NULL AND payload.inline_body IS NOT NULL
+                      AND (payload.expires_at IS NULL OR payload.expires_at > clock_timestamp())
                     ORDER BY provider_fetch.sync_work_item_attempt DESC,provider_fetch.id DESC LIMIT 1""",
                 (item.id, endpoint, _params_digest(params)),
             ).fetchone()
@@ -722,6 +783,7 @@ class ProviderProvenance:
                         WHERE provider_fetch.id=%s AND provider_fetch.sync_work_item_id=%s
                           AND provider_fetch.outcome='success' AND payload.purged_at IS NULL
                           AND payload.inline_body IS NOT NULL
+                          AND (payload.expires_at IS NULL OR payload.expires_at > clock_timestamp())
                         FOR SHARE OF provider_fetch,payload""",
                     (fetch_id, item.id),
                 ).fetchone()

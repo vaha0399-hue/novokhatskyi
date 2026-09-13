@@ -391,6 +391,111 @@ def test_q06_fallback_item_scope_is_checked_for_configured_credential(tmp_path: 
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("field", "mode"),
+    tuple(
+        (field, mode)
+        for field in ("subject_fixture_id", "subject_season_id", "subject_team_id")
+        for mode in ("different", "missing")
+    ),
+)
+def test_q06_capture_scope_must_match_work_item_and_authorization_before_mutation(
+    tmp_path: Path,
+    field: str,
+    mode: str,
+) -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        item, authorization = _item(connection, uuid.uuid4().hex)
+        item = dataclasses.replace(
+            item,
+            scope={"fixture_id": 41, "season_id": authorization.request.season_id, "team_id": 51},
+        )
+        valid_scope = {
+            "subject_fixture_id": 41,
+            "subject_season_id": authorization.request.season_id,
+            "subject_team_id": 51,
+        }
+        invalid_scope = dict(valid_scope)
+        if mode == "different":
+            invalid_scope[field] = int(invalid_scope[field]) + 1
+        else:
+            del invalid_scope[field]
+        spool = RawSpool(tmp_path / "spool")
+
+        with pytest.raises(ProvenanceError, match="does not match"):
+            ProviderProvenance(
+                connection,
+                response_contains_api_key=lambda _body: False,
+                spool=spool,
+            ).persist(
+                item,
+                authorization,
+                (_capture(scope=valid_scope), _capture(scope=invalid_scope)),
+            )
+
+        assert not spool.root.exists()
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s",
+            (item.id,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("field", ("fixture_id", "team_id"))
+def test_q06_capture_subject_must_belong_to_authorized_provider_season(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(
+            connection, uuid.uuid4().hex,
+        )
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-foreign-subject-{uuid.uuid4().hex}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        league_id = int(connection.execute(
+            "SELECT league_id FROM football.seasons WHERE id=%s", (season_id,),
+        ).fetchone()[0])
+        league_external_id = str(connection.execute(
+            "SELECT external_id FROM source.league_provider_refs WHERE provider_id=%s AND league_id=%s",
+            (provider_id, league_id),
+        ).fetchone()[0])
+        foreign_season_id = int(connection.execute(
+            """INSERT INTO football.seasons(league_id,start_year,label)
+               VALUES(%s,2025,%s) RETURNING id""",
+            (league_id, f"Q06 foreign {uuid.uuid4().hex}"),
+        ).fetchone()[0])
+        connection.execute(
+            """INSERT INTO source.season_provider_refs(
+                   provider_id,league_external_id,external_season,season_id
+               ) VALUES(%s,%s,2025,%s)""",
+            (provider_id, league_external_id, foreign_season_id),
+        )
+        foreign_fixture_id, foreign_team_id = _q06_subjects(
+            connection, provider_id, foreign_season_id, uuid.uuid4().hex,
+        )
+        foreign_id = foreign_fixture_id if field == "fixture_id" else foreign_team_id
+        spool = RawSpool(tmp_path / "spool")
+
+        with pytest.raises(ProvenanceError, match="outside the authorized work scope"):
+            ProviderProvenance(
+                connection,
+                response_contains_api_key=lambda _body: False,
+                spool=spool,
+            ).persist(
+                item,
+                authorization,
+                (_capture(scope={field: foreign_id, "season_id": season_id}),),
+            )
+
+        assert not spool.root.exists()
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s",
+            (item.id,),
+        ).fetchone()[0] == 0
+
+
 def test_q06_succeeded_exact_db_copy_allows_local_purge_without_db_changes(tmp_path: Path) -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
@@ -1062,6 +1167,56 @@ def test_replay_verifies_retained_raw_sha256_before_returning_it() -> None:
             )
         with pytest.raises(ProvenanceError, match="SHA-256 mismatch"):
             provenance.latest_replay(item, endpoint="/fixtures", params={"league": 39})
+
+
+def test_replay_skips_expired_raw_and_rechecks_expiry_before_apply() -> None:
+    assert TEST_DB_URL is not None
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        item, authorization = _item(connection, uuid.uuid4().hex)
+        provenance = ProviderProvenance(connection, response_contains_api_key=lambda _body: False)
+        older, newer = provenance.persist(
+            item,
+            authorization,
+            (
+                _capture(payload={"results": 1, "response": [{"id": "older"}]}),
+                _capture(payload={"results": 1, "response": [{"id": "newer"}]}),
+            ),
+        )
+        assert provenance.latest_replay(
+            item, endpoint="/fixtures", params={"league": 39},
+        ).fetch_id == newer.fetch_id
+
+        with connection.transaction():
+            connection.execute("SET LOCAL session_replication_role = replica")
+            connection.execute(
+                """UPDATE source.provider_raw_payloads
+                      SET created_at=clock_timestamp()-interval '2 days',
+                          expires_at=clock_timestamp()-interval '1 day'
+                    WHERE fetch_id=%s""",
+                (newer.fetch_id,),
+            )
+
+        replay = provenance.latest_replay(item, endpoint="/fixtures", params={"league": 39})
+        assert replay is not None and replay.fetch_id == older.fetch_id
+
+        with connection.transaction():
+            connection.execute("SET LOCAL session_replication_role = replica")
+            connection.execute(
+                """UPDATE source.provider_raw_payloads
+                      SET created_at=clock_timestamp()-interval '2 days',
+                          expires_at=clock_timestamp()-interval '1 day'
+                    WHERE fetch_id=%s""",
+                (older.fetch_id,),
+            )
+
+        assert provenance.latest_replay(item, endpoint="/fixtures", params={"league": 39}) is None
+        with pytest.raises(ProvenanceError, match="replay source raw payload is unavailable"):
+            provenance.verify_source_fetches(
+                connection,
+                item,
+                (older.fetch_id,),
+                replayed_fetch_ids=(older.fetch_id,),
+            )
 
 
 @pytest.mark.parametrize(
