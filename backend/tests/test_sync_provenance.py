@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.api_football import APIFootballResponse
-from app.importer.raw_spool import RawSpool, RawSpoolArtifact
+from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolCapacityError, RawSpoolError
 from app.importer.season_bootstrap import BaseRequest
 from app.sync.provenance import ProvenanceError, RawFetchCapture
 from app.sync.repository import LeasedWorkItem
@@ -45,7 +45,7 @@ def test_q06_raw_capture_rejects_credential_bearing_metadata() -> None:
         RawFetchCapture("/fixtures", {"id": 7}, _response(), now, now, "fixtures-v1", scope={"headers": {"x": "no"}})
 
 
-def test_q06_spool_evicts_only_durable_captures(tmp_path: Path) -> None:
+def test_q06_spool_refuses_over_limit_without_db_proof(tmp_path: Path) -> None:
     spool = RawSpool(tmp_path / "spool", max_bytes=10_000)
     now = datetime.now(UTC)
     artifact = RawSpoolArtifact(BaseRequest("/fixtures", {"league": 39}), _response(), now, now)
@@ -55,14 +55,58 @@ def test_q06_spool_evicts_only_durable_captures(tmp_path: Path) -> None:
     spool.mark_durable(durable)
     spool.stage(active, artifact)
 
-    # Tightening the configured cap simulates the next maintenance pass.  The
-    # durable capture can disappear because the DB owns it; the active replay
-    # capture is never a candidate.
+    # A durable marker is only a candidate.  Without a read-only DB verifier,
+    # both captures remain available and the bounded store refuses growth.
     spool._max_bytes = sum(path.stat().st_size for path in active.iterdir())  # type: ignore[attr-defined]
-    spool.enforce_limit()
+    with pytest.raises(RawSpoolCapacityError):
+        spool.enforce_limit()
 
+    assert durable.exists()
+    assert active.exists()
+
+
+def test_q06_spool_purges_only_verified_durable_capture(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool", max_bytes=10_000)
+    now = datetime.now(UTC)
+    artifact = RawSpoolArtifact(BaseRequest("/fixtures", {"league": 39}), _response(), now, now)
+    durable = spool.work_item_directory(work_item_id=1, attempt=1)
+    active = spool.work_item_directory(work_item_id=2, attempt=1)
+    spool.stage(durable, artifact)
+    spool.mark_durable(durable)
+    spool.stage(active, artifact)
+    spool._max_bytes = sum(path.stat().st_size for path in active.iterdir())  # type: ignore[attr-defined]
+
+    with pytest.raises(RawSpoolCapacityError):
+        spool.enforce_limit()
+    assert durable.exists()
+
+    spool.set_purge_verifier(lambda path: path.name == "attempt-1" and path.parent.name == "work-item-1")
+    spool.enforce_limit()
     assert not durable.exists()
     assert active.exists()
+
+
+def test_q06_spool_rejects_oversized_artifact_before_writing(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool", max_bytes=32)
+    now = datetime.now(UTC)
+    artifact = RawSpoolArtifact(BaseRequest("/fixtures", {"league": 39}), _response(), now, now)
+    directory = spool.work_item_directory(work_item_id=1, attempt=1)
+
+    with pytest.raises(RawSpoolCapacityError):
+        spool.stage(directory, artifact)
+    assert not directory.exists()
+
+
+def test_q06_spool_rejects_symlinked_purge_path(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool")
+    target = tmp_path / "outside"
+    target.mkdir()
+    link = spool.root / "run-1"
+    spool.root.mkdir(parents=True)
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RawSpoolError):
+        spool.purge_generation(link / "league-1-season-2026" / "generation-1")
 
 
 @dataclass

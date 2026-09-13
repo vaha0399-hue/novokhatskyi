@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import fcntl
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,10 @@ from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse
 
 class RawSpoolError(RuntimeError):
     """A staged provider artifact is missing, unsafe, or corrupt."""
+
+
+class RawSpoolCapacityError(RawSpoolError):
+    """The spool cannot accept more bytes without deleting protected data."""
 
 
 @dataclass(frozen=True)
@@ -43,15 +48,51 @@ class RawSpool:
     positive numeric IDs supplied by the worker.
     """
 
-    def __init__(self, root: Path, *, max_bytes: int | None = 1024 * 1024 * 1024) -> None:
+    def __init__(self, root: Path, *, max_bytes: int | None = 1024 * 1024 * 1024, purge_verifier: Callable[[Path], bool] | None = None) -> None:
         if max_bytes is not None and max_bytes <= 0:
             raise ValueError("raw spool maximum must be positive")
         self._root = root
         self._max_bytes = max_bytes
+        self._purge_verifier = purge_verifier
 
     @property
     def root(self) -> Path:
         return self._root
+
+    def set_purge_verifier(self, verifier: Callable[[Path], bool] | None) -> None:
+        self._purge_verifier = verifier
+
+    def _validate_directory(self, directory: Path) -> None:
+        root = self._root.absolute()
+        candidate = directory.absolute()
+        if candidate == root or root not in candidate.parents:
+            raise RawSpoolError("refusing to access path outside raw spool")
+        current = candidate
+        while current != root:
+            if current.is_symlink():
+                raise RawSpoolError("raw spool path contains a symlink")
+            current = current.parent
+
+    class _Lock:
+        def __init__(self, spool: "RawSpool") -> None:
+            self.spool = spool
+            self.handle: Any = None
+
+        def __enter__(self) -> "RawSpool._Lock":
+            self.spool._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_path = self.spool._root / ".spool.lock"
+            self.handle = open(lock_path, "a+b")
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            assert self.handle is not None
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+
+    def _lock(self) -> "RawSpool._Lock":
+        return RawSpool._Lock(self)
 
     def capture_directory(self, *, run_id: int, league_external_id: int, season_start_year: int, generation: int) -> Path:
         if min(run_id, league_external_id, season_start_year, generation) <= 0:
@@ -104,6 +145,11 @@ class RawSpool:
             raise
 
     def stage(self, directory: Path, artifact: RawSpoolArtifact) -> None:
+        self._validate_directory(directory)
+        with self._lock():
+            self._stage_unlocked(directory, artifact)
+
+    def _stage_unlocked(self, directory: Path, artifact: RawSpoolArtifact) -> None:
         label = self._label(artifact.request.endpoint)
         raw_path = directory / f"{label}.raw.json"
         request_path = directory / f"{label}.request.json"
@@ -152,7 +198,7 @@ class RawSpool:
         # Replacing an existing artifact is forbidden: one capture generation
         # represents a coherent source observation.
         if raw_path.exists() or request_path.exists():
-            loaded = self.load(directory, artifact.request)
+            loaded = self._load_unlocked(directory, artifact.request)
             if (
                 loaded is None
                 or loaded.response.raw_body != raw
@@ -162,10 +208,24 @@ class RawSpool:
             ):
                 raise RawSpoolError("capture generation already contains a different provider response")
             return
-        self._write_atomic(raw_path, raw)
-        self._write_atomic(request_path, json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode())
+        metadata_bytes = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
+        # Each atomic temp file has the same payload size as its final file;
+        # the reservation therefore covers the peak raw+metadata footprint.
+        self._ensure_capacity(len(raw) + len(metadata_bytes))
+        try:
+            self._write_atomic(raw_path, raw)
+            self._write_atomic(request_path, metadata_bytes)
+        except BaseException:
+            raw_path.unlink(missing_ok=True)
+            request_path.unlink(missing_ok=True)
+            raise
 
     def load(self, directory: Path, request: BaseRequest) -> RawSpoolArtifact | None:
+        self._validate_directory(directory)
+        with self._lock():
+            return self._load_unlocked(directory, request)
+
+    def _load_unlocked(self, directory: Path, request: BaseRequest) -> RawSpoolArtifact | None:
         label = self._label(request.endpoint)
         raw_path = directory / f"{label}.raw.json"
         request_path = directory / f"{label}.request.json"
@@ -239,6 +299,12 @@ class RawSpool:
         if work_item_id <= 0:
             raise ValueError("raw spool work item id must be positive")
         work_directory = self._root / "repeatable" / f"work-item-{work_item_id}"
+        self._validate_directory(work_directory)
+        with self._lock():
+            return self._work_item_artifacts_unlocked(work_item_id=work_item_id)
+
+    def _work_item_artifacts_unlocked(self, *, work_item_id: int) -> tuple[tuple[Path, RawSpoolArtifact], ...]:
+        work_directory = self._root / "repeatable" / f"work-item-{work_item_id}"
         if not work_directory.exists():
             return ()
         if not work_directory.is_dir() or work_directory.is_symlink():
@@ -284,7 +350,7 @@ class RawSpool:
                 params = metadata.get("parameters") if isinstance(metadata, Mapping) else None
                 if not isinstance(endpoint, str) or not isinstance(params, Mapping):
                     raise RawSpoolError("raw spool work request metadata is invalid")
-                artifact = self.load(request_directory, BaseRequest(endpoint, dict(params)))
+                artifact = self._load_unlocked(request_directory, BaseRequest(endpoint, dict(params)))
                 if (
                     artifact is None
                     or artifact.work_item_id != work_item_id
@@ -296,34 +362,59 @@ class RawSpool:
 
     def mark_durable(self, directory: Path) -> None:
         """Mark staged bytes as safely replayable from durable provenance."""
-        if self._root not in directory.parents or not directory.is_dir():
+        self._validate_directory(directory)
+        if not directory.is_dir():
             raise RawSpoolError("refusing to mark raw spool outside its root")
-        self._write_atomic(directory / ".durable", b"durable\n")
-        self.enforce_limit()
+        with self._lock():
+            self._ensure_capacity(len(b"durable\n"))
+            self._write_atomic(directory / ".durable", b"durable\n")
+            self._enforce_limit_unlocked()
+
+    def _ensure_capacity(self, additional: int) -> None:
+        if self._max_bytes is None:
+            return
+        self._enforce_limit_unlocked(required=additional)
+
+    def _size_unlocked(self) -> int:
+        if not self._root.exists():
+            return 0
+        return sum(path.stat().st_size for path in self._root.rglob("*") if path.name != ".spool.lock" and path.is_file() and not path.is_symlink())
 
     def enforce_limit(self) -> None:
+        with self._lock():
+            self._enforce_limit_unlocked()
+
+    def _enforce_limit_unlocked(self, *, required: int = 0) -> None:
         """Evict only DB-backed captures; never an uncommitted replay input."""
         if self._max_bytes is None or not self._root.exists():
             return
-        def size() -> int:
-            return sum(path.stat().st_size for path in self._root.rglob("*") if path.is_file() and not path.is_symlink())
-        total = size()
-        if total <= self._max_bytes:
+        total = self._size_unlocked()
+        if total + required <= self._max_bytes:
             return
         candidates = sorted(
-            (marker.parent for marker in self._root.rglob(".durable") if marker.is_file() and not marker.is_symlink()),
+            (
+                marker.parent for marker in self._root.rglob(".durable")
+                if marker.is_file() and not marker.is_symlink() and not marker.parent.name.startswith(".purging-")
+            ),
             key=lambda path: path.stat().st_mtime,
         )
         for directory in candidates:
-            if total <= self._max_bytes:
+            if total + required <= self._max_bytes:
                 return
-            self.purge_generation(directory)
-            total = size()
-        if total > self._max_bytes:
-            raise RawSpoolError("raw spool limit reached by unrecoverable captures")
+            if self._purge_verifier is None or not self._purge_verifier(directory):
+                continue
+            self._purge_generation_unlocked(directory)
+            total = self._size_unlocked()
+        if total + required > self._max_bytes:
+            raise RawSpoolCapacityError("raw spool capacity is exhausted")
 
     def discard_partial(self, directory: Path, request: BaseRequest) -> bool:
         """Recover only an interrupted single-endpoint write before refetching it."""
+        self._validate_directory(directory)
+        with self._lock():
+            return self._discard_partial_unlocked(directory, request)
+
+    def _discard_partial_unlocked(self, directory: Path, request: BaseRequest) -> bool:
         label = self._label(request.endpoint)
         raw_path = directory / f"{label}.raw.json"
         request_path = directory / f"{label}.request.json"
@@ -339,14 +430,38 @@ class RawSpool:
 
     def purge_generation(self, directory: Path) -> None:
         """Delete only a known completed capture directory, never the spool root."""
-        if self._root not in directory.parents or not directory.is_dir():
+        self._validate_directory(directory)
+        with self._lock():
+            self._purge_generation_unlocked(directory)
+
+    def _purge_generation_unlocked(self, directory: Path) -> None:
+        if not directory.is_dir() or directory.is_symlink():
             raise RawSpoolError("refusing to purge outside raw spool")
-        for item in directory.iterdir():
+        relative = directory.absolute().relative_to(self._root.absolute())
+        parts = relative.parts
+        known_generation = (
+            len(parts) == 3 and parts[0].startswith("run-") and
+            parts[1].startswith("league-") and parts[2].startswith("generation-")
+        )
+        known_request = (
+            len(parts) == 4 and parts[0] == "repeatable" and parts[1].startswith("work-item-") and
+            parts[2].startswith("attempt-") and parts[3].startswith("request-")
+        )
+        known_attempt = (
+            len(parts) == 3 and parts[0] == "repeatable" and parts[1].startswith("work-item-") and
+            parts[2].startswith("attempt-")
+        )
+        known_catalogue = len(parts) == 2 and parts[0] == "catalogue"
+        if not (known_generation or known_request or known_attempt or known_catalogue):
+            raise RawSpoolError("raw spool directory is not a known capture")
+        quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
+        directory.rename(quarantine)
+        for item in quarantine.iterdir():
             if item.is_file() or item.is_symlink():
                 item.unlink()
             else:
                 raise RawSpoolError("raw spool generation has an unexpected nested directory")
-        directory.rmdir()
+        quarantine.rmdir()
 
     def latest_catalogue(self) -> RawSpoolArtifact | None:
         """Recover a staged catalogue after a crash before queue creation."""
