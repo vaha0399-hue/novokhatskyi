@@ -242,44 +242,14 @@ class ProviderProvenance:
             recoverable.append((capture, artifact.work_item_attempt, physical_request_id))
         recovered: list[PersistedRawFetch] = []
         # The top-level transaction must commit before a staged directory is
-        # marked durable.  `_persist_database_rows` deliberately shares it.
+        # marked durable.  Every recovery capture follows the same insert and
+        # full conflict comparison as an ordinary fresh persistence.
         with self._connection.transaction():
-            for capture, source_attempt, physical_request_id in recoverable:
-                if not self._spool_capture_is_persisted(item, capture, source_attempt, physical_request_id):
-                    self._validate_captures(((capture, source_attempt, physical_request_id),))
-                    recovered.extend(
-                        self._persist_database_rows(item, authorization, ((capture, source_attempt, physical_request_id),))
-                    )
+            self._validate_captures(recoverable)
+            recovered.extend(self._persist_database_rows(item, authorization, recoverable))
         for directory in set(staged):
             self._spool.mark_durable(directory)
         return tuple(recovered)
-
-    def _spool_capture_is_persisted(
-        self, item: LeasedWorkItem, capture: RawFetchCapture, source_attempt: int, physical_request_id: str,
-    ) -> bool:
-        row = self._connection.execute(
-            """SELECT 1
-                 FROM source.provider_fetches provider_fetch
-                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
-                WHERE provider_fetch.sync_work_item_id=%s
-                  AND provider_fetch.sync_work_item_attempt=%s
-                  AND provider_fetch.endpoint=%s
-                  AND provider_fetch.request_params_sha256=%s
-                  AND provider_fetch.content_sha256=%s
-                  AND payload.inline_body=%s
-                  AND provider_fetch.request_scope->>'physical_request_id'=%s
-                LIMIT 1""",
-            (
-                item.id,
-                source_attempt,
-                capture.endpoint,
-                _params_digest(capture.params),
-                hashlib.sha256(capture.response.raw_body).digest(),
-                capture.response.raw_body,
-                physical_request_id,
-            ),
-        ).fetchone()
-        return row is not None
 
     def _persist_database(
         self,

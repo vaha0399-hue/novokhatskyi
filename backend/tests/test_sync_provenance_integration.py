@@ -486,6 +486,57 @@ def test_concurrent_spool_recovery_and_persist_share_one_physical_raw_fetch(tmp_
         ).fetchone()[0] == 1
 
 
+def test_spool_recovery_rejects_mismatched_physical_raw_without_marking_durable(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+        item = PostgresSyncRepository(setup, gate).claim_next(f"q06-mismatch-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        persisted_capture = _capture()
+        persisted = ProviderProvenance(setup, response_contains_api_key=lambda _body: False).persist(
+            item, authorization, (persisted_capture,),
+        )
+        spool_capture = _capture(payload={
+            "get": "fixtures", "parameters": {"league": "39"}, "errors": {}, "results": 1,
+            "paging": {"current": 1, "total": 1}, "response": ["different raw"],
+        })
+        spool = RawSpool(tmp_path / "spool")
+        request_directory = spool.work_item_request_directory(
+            work_item_id=item.id, attempt=item.attempts, request_number=1,
+        )
+        spool.stage(
+            request_directory,
+            RawSpoolArtifact(
+                BaseRequest(spool_capture.endpoint, dict(spool_capture.params)),
+                spool_capture.response,
+                spool_capture.request_started_at,
+                spool_capture.response_received_at,
+                dict(item.scope),
+                item.id,
+                item.attempts,
+                spool_capture.normalization_version,
+                spool_capture.purpose,
+                spool_capture.retention_class,
+                f"work-item-{item.id}:attempt-{item.attempts}:request-000001",
+            ),
+        )
+
+        with psycopg.connect(TEST_DB_URL) as connection:
+            recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+            with pytest.raises(ProvenanceError, match="does not match"):
+                recorder.recover_spooled_raw(item, authorization)
+
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
+        ).fetchone()[0] == 1
+        assert not (request_directory / ".durable").exists()
+
+
 def test_real_q03_runner_replays_raw_with_source_links_and_atomic_completion() -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
