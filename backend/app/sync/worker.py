@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from random import uniform
 from threading import Event, Thread
 from typing import Any, Protocol
@@ -15,6 +15,7 @@ from app.api_football.budget import APIFootballBudgetError, budget_retry_delay_s
 from app.api_football.errors import APIFootballHTTPError
 from app.sync.policies import AuthorizedSyncWork, SyncPolicyDenied, SyncPolicyGate, SyncWorkRequest
 from app.sync.repository import LeasedWorkItem, PostgresSyncRepository
+from app.sync.provenance import ProviderProvenance, RawFetchCapture
 
 
 class LeaseLost(RuntimeError):
@@ -257,10 +258,19 @@ class AtomicWorkTransaction:
 class WorkResult:
     checkpoint: Mapping[str, Any]
     dependent_work: tuple[Callable[[AtomicWorkTransaction], None], ...] = ()
+    raw_fetches: tuple[RawFetchCapture, ...] = ()
+    source_fetch_ids: tuple[int, ...] = ()
+    replayed_fetch_ids: tuple[int, ...] = ()
+    replay_normalization_version: str | None = None
 
 
 class FetchExecutor(Protocol):
     def __call__(self, item: LeasedWorkItem, authorization: AuthorizedSyncWork) -> WorkResult: ...
+
+
+class ReplayableFetchExecutor(FetchExecutor, Protocol):
+    """Optional Q06 hook: return a verified saved response before HTTP."""
+    def replay(self, item: LeasedWorkItem, authorization: AuthorizedSyncWork, provenance: ProviderProvenance) -> WorkResult | None: ...
 
 
 class RepeatableSyncWorker:
@@ -272,13 +282,14 @@ class RepeatableSyncWorker:
     """
     def __init__(self, connection: Connection[Any], policy_gate: SyncPolicyGate, owner: str,
                  heartbeat_connection_factory: Callable[[], Connection[Any]] | None = None,
-                 heartbeat_interval: float = 30.0) -> None:
+                 heartbeat_interval: float = 30.0, provenance: ProviderProvenance | None = None) -> None:
         if heartbeat_connection_factory is None:
             raise ValueError("repeatable worker requires a separate heartbeat connection factory")
         self._connection, self._gate, self._owner = connection, policy_gate, owner
         self.repository = PostgresSyncRepository(connection, policy_gate)
         self._heartbeat_connection_factory = heartbeat_connection_factory
         self._heartbeat_interval = heartbeat_interval
+        self._provenance = provenance
 
     def run_once(self, fetch: FetchExecutor, apply_result: Callable[[AtomicWorkTransaction, LeasedWorkItem, WorkResult], None], *, max_attempts: int = 5) -> bool:
         # Claim and policy recheck are a short transaction, deliberately
@@ -311,7 +322,21 @@ class RepeatableSyncWorker:
         thread = Thread(target=beat, daemon=True)
         thread.start()
         try:
-            result = fetch(item, authorization)
+            replay = getattr(fetch, "replay", None)
+            result = replay(item, authorization, self._provenance) if self._provenance is not None and callable(replay) else None
+            if result is None:
+                result = fetch(item, authorization)
+            else:
+                if (
+                    result.raw_fetches
+                    or not result.source_fetch_ids
+                    or not isinstance(result.replay_normalization_version, str)
+                    or not result.replay_normalization_version.strip()
+                ):
+                    raise RuntimeError("replay must return source fetch ids and a normalization version without new raw captures")
+                result = replace(result, replayed_fetch_ids=result.source_fetch_ids)
+            if result.raw_fetches and (result.source_fetch_ids or result.replayed_fetch_ids):
+                raise RuntimeError("fresh raw captures cannot be combined with existing source fetch ids")
         except (APIFootballBudgetError, APIFootballHTTPError) as exc:
             stop.set()
             thread.join()
@@ -346,6 +371,11 @@ class RepeatableSyncWorker:
         thread.join()
         if failed.is_set():
             raise LeaseLost("repeatable work-item heartbeat failed")
+        if result.raw_fetches:
+            if self._provenance is None:
+                raise RuntimeError("raw fetches require a Q06 provenance recorder")
+            persisted = self._provenance.persist(item, authorization, result.raw_fetches)
+            result = replace(result, source_fetch_ids=tuple(value.fetch_id for value in persisted))
         with self._connection.transaction():
             guarded = self._connection.execute(
                 "SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)",
@@ -354,9 +384,23 @@ class RepeatableSyncWorker:
             if guarded is None or guarded[0] is not True:
                 raise LeaseLost("repeatable work-item lease was lost before applying its result")
             writer = AtomicWorkTransaction(self._connection)
+            if result.source_fetch_ids:
+                if self._provenance is None:
+                    raise RuntimeError("source fetch ids require a Q06 provenance recorder")
+                # Replayed bytes are hashed again here, after the lease fence
+                # and before the first domain mutation.
+                self._provenance.verify_source_fetches(
+                    writer, item, result.source_fetch_ids, replayed_fetch_ids=result.replayed_fetch_ids,
+                )
             apply_result(writer, item, result)
             for enqueue_dependent in result.dependent_work:
                 enqueue_dependent(writer)
+            if result.replayed_fetch_ids:
+                assert self._provenance is not None
+                assert isinstance(result.replay_normalization_version, str)
+                self._provenance.record_reprocessing(
+                    writer, item, result.replayed_fetch_ids, result.replay_normalization_version,
+                )
             completed = self._connection.execute(
                 "SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)",
                 (item.id, self._owner, item.lease_token, Jsonb(dict(result.checkpoint))),
@@ -367,7 +411,7 @@ class RepeatableSyncWorker:
 
     def run_registered_once(self, registry: Any, *, max_attempts: int = 5) -> bool:
         """Use the same reviewed registry that allowed the producer to enqueue."""
-        return self.run_once(registry.fetch, registry.apply_result, max_attempts=max_attempts)
+        return self.run_once(registry, registry.apply_result, max_attempts=max_attempts)
 
     def _send_heartbeat(self, item: LeasedWorkItem) -> bool:
         with self._heartbeat_connection_factory() as heartbeat_connection:

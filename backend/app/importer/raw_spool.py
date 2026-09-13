@@ -26,6 +26,10 @@ class RawSpoolArtifact:
     response: APIFootballResponse
     request_started_at: datetime
     response_received_at: datetime
+    scope: Mapping[str, Any] | None = None
+    work_item_id: int | None = None
+    work_item_attempt: int | None = None
+    normalization_version: str | None = None
 
 
 class RawSpool:
@@ -36,8 +40,11 @@ class RawSpool:
     positive numeric IDs supplied by the worker.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, max_bytes: int | None = 1024 * 1024 * 1024) -> None:
+        if max_bytes is not None and max_bytes <= 0:
+            raise ValueError("raw spool maximum must be positive")
         self._root = root
+        self._max_bytes = max_bytes
 
     @property
     def root(self) -> Path:
@@ -48,13 +55,28 @@ class RawSpool:
             raise ValueError("raw spool identifiers must be positive")
         return self._root / f"run-{run_id}" / f"league-{league_external_id}-season-{season_start_year}" / f"generation-{generation}"
 
+    def work_item_directory(self, *, work_item_id: int, attempt: int) -> Path:
+        """Return the private transient directory for one fenced work attempt."""
+        if work_item_id <= 0 or attempt <= 0:
+            raise ValueError("work-item spool identifiers must be positive")
+        return self._root / "repeatable" / f"work-item-{work_item_id}" / f"attempt-{attempt}"
+
+    def work_item_request_directory(self, *, work_item_id: int, attempt: int, request_number: int) -> Path:
+        """Keep every physical provider request separate within one attempt."""
+        if request_number <= 0:
+            raise ValueError("raw spool request number must be positive")
+        return self.work_item_directory(work_item_id=work_item_id, attempt=attempt) / f"request-{request_number:06d}"
+
     @staticmethod
     def _label(endpoint: str) -> str:
         labels = {"/leagues": "leagues", "/teams": "teams", "/standings": "standings", "/fixtures": "fixtures"}
-        try:
+        if endpoint in labels:
             return labels[endpoint]
-        except KeyError as error:
-            raise RawSpoolError("unsupported raw spool endpoint") from error
+        if not endpoint.startswith("/") or any(character.isspace() for character in endpoint):
+            raise RawSpoolError("unsafe raw spool endpoint")
+        # The endpoint itself remains in metadata.  A digest makes a safe,
+        # deterministic filename for Q03 work types beyond the bootstrap four.
+        return f"endpoint-{hashlib.sha256(endpoint.encode()).hexdigest()[:20]}"
 
     @staticmethod
     def _write_atomic(path: Path, content: bytes) -> None:
@@ -83,7 +105,15 @@ class RawSpool:
         raw_path = directory / f"{label}.raw.json"
         request_path = directory / f"{label}.request.json"
         raw = artifact.response.raw_body
-        metadata = {
+        if artifact.work_item_id is not None and artifact.work_item_id <= 0:
+            raise RawSpoolError("raw spool work item is invalid")
+        if artifact.work_item_attempt is not None and artifact.work_item_attempt <= 0:
+            raise RawSpoolError("raw spool work attempt is invalid")
+        if (artifact.work_item_id is None) != (artifact.work_item_attempt is None):
+            raise RawSpoolError("raw spool work provenance is incomplete")
+        if artifact.normalization_version is not None and not artifact.normalization_version.strip():
+            raise RawSpoolError("raw spool normalization version is invalid")
+        metadata: dict[str, Any] = {
             "endpoint": artifact.request.endpoint,
             "parameters": dict(artifact.request.params),
             "http_status": artifact.response.status_code,
@@ -92,6 +122,13 @@ class RawSpool:
             "request_started_at": artifact.request_started_at.isoformat(),
             "response_received_at": artifact.response_received_at.isoformat(),
         }
+        if artifact.scope is not None:
+            metadata["scope"] = dict(artifact.scope)
+        if artifact.work_item_id is not None:
+            metadata["work_item_id"] = artifact.work_item_id
+            metadata["work_item_attempt"] = artifact.work_item_attempt
+        if artifact.normalization_version is not None:
+            metadata["normalization_version"] = artifact.normalization_version
         # A raw body is durable only once both files are atomically present.
         # Replacing an existing artifact is forbidden: one capture generation
         # represents a coherent source observation.
@@ -133,12 +170,56 @@ class RawSpool:
             raise RawSpoolError("raw spool content or timestamps are invalid") from error
         if not isinstance(payload, dict) or started.tzinfo is None or received.tzinfo is None or received < started:
             raise RawSpoolError("raw spool response contract is invalid")
+        scope = metadata.get("scope")
+        if scope is not None and not isinstance(scope, Mapping):
+            raise RawSpoolError("raw spool scope is invalid")
+        work_item_id, work_item_attempt = metadata.get("work_item_id"), metadata.get("work_item_attempt")
+        if (work_item_id is None) != (work_item_attempt is None) or (
+            work_item_id is not None and (not isinstance(work_item_id, int) or not isinstance(work_item_attempt, int)
+                                      or work_item_id <= 0 or work_item_attempt <= 0)
+        ):
+            raise RawSpoolError("raw spool work provenance is invalid")
+        normalization_version = metadata.get("normalization_version")
+        if normalization_version is not None and (not isinstance(normalization_version, str) or not normalization_version.strip()):
+            raise RawSpoolError("raw spool normalization version is invalid")
         return RawSpoolArtifact(
             request,
             APIFootballResponse(payload, raw, 200, {}),
             started,
             received,
+            dict(scope) if scope is not None else None,
+            work_item_id,
+            work_item_attempt,
+            normalization_version,
         )
+
+    def mark_durable(self, directory: Path) -> None:
+        """Mark staged bytes as safely replayable from durable provenance."""
+        if self._root not in directory.parents or not directory.is_dir():
+            raise RawSpoolError("refusing to mark raw spool outside its root")
+        self._write_atomic(directory / ".durable", b"durable\n")
+        self.enforce_limit()
+
+    def enforce_limit(self) -> None:
+        """Evict only DB-backed captures; never an uncommitted replay input."""
+        if self._max_bytes is None or not self._root.exists():
+            return
+        def size() -> int:
+            return sum(path.stat().st_size for path in self._root.rglob("*") if path.is_file() and not path.is_symlink())
+        total = size()
+        if total <= self._max_bytes:
+            return
+        candidates = sorted(
+            (marker.parent for marker in self._root.rglob(".durable") if marker.is_file() and not marker.is_symlink()),
+            key=lambda path: path.stat().st_mtime,
+        )
+        for directory in candidates:
+            if total <= self._max_bytes:
+                return
+            self.purge_generation(directory)
+            total = size()
+        if total > self._max_bytes:
+            raise RawSpoolError("raw spool limit reached by unrecoverable captures")
 
     def discard_partial(self, directory: Path, request: BaseRequest) -> bool:
         """Recover only an interrupted single-endpoint write before refetching it."""
