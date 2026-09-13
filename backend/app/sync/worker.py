@@ -322,6 +322,12 @@ class RepeatableSyncWorker:
         thread = Thread(target=beat, daemon=True)
         thread.start()
         try:
+            recover_spooled_raw = getattr(self._provenance, "recover_spooled_raw", None)
+            if callable(recover_spooled_raw):
+                # A crash can leave verified bytes in the spool before their
+                # independent raw transaction committed.  Recover them before
+                # the registry decides whether it must issue HTTP again.
+                recover_spooled_raw(item, authorization)
             replay = getattr(fetch, "replay", None)
             result = replay(item, authorization, self._provenance) if self._provenance is not None and callable(replay) else None
             if result is None:

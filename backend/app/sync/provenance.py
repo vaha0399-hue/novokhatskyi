@@ -93,6 +93,26 @@ def _unique_fetch_ids(fetch_ids: Sequence[int]) -> tuple[int, ...]:
     return tuple(unique)
 
 
+def _subject_id(scope: Mapping[str, Any], *, field: str, legacy_field: str) -> int | None:
+    values = [scope[name] for name in (field, legacy_field) if name in scope]
+    if not values:
+        return None
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values):
+        raise ProvenanceError(f"{field} must be a positive integer")
+    if any(value != values[0] for value in values[1:]):
+        raise ProvenanceError(f"{field} conflicts with {legacy_field}")
+    return values[0]
+
+
+def _subjects(scope: Mapping[str, Any]) -> tuple[int | None, int | None, int | None]:
+    """Map the safe queue scope to the relational provenance subjects."""
+    return (
+        _subject_id(scope, field="subject_fixture_id", legacy_field="fixture_id"),
+        _subject_id(scope, field="subject_season_id", legacy_field="season_id"),
+        _subject_id(scope, field="subject_team_id", legacy_field="team_id"),
+    )
+
+
 @dataclass(frozen=True)
 class RawFetchCapture:
     endpoint: str
@@ -171,20 +191,96 @@ class ProviderProvenance:
                 )
                 self._spool.stage(directory, artifact)
                 staged.append((capture, directory))
+        persisted = self._persist_database(
+            item, authorization, tuple((capture, item.attempts) for capture in captures),
+        )
+        for directory in {directory for _capture, directory in staged}:
+            assert self._spool is not None
+            self._spool.mark_durable(directory)  # database bytes now survive spool eviction
+        return persisted
+
+    def recover_spooled_raw(
+        self, item: LeasedWorkItem, authorization: AuthorizedSyncWork,
+    ) -> tuple[PersistedRawFetch, ...]:
+        """Commit verified pre-DB spool captures before a replay hook can choose HTTP."""
+        if self._spool is None:
+            return ()
+        recovered: list[PersistedRawFetch] = []
+        for directory, artifact in self._spool.work_item_artifacts(work_item_id=item.id):
+            assert artifact.work_item_attempt is not None
+            if artifact.normalization_version is None:
+                raise ProvenanceError("raw spool capture has no normalization version")
+            capture = RawFetchCapture(
+                artifact.request.endpoint,
+                dict(artifact.request.params),
+                artifact.response,
+                artifact.request_started_at,
+                artifact.response_received_at,
+                artifact.normalization_version,
+                scope=artifact.scope,
+            )
+            if not self._spool_capture_is_persisted(item, capture, artifact.work_item_attempt):
+                recovered.extend(self._persist_database(item, authorization, ((capture, artifact.work_item_attempt),)))
+            self._spool.mark_durable(directory)
+        return tuple(recovered)
+
+    def _spool_capture_is_persisted(
+        self, item: LeasedWorkItem, capture: RawFetchCapture, source_attempt: int,
+    ) -> bool:
+        row = self._connection.execute(
+            """SELECT 1
+                 FROM source.provider_fetches provider_fetch
+                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                WHERE provider_fetch.sync_work_item_id=%s
+                  AND provider_fetch.sync_work_item_attempt=%s
+                  AND provider_fetch.endpoint=%s
+                  AND provider_fetch.request_params_sha256=%s
+                  AND provider_fetch.content_sha256=%s
+                  AND payload.inline_body=%s
+                LIMIT 1""",
+            (
+                item.id,
+                source_attempt,
+                capture.endpoint,
+                _params_digest(capture.params),
+                hashlib.sha256(capture.response.raw_body).digest(),
+                capture.response.raw_body,
+            ),
+        ).fetchone()
+        return row is not None
+
+    def _persist_database(
+        self,
+        item: LeasedWorkItem,
+        authorization: AuthorizedSyncWork,
+        captures: Sequence[tuple[RawFetchCapture, int]],
+    ) -> tuple[PersistedRawFetch, ...]:
+        for capture, source_attempt in captures:
+            if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or source_attempt < 1:
+                raise ProvenanceError("source work-item attempt must be a positive integer")
+            try:
+                contains_credential = self._response_contains_api_key(capture.response.raw_body)
+            except Exception as error:
+                raise ProvenanceError("provider response credential check failed") from error
+            if contains_credential:
+                raise ProvenanceError("provider response contains configured credential")
         persisted: list[PersistedRawFetch] = []
         # This transaction intentionally ends before the Q03 lease guard and
         # domain writer.  A later normalization rollback cannot erase evidence.
         with self._connection.transaction():
-            for capture in captures:
+            for capture, source_attempt in captures:
                 results, paging_current, paging_total = _response_summary(capture.response)
-                scope = {"scope_key": item.scope_key, "job_type": item.job_type, "scope": _safe_mapping(capture.scope or item.scope)}
+                capture_scope = _safe_mapping(capture.scope or item.scope)
+                subject_fixture_id, subject_season_id, subject_team_id = _subjects(capture_scope)
+                scope = {"scope_key": item.scope_key, "job_type": item.job_type, "scope": capture_scope}
                 row = self._connection.execute(
                     """INSERT INTO source.provider_fetches(
                            provider_id,endpoint,request_params,request_params_sha256,purpose,
                            request_started_at,response_received_at,http_status,outcome,
                            provider_results,paging_current,paging_total,content_sha256,
-                           request_scope,normalization_version,sync_work_item_id,sync_work_item_attempt
-                       ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s)
+                           request_scope,normalization_version,sync_work_item_id,sync_work_item_attempt,
+                           subject_fixture_id,subject_season_id,subject_team_id
+                       ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        RETURNING id""",
                     (
                         authorization.request.provider_id, capture.endpoint, Jsonb(_safe_mapping(capture.params)),
@@ -192,7 +288,7 @@ class ProviderProvenance:
                         capture.response_received_at, capture.response.status_code,
                         results, paging_current, paging_total,
                         hashlib.sha256(capture.response.raw_body).digest(), Jsonb(scope), capture.normalization_version,
-                        item.id, item.attempts,
+                        item.id, source_attempt, subject_fixture_id, subject_season_id, subject_team_id,
                     ),
                 ).fetchone()
                 if row is None:
@@ -208,9 +304,6 @@ class ProviderProvenance:
                     ),
                 )
                 persisted.append(PersistedRawFetch(fetch_id, capture))
-        for directory in {directory for _capture, directory in staged}:
-            assert self._spool is not None
-            self._spool.mark_durable(directory)  # database bytes now survive spool eviction
         return tuple(persisted)
 
     def latest_replay(self, item: LeasedWorkItem, *, endpoint: str, params: Mapping[str, Any]) -> PersistedRawFetch | None:

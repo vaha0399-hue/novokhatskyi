@@ -193,6 +193,61 @@ class RawSpool:
             normalization_version,
         )
 
+    def work_item_artifacts(self, *, work_item_id: int) -> tuple[tuple[Path, RawSpoolArtifact], ...]:
+        """Return verified, pre-commit captures from prior attempts of one work item."""
+        if work_item_id <= 0:
+            raise ValueError("raw spool work item id must be positive")
+        work_directory = self._root / "repeatable" / f"work-item-{work_item_id}"
+        if not work_directory.exists():
+            return ()
+        if not work_directory.is_dir() or work_directory.is_symlink():
+            raise RawSpoolError("unsafe raw spool work-item directory")
+
+        artifacts: list[tuple[Path, RawSpoolArtifact]] = []
+        for attempt_directory in sorted(work_directory.iterdir(), key=lambda path: path.name):
+            attempt_prefix = "attempt-"
+            attempt_value = attempt_directory.name.removeprefix(attempt_prefix)
+            if (
+                not attempt_directory.is_dir()
+                or attempt_directory.is_symlink()
+                or not attempt_directory.name.startswith(attempt_prefix)
+                or not attempt_value.isdecimal()
+                or int(attempt_value) < 1
+            ):
+                raise RawSpoolError("unsafe raw spool work attempt directory")
+            attempt = int(attempt_value)
+            for request_directory in sorted(attempt_directory.iterdir(), key=lambda path: path.name):
+                if (
+                    not request_directory.is_dir()
+                    or request_directory.is_symlink()
+                    or not request_directory.name.startswith("request-")
+                    or not request_directory.name.removeprefix("request-").isdecimal()
+                ):
+                    raise RawSpoolError("unsafe raw spool work request directory")
+                metadata_files = [
+                    path for path in request_directory.iterdir()
+                    if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
+                ]
+                if len(metadata_files) != 1:
+                    raise RawSpoolError("raw spool work request metadata is missing or ambiguous")
+                try:
+                    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise RawSpoolError("raw spool work request metadata is unreadable") from error
+                endpoint = metadata.get("endpoint") if isinstance(metadata, Mapping) else None
+                params = metadata.get("parameters") if isinstance(metadata, Mapping) else None
+                if not isinstance(endpoint, str) or not isinstance(params, Mapping):
+                    raise RawSpoolError("raw spool work request metadata is invalid")
+                artifact = self.load(request_directory, BaseRequest(endpoint, dict(params)))
+                if (
+                    artifact is None
+                    or artifact.work_item_id != work_item_id
+                    or artifact.work_item_attempt != attempt
+                ):
+                    raise RawSpoolError("raw spool work request provenance does not match its directory")
+                artifacts.append((request_directory, artifact))
+        return tuple(artifacts)
+
     def mark_durable(self, directory: Path) -> None:
         """Mark staged bytes as safely replayable from durable provenance."""
         if self._root not in directory.parents or not directory.is_dir():

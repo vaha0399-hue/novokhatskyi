@@ -56,13 +56,19 @@ def _item(connection: psycopg.Connection, suffix: str) -> tuple[LeasedWorkItem, 
     )
 
 
-def _capture(*, endpoint: str = "/fixtures", params: dict[str, object] | None = None, payload: dict[str, object] | None = None) -> RawFetchCapture:
+def _capture(
+    *,
+    endpoint: str = "/fixtures",
+    params: dict[str, object] | None = None,
+    payload: dict[str, object] | None = None,
+    scope: dict[str, object] | None = None,
+) -> RawFetchCapture:
     now = datetime.now(UTC)
     return RawFetchCapture(
         endpoint, params or {"league": 39}, _response(payload or {
             "get": "fixtures", "parameters": {"league": "39"}, "errors": {}, "results": 0,
             "paging": {"current": 1, "total": 1}, "response": [],
-        }), now, now, "fixtures-v1",
+        }), now, now, "fixtures-v1", scope=scope,
     )
 
 
@@ -104,6 +110,36 @@ def _requeue_for_replay(connection: psycopg.Connection, work_item_id: int, owner
         "SELECT ops.requeue_repeatable_sync_work_item(%s,%s,%s,%s,%s,%s,%s)",
         (work_item_id, owner, lease_token, Jsonb({}), "replay after domain failure", "0 seconds", False),
     ).fetchone()[0] is True
+
+
+def _q06_subjects(
+    connection: psycopg.Connection, provider_id: int, season_id: int, suffix: str,
+) -> tuple[int, int]:
+    home_id = int(connection.execute(
+        "INSERT INTO football.teams(name) VALUES(%s) RETURNING id", (f"Q06 subject home {suffix}",),
+    ).fetchone()[0])
+    away_id = int(connection.execute(
+        "INSERT INTO football.teams(name) VALUES(%s) RETURNING id", (f"Q06 subject away {suffix}",),
+    ).fetchone()[0])
+    connection.execute(
+        "INSERT INTO football.season_teams(season_id,team_id) VALUES(%s,%s),(%s,%s)",
+        (season_id, home_id, season_id, away_id),
+    )
+    fixture_id = int(connection.execute(
+        """INSERT INTO football.fixtures(
+               season_id,home_team_id,away_team_id,kickoff_at,lifecycle_state,first_seen_at,last_seen_at
+           ) VALUES(%s,%s,%s,%s,'scheduled',%s,%s) RETURNING id""",
+        (season_id, home_id, away_id, datetime.now(UTC) + timedelta(days=1), datetime.now(UTC), datetime.now(UTC)),
+    ).fetchone()[0])
+    connection.execute(
+        "INSERT INTO source.fixture_provider_refs(provider_id,external_id,fixture_id) VALUES(%s,%s,%s)",
+        (provider_id, f"q06-subject-fixture-{suffix}", fixture_id),
+    )
+    connection.execute(
+        "INSERT INTO source.team_provider_refs(provider_id,external_id,team_id) VALUES(%s,%s,%s)",
+        (provider_id, f"q06-subject-team-{suffix}", home_id),
+    )
+    return fixture_id, home_id
 
 
 def test_credential_bearing_raw_never_reaches_spool_or_database(tmp_path: Path) -> None:
@@ -215,6 +251,120 @@ def test_invalid_provider_summaries_become_null_while_raw_bytes_are_retained(pay
             (persisted[0].fetch_id,),
         ).fetchone()
         assert row == (*expected, capture.response.raw_body)
+
+
+def test_recorder_persists_fixture_season_and_team_subjects() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-subjects-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        fixture_id, team_id = _q06_subjects(connection, provider_id, season_id, suffix)
+        provenance = ProviderProvenance(connection, response_contains_api_key=lambda _body: False)
+
+        persisted = provenance.persist(
+            item,
+            authorization,
+            (
+                _capture(endpoint="/standings", params={"league": 39, "season": 2026}, scope={"season_id": season_id}),
+                _capture(endpoint="/fixtures/statistics", params={"fixture": 42}, scope={"fixture_id": fixture_id, "season_id": season_id}),
+                _capture(endpoint="/fixtures/lineups", params={"fixture": 42}, scope={"fixture_id": fixture_id, "season_id": season_id}),
+                _capture(endpoint="/teams/statistics", params={"team": 7, "season": 2026}, scope={"team_id": team_id, "season_id": season_id}),
+            ),
+        )
+
+        assert connection.execute(
+            """SELECT endpoint,subject_fixture_id,subject_season_id,subject_team_id
+                 FROM source.provider_fetches WHERE id=ANY(%s) ORDER BY id""",
+            ([value.fetch_id for value in persisted],),
+        ).fetchall() == [
+            ("/standings", None, season_id, None),
+            ("/fixtures/statistics", fixture_id, season_id, None),
+            ("/fixtures/lineups", fixture_id, season_id, None),
+            ("/teams/statistics", None, season_id, team_id),
+        ]
+
+
+def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        owner = f"q06-spool-{suffix}"
+        spool = RawSpool(tmp_path / "spool")
+        first_recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        first_worker = RepeatableSyncWorker(
+            connection, gate, owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=first_recorder,
+        )
+        capture = _capture()
+        fail_function = f"ops.q06_spool_fail_{suffix}"
+        fail_trigger = f"q06_spool_fail_{suffix}"
+        connection.execute(
+            f"""CREATE FUNCTION {fail_function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'precommit raw persistence failure'; END $$""",
+        )
+        connection.execute(
+            f"CREATE TRIGGER {fail_trigger} BEFORE INSERT ON source.provider_fetches "
+            f"FOR EACH ROW EXECUTE FUNCTION {fail_function}()",
+        )
+        try:
+            with pytest.raises(psycopg.errors.RaiseException, match="precommit raw persistence failure"):
+                first_worker.run_once(
+                    lambda *_args: WorkResult({}, raw_fetches=(capture,)),
+                    lambda *_args: (_ for _ in ()).throw(AssertionError("domain write must not run")),
+                )
+        finally:
+            connection.execute(f"DROP TRIGGER {fail_trigger} ON source.provider_fetches")
+            connection.execute(f"DROP FUNCTION {fail_function}()")
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+        ).fetchone()[0] == 0
+        _requeue_for_replay(connection, work_item_id, owner)
+
+        class SpoolReplayDispatch:
+            def __init__(self) -> None:
+                self.http_calls = 0
+
+            def replay(self, item, _authorization, recorder):
+                saved = recorder.latest_replay(item, endpoint="/fixtures", params={"league": 39})
+                assert saved is not None
+                return WorkResult({}, source_fetch_ids=(saved.fetch_id,), replay_normalization_version="fixtures-v2")
+
+            def fetch(self, *_args):
+                self.http_calls += 1
+                raise AssertionError("spool replay must not call the provider")
+
+            def apply_result(self, _writer, _item, _result):
+                pass
+
+        dispatch = SpoolReplayDispatch()
+        second_recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        second_worker = RepeatableSyncWorker(
+            connection, gate, owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=second_recorder,
+        )
+        assert second_worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
+        assert dispatch.http_calls == 0
+        row = connection.execute(
+            """SELECT provider_fetch.sync_work_item_attempt,provider_fetch.normalization_version,
+                      provider_fetch.request_started_at,provider_fetch.response_received_at,raw.inline_body
+                 FROM source.provider_fetches provider_fetch
+                 JOIN source.provider_raw_payloads raw ON raw.fetch_id=provider_fetch.id
+                WHERE provider_fetch.sync_work_item_id=%s""",
+            (work_item_id,),
+        ).fetchone()
+        assert row == (
+            1,
+            capture.normalization_version,
+            capture.request_started_at,
+            capture.response_received_at,
+            capture.response.raw_body,
+        )
 
 
 def test_real_q03_runner_replays_raw_with_source_links_and_atomic_completion() -> None:
