@@ -57,6 +57,29 @@ def test_catalogue_replay_is_consumed_after_queue_creation(tmp_path: Path) -> No
     assert spool.latest_catalogue() is None
 
 
+def test_catalogue_recovery_rejects_symlinked_candidate_and_artifact_files(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool")
+    request = BaseRequest("/leagues", {})
+    response = _response({"get": "leagues", "parameters": {}, "errors": {}, "results": 0, "paging": {"current": 1, "total": 1}, "response": []})
+    now = datetime.now(UTC)
+    external_spool = RawSpool(tmp_path / "outside-spool")
+    outside = external_spool.root / "catalogue" / "artifact"
+    external_spool.stage(outside, RawSpoolArtifact(request, response, now, now))
+    external_spool.mark_catalogue_pending(outside)
+    catalogue = spool.root / "catalogue"
+    catalogue.mkdir(parents=True)
+    (catalogue / "linked").symlink_to(outside, target_is_directory=True)
+    assert spool.latest_catalogue() is None
+
+    candidate = catalogue / "local"
+    spool.stage(candidate, RawSpoolArtifact(request, response, now, now))
+    spool.mark_catalogue_pending(candidate)
+    raw = candidate / "leagues.raw.json"
+    raw.unlink()
+    raw.symlink_to(outside / "leagues.raw.json")
+    assert spool.latest_catalogue() is None
+
+
 def test_catalogue_classifies_only_current_regular_leagues() -> None:
     response = _response(
         {

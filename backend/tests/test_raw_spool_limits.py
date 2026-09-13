@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from app.api_football import APIFootballResponse
-from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolCapacityError
+from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolCapacityError, RawSpoolError
 from app.importer.season_bootstrap import BaseRequest
 
 
@@ -280,5 +280,67 @@ def test_restart_rechecks_and_finishes_cleanup_quarantine_after_rename_crash(tmp
     restarted = RawSpool(root)
     assert restarted.work_item_artifacts(work_item_id=401) == ()
     restarted.set_purge_verifier(lambda _directory: True)
+    restarted.enforce_limit()
+    assert not quarantines[0].exists()
+
+
+def test_cleanup_journal_publication_failure_restores_unmodified_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = RawSpool(tmp_path / "spool", purge_verifier=lambda _directory: True)
+    artifact = _artifact(work_item_id=501, request_number=1)
+    directory = spool.work_item_request_directory(work_item_id=501, attempt=1, request_number=1)
+    spool.stage(directory, artifact)
+    spool.mark_durable(directory)
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    unlinked: list[Path] = []
+    original_unlink = Path.unlink
+
+    def reject_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError("journal publication interrupted")
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        unlinked.append(path)
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", reject_link)
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    with pytest.raises(RawSpoolError, match="cleanup proof cannot be published"):
+        spool.purge_generation(directory)
+
+    assert unlinked == []
+    assert directory.is_dir()
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+    assert tuple(directory.parent.glob(".purging-*")) == ()
+
+
+@pytest.mark.parametrize("failed_unlink", (1, 2, 3, 4))
+def test_restart_finishes_cleanup_after_each_unlink_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_unlink: int,
+) -> None:
+    spool = RawSpool(tmp_path / "spool", purge_verifier=lambda _directory: True)
+    artifact = _artifact(work_item_id=502, request_number=1)
+    directory = spool.work_item_request_directory(work_item_id=502, attempt=1, request_number=1)
+    spool.stage(directory, artifact)
+    spool.mark_durable(directory)
+    original_unlink = Path.unlink
+    calls = 0
+
+    def fail_once(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failed_unlink:
+            raise OSError("unlink interrupted")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+    with pytest.raises(OSError, match="unlink interrupted"):
+        spool.purge_generation(directory)
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    quarantines = tuple(directory.parent.glob(".purging-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / ".cleanup-proof.json").is_file()
+    restarted = RawSpool(tmp_path / "spool", max_bytes=1, purge_verifier=lambda _directory: True)
     restarted.enforce_limit()
     assert not quarantines[0].exists()

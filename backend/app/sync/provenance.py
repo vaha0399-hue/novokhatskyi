@@ -6,10 +6,11 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from psycopg import Connection, Error as PsycopgError
 from psycopg.pq import TransactionStatus
@@ -173,6 +174,7 @@ class ProviderProvenance:
         self._spool = spool
         if spool is not None:
             spool.set_purge_verifier(self._spool_candidate_is_safe_from_database)
+            spool.set_purge_guard(self._spool_candidate_guard_from_database)
 
     def _effective_scope(self, capture: RawFetchCapture, item: LeasedWorkItem) -> dict[str, Any]:
         return _safe_mapping(capture.scope if capture.scope is not None else item.scope)
@@ -267,93 +269,192 @@ class ProviderProvenance:
 
     def _spool_candidate_is_safe_from_database(self, directory: object) -> bool:
         """Verify an existing durable capture after a process restart."""
+        with self._spool_candidate_guard_from_database(directory) as proven:
+            return proven
+
+    @contextmanager
+    def _spool_candidate_guard_from_database(self, directory: object) -> Iterator[bool]:
+        """Hold matching source rows against mutation until local unlink ends."""
         if self._spool is None or not isinstance(directory, Path):
-            return False
+            yield False
+            return
         try:
-            metadata_files = [
-                path for path in directory.iterdir()
-                if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
-            ]
-            if len(metadata_files) != 1:
-                return False
-            metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+            proof = directory / self._spool._CLEANUP_PROOF  # type: ignore[attr-defined]
+            proof_exists = proof.exists()
+            if proof.exists():
+                metadata = self._spool._cleanup_proof_metadata_unlocked(directory)  # type: ignore[attr-defined]
+            else:
+                metadata_files = [
+                    path for path in directory.iterdir()
+                    if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
+                ]
+                if len(metadata_files) != 1:
+                    yield False
+                    return
+                metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
             endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
             if not isinstance(endpoint, str) or not isinstance(params, Mapping):
-                return False
-            artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
-            if artifact is None or artifact.work_item_id is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
-                return False
+                yield False
+                return
             identity = self._spool._repeatable_identity_unlocked(directory)  # type: ignore[attr-defined]
             if identity is None:
-                return False
+                yield False
+                return
             work_item_id, attempt, request_number = identity
-            if artifact.work_item_id != work_item_id or artifact.work_item_attempt != attempt:
-                return False
+            stored_work_item_id = metadata.get("work_item_id")
+            stored_attempt = metadata.get("work_item_attempt")
+            physical_request_id = metadata.get("physical_request_id")
+            if (
+                not isinstance(stored_work_item_id, int)
+                or not isinstance(stored_attempt, int)
+                or not isinstance(physical_request_id, str)
+                or stored_work_item_id != work_item_id
+                or stored_attempt != attempt
+            ):
+                yield False
+                return
             if request_number is not None:
-                if artifact.physical_request_id != _physical_request_id(work_item_id, attempt, request_number):
-                    return False
+                if physical_request_id != _physical_request_id(work_item_id, attempt, request_number):
+                    yield False
+                    return
             elif not re.fullmatch(
                 rf"work-item-{work_item_id}:attempt-{attempt}:request-[0-9]+",
-                artifact.physical_request_id,
+                physical_request_id,
             ):
-                return False
-            scope = _safe_mapping(artifact.scope or {})
+                yield False
+                return
+            scope_value = metadata.get("scope", {})
+            if not isinstance(scope_value, Mapping):
+                yield False
+                return
+            scope = _safe_mapping(scope_value)
             subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope)
-            results, paging_current, paging_total = _response_summary(artifact.response)
-            expires_at = None if artifact.retention_class == "contract_sample" else artifact.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
-            request_scope = {
-                "scope": scope,
-                "physical_request_id": artifact.physical_request_id,
-            }
-            with self._connection.transaction():
-                row = self._connection.execute(
-                    """SELECT provider_fetch.id
-                         FROM source.provider_fetches provider_fetch
-                         JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
-                         JOIN ops.sync_work_items item ON item.id=provider_fetch.sync_work_item_id
-                         JOIN ops.sync_runs run ON run.id=item.run_id AND run.provider_id=provider_fetch.provider_id
-                        WHERE item.status='succeeded'
-                          AND provider_fetch.sync_work_item_id=%s
-                          AND provider_fetch.sync_work_item_attempt=%s
-                          AND provider_fetch.request_scope->>'physical_request_id'=%s
-                          AND provider_fetch.endpoint=%s
-                          AND provider_fetch.request_params=%s
-                          AND provider_fetch.request_params_sha256=%s
-                          AND provider_fetch.purpose=%s
-                          AND provider_fetch.request_started_at=%s
-                          AND provider_fetch.response_received_at=%s
-                          AND provider_fetch.http_status=%s
-                          AND provider_fetch.outcome='success'
-                          AND provider_fetch.provider_results IS NOT DISTINCT FROM %s
-                          AND provider_fetch.paging_current IS NOT DISTINCT FROM %s
-                          AND provider_fetch.paging_total IS NOT DISTINCT FROM %s
-                          AND provider_fetch.content_sha256=%s
-                          AND provider_fetch.request_scope->'scope'=%s
-                          AND provider_fetch.normalization_version=%s
-                          AND provider_fetch.subject_fixture_id IS NOT DISTINCT FROM %s
-                          AND provider_fetch.subject_season_id IS NOT DISTINCT FROM %s
-                          AND provider_fetch.subject_team_id IS NOT DISTINCT FROM %s
-                          AND payload.inline_body=%s
-                          AND payload.content_type='application/json'
-                          AND payload.content_encoding IS NULL
-                          AND payload.object_key IS NULL
-                          AND payload.byte_count=%s
-                          AND payload.retention_class=%s
-                          AND payload.expires_at IS NOT DISTINCT FROM %s
-                          AND payload.purged_at IS NULL""",
-                    (
-                        artifact.work_item_id, artifact.work_item_attempt, artifact.physical_request_id,
-                        artifact.request.endpoint, Jsonb(dict(artifact.request.params)), _params_digest(artifact.request.params),
-                        artifact.purpose, artifact.request_started_at, artifact.response_received_at,
-                        artifact.response.status_code, results, paging_current, paging_total,
-                        hashlib.sha256(artifact.response.raw_body).digest(), Jsonb(scope),
-                        artifact.normalization_version, subject_fixture_id, subject_season_id, subject_team_id,
-                        artifact.response.raw_body, len(artifact.response.raw_body), artifact.retention_class, expires_at,
-                    ),
-                ).fetchone()
-                return row is not None
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError, PsycopgError):
-            return False
+            raw_hash = metadata.get("content_sha256")
+            byte_count = metadata.get("byte_count")
+            started = datetime.fromisoformat(str(metadata["request_started_at"]).replace("Z", "+00:00"))
+            received = datetime.fromisoformat(str(metadata["response_received_at"]).replace("Z", "+00:00"))
+            http_status = metadata.get("http_status")
+            normalization_version = metadata.get("normalization_version")
+            purpose = metadata.get("purpose")
+            retention_class = metadata.get("retention_class")
+            if (
+                not isinstance(raw_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", raw_hash)
+                or not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0
+                or started.tzinfo is None or received.tzinfo is None or received < started
+                or not isinstance(http_status, int) or isinstance(http_status, bool)
+                or not isinstance(normalization_version, str) or not normalization_version.strip()
+                or not isinstance(purpose, str) or not isinstance(retention_class, str)
+            ):
+                yield False
+                return
+            expires_at = None if retention_class == "contract_sample" else received + timedelta(days=RAW_RETENTION_DAYS)
+            raw_path = directory / f"{self._spool._label(endpoint)}.raw.json"  # type: ignore[attr-defined]
+            local_raw: bytes | None = None
+            if raw_path.exists():
+                if not raw_path.is_file() or raw_path.is_symlink():
+                    yield False
+                    return
+                local_raw = raw_path.read_bytes()
+                if len(local_raw) != byte_count or hashlib.sha256(local_raw).hexdigest() != raw_hash:
+                    yield False
+                    return
+            elif not proof_exists:
+                yield False
+                return
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError):
+            yield False
+            return
+
+        # Do not use ``with`` around the yield: an unlink exception must leave
+        # this context as an unlink exception, not be recast as a failed DB
+        # check.  The transaction stays open until that body ends, retaining
+        # FOR SHARE locks on the exact fetch, payload and work-item rows.
+        transaction = self._connection.transaction()
+        try:
+            transaction.__enter__()
+        except PsycopgError:
+            yield False
+            return
+        try:
+            self._connection.execute("SET LOCAL lock_timeout = '2s'")
+            row = self._connection.execute(
+                """SELECT provider_fetch.provider_results,provider_fetch.paging_current,provider_fetch.paging_total,
+                          payload.inline_body
+                     FROM source.provider_fetches provider_fetch
+                     JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                     JOIN ops.sync_work_items item ON item.id=provider_fetch.sync_work_item_id
+                     JOIN ops.sync_runs run ON run.id=item.run_id AND run.provider_id=provider_fetch.provider_id
+                    WHERE item.status='succeeded'
+                      AND provider_fetch.sync_work_item_id=%s
+                      AND provider_fetch.sync_work_item_attempt=%s
+                      AND provider_fetch.request_scope->>'physical_request_id'=%s
+                      AND provider_fetch.endpoint=%s
+                      AND provider_fetch.request_params=%s
+                      AND provider_fetch.request_params_sha256=%s
+                      AND provider_fetch.purpose=%s
+                      AND provider_fetch.request_started_at=%s
+                      AND provider_fetch.response_received_at=%s
+                      AND provider_fetch.http_status=%s
+                      AND provider_fetch.outcome='success'
+                      AND provider_fetch.content_sha256=%s
+                      AND provider_fetch.request_scope->'scope'=%s
+                      AND provider_fetch.normalization_version=%s
+                      AND provider_fetch.subject_fixture_id IS NOT DISTINCT FROM %s
+                      AND provider_fetch.subject_season_id IS NOT DISTINCT FROM %s
+                      AND provider_fetch.subject_team_id IS NOT DISTINCT FROM %s
+                      AND payload.inline_body IS NOT NULL
+                      AND payload.content_type='application/json'
+                      AND payload.content_encoding IS NULL
+                      AND payload.object_key IS NULL
+                      AND payload.byte_count=%s
+                      AND payload.retention_class=%s
+                      AND payload.expires_at IS NOT DISTINCT FROM %s
+                      AND payload.purged_at IS NULL
+                    FOR SHARE OF provider_fetch,payload,item""",
+                (
+                    stored_work_item_id, stored_attempt, physical_request_id,
+                    endpoint, Jsonb(dict(params)), _params_digest(params), purpose, started, received,
+                    http_status, bytes.fromhex(raw_hash), Jsonb(scope), normalization_version,
+                    subject_fixture_id, subject_season_id, subject_team_id,
+                    byte_count, retention_class, expires_at,
+                ),
+            ).fetchone()
+        except PsycopgError as error:
+            transaction.__exit__(type(error), error, error.__traceback__)
+            yield False
+            return
+        try:
+            if row is None or not isinstance(row[3], bytes):
+                proven = False
+            else:
+                raw = row[3]
+                if len(raw) != byte_count or hashlib.sha256(raw).hexdigest() != raw_hash:
+                    proven = False
+                elif local_raw is not None and local_raw != raw:
+                    proven = False
+                else:
+                    try:
+                        payload = json.loads(raw)
+                        if not isinstance(payload, dict):
+                            proven = False
+                        else:
+                            results, paging_current, paging_total = _response_summary(
+                                APIFootballResponse(payload, raw, http_status, {}),
+                            )
+                            proven = (row[0], row[1], row[2]) == (results, paging_current, paging_total)
+                    except (ValueError, TypeError, json.JSONDecodeError, ProvenanceError):
+                        proven = False
+            try:
+                yield proven
+            except BaseException as error:
+                transaction.__exit__(type(error), error, error.__traceback__)
+                raise
+            else:
+                transaction.__exit__(None, None, None)
+        except BaseException:
+            # The only errors this level may handle are from the DB context;
+            # errors from the unlink body were already re-raised above.
+            raise
     def _persist_database(
         self,
         item: LeasedWorkItem,

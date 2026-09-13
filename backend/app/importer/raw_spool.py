@@ -1,9 +1,12 @@
 """Crash-safe local landing zone for pre-canonical provider responses.
 
 All filesystem operations use the root lock; DB verification is performed while
-that short lock is held, and HTTP is never part of the critical section.  A
+that short lock is held, and HTTP is never part of the critical section.  Purge
+order is root lock, then DB ``FOR SHARE`` locks, then atomic journal publication
+and unlink.  The DB transaction remains open through the final unlink.  A
 verified purge first renames its directory to ``.purging-*`` so an interrupted
-cleanup remains visible and is never mistaken for replay input.
+cleanup remains visible and is never mistaken for replay input; restart treats
+the journal as an input to re-verification, never as deletion authority.
 """
 
 from __future__ import annotations
@@ -14,11 +17,12 @@ import os
 import fcntl
 import re
 import uuid
+from contextlib import nullcontext
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 from app.api_football import APIFootballResponse
 from app.importer.season_bootstrap import BaseRequest, CollectedBaseResponse
@@ -55,12 +59,15 @@ class RawSpool:
     positive numeric IDs supplied by the worker.
     """
 
+    _CLEANUP_PROOF = ".cleanup-proof.json"
+
     def __init__(self, root: Path, *, max_bytes: int | None = 1024 * 1024 * 1024, purge_verifier: Callable[[Path], bool] | None = None) -> None:
         if max_bytes is not None and max_bytes <= 0:
             raise ValueError("raw spool maximum must be positive")
         self._root = root
         self._max_bytes = max_bytes
         self._purge_verifier = purge_verifier
+        self._purge_guard: Callable[[Path], ContextManager[bool]] | None = None
 
     @property
     def root(self) -> Path:
@@ -68,6 +75,10 @@ class RawSpool:
 
     def set_purge_verifier(self, verifier: Callable[[Path], bool] | None) -> None:
         self._purge_verifier = verifier
+
+    def set_purge_guard(self, guard: Callable[[Path], ContextManager[bool]] | None) -> None:
+        """Install the DB lock guard used only while verified files are unlinked."""
+        self._purge_guard = guard
 
     @staticmethod
     def _absolute_path(path: Path) -> Path:
@@ -186,6 +197,20 @@ class RawSpool:
             temporary.unlink(missing_ok=True)
             raise
 
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        """Persist an already-completed namespace change without following links."""
+        try:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as error:
+            raise RawSpoolError("raw spool directory cannot be synchronized") from error
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            raise RawSpoolError("raw spool directory cannot be synchronized") from error
+        finally:
+            os.close(descriptor)
+
     def stage(self, directory: Path, artifact: RawSpoolArtifact) -> None:
         self._validate_directory(directory)
         with self._lock():
@@ -222,6 +247,12 @@ class RawSpool:
             "content_sha256": hashlib.sha256(raw).hexdigest(),
             "request_started_at": artifact.request_started_at.isoformat(),
             "response_received_at": artifact.response_received_at.isoformat(),
+        }
+        metadata["cleanup_manifest"] = {
+            "version": 1,
+            "files": (f"{label}.raw.json", f"{label}.request.json", ".durable"),
+            "raw_sha256": metadata["content_sha256"],
+            "raw_byte_count": len(raw),
         }
         if artifact.scope is not None:
             metadata["scope"] = dict(artifact.scope)
@@ -273,7 +304,12 @@ class RawSpool:
         request_path = directory / f"{label}.request.json"
         if not raw_path.exists() and not request_path.exists():
             return None
-        if not raw_path.is_file() or not request_path.is_file():
+        if (
+            not raw_path.is_file()
+            or raw_path.is_symlink()
+            or not request_path.is_file()
+            or request_path.is_symlink()
+        ):
             raise RawSpoolError("partial raw spool artifact")
         try:
             metadata = json.loads(request_path.read_text(encoding="utf-8"))
@@ -456,12 +492,17 @@ class RawSpool:
     def _verified_q06_candidate_unlocked(self, directory: Path) -> bool:
         identity = self._repeatable_identity_unlocked(directory)
         marker = directory / ".durable"
+        has_durable_marker = marker.is_file() and not marker.is_symlink()
+        if not has_durable_marker:
+            try:
+                self._cleanup_proof_metadata_unlocked(directory)
+            except RawSpoolError:
+                return False
         if (
             identity is None
             or not directory.is_dir()
             or directory.is_symlink()
-            or not marker.is_file()
-            or marker.is_symlink()
+            or not has_durable_marker and not (directory / self._CLEANUP_PROOF).is_file()
             or self._purge_verifier is None
         ):
             return False
@@ -470,18 +511,49 @@ class RawSpool:
         except Exception:
             return False
 
+    def _purge_guard_unlocked(self, directory: Path) -> ContextManager[bool]:
+        if self._purge_guard is not None:
+            return self._purge_guard(directory)
+        return nullcontext(self._verified_q06_candidate_unlocked(directory))
+
+    def _cleanup_proof_metadata_unlocked(self, directory: Path) -> Mapping[str, Any]:
+        proof = directory / self._CLEANUP_PROOF
+        if not proof.is_file() or proof.is_symlink():
+            raise RawSpoolError("raw spool cleanup proof is unavailable")
+        try:
+            metadata = json.loads(proof.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RawSpoolError("raw spool cleanup proof is unreadable") from error
+        return self._validate_cleanup_metadata_unlocked(metadata)
+
+    def _validate_cleanup_metadata_unlocked(self, metadata: object) -> Mapping[str, Any]:
+        if not isinstance(metadata, Mapping):
+            raise RawSpoolError("raw spool cleanup proof is invalid")
+        manifest = metadata.get("cleanup_manifest")
+        endpoint = metadata.get("endpoint")
+        if not isinstance(manifest, Mapping) or not isinstance(endpoint, str):
+            raise RawSpoolError("raw spool cleanup proof is incomplete")
+        label = self._label(endpoint)
+        expected = (f"{label}.raw.json", f"{label}.request.json", ".durable")
+        if (
+            manifest.get("version") != 1
+            or tuple(manifest.get("files", ())) != expected
+            or manifest.get("raw_sha256") != metadata.get("content_sha256")
+            or manifest.get("raw_byte_count") != metadata.get("byte_count")
+        ):
+            raise RawSpoolError("raw spool cleanup proof does not match its metadata")
+        return metadata
+
     def _recover_quarantines_unlocked(self) -> None:
         if not self._root.exists():
             return
-        quarantines = sorted(
-            (
-                marker.parent for marker in self._root.rglob(".durable")
-                if marker.parent.name.startswith(".purging-")
-                and self._repeatable_identity_unlocked(marker.parent) is not None
-            ),
-            key=lambda path: path.stat().st_mtime,
+        quarantines = tuple(
+            directory for directory in self._root.rglob(".purging-*")
+            if directory.is_dir()
+            and not directory.is_symlink()
+            and self._repeatable_identity_unlocked(directory) is not None
         )
-        for directory in quarantines:
+        for directory in sorted(quarantines, key=lambda path: path.stat().st_mtime):
             self._purge_verified_q06_unlocked(directory)
 
     def enforce_limit(self) -> None:
@@ -572,32 +644,103 @@ class RawSpool:
             raise RawSpoolError("raw spool directory is not a legacy generation")
         quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
         directory.rename(quarantine)
-        self._remove_quarantine_unlocked(quarantine)
+        self._remove_legacy_quarantine_unlocked(quarantine)
 
     def _purge_verified_q06_unlocked(self, directory: Path) -> bool:
-        if not self._verified_q06_candidate_unlocked(directory):
-            return False
-        if directory.name.startswith(".purging-"):
-            self._remove_quarantine_unlocked(directory)
+        if directory.name.startswith(".purging-") and directory.is_dir() and not directory.is_symlink():
+            # A crash after the journal was unlinked can leave an empty
+            # quarantine.  Removing the empty directory loses no artifact and
+            # cannot be mistaken for accepting an unproven capture.
+            if not any(directory.iterdir()):
+                directory.rmdir()
+                self._fsync_directory(directory.parent)
+                return True
+        quarantine = directory
+        renamed = False
+        if not directory.name.startswith(".purging-"):
+            if not self._verified_q06_candidate_unlocked(directory):
+                return False
+            quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
+            directory.rename(quarantine)
+            self._fsync_directory(quarantine.parent)
+            renamed = True
+        try:
+            # This guard keeps the DB raw payload, fetch, and succeeded work
+            # item immutable until the local copy has been removed.
+            with self._purge_guard_unlocked(quarantine) as proven:
+                if not proven:
+                    return False
+                self._remove_quarantine_unlocked(quarantine)
             return True
-        quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
-        directory.rename(quarantine)
-        # A rename is recoverable but not a proof: verify the same bytes and
-        # metadata again under their quarantine name before deletion.
-        if not self._verified_q06_candidate_unlocked(quarantine):
-            quarantine.rename(directory)
-            return False
-        self._remove_quarantine_unlocked(quarantine)
-        return True
+        finally:
+            # Before the journal is atomically published no file was removed,
+            # so the normal name can be restored.  Once it exists, recovery
+            # must retain the quarantine and re-run DB proof before each later
+            # unlink; a marker itself is never sufficient proof.
+            if renamed and quarantine.exists() and not (quarantine / self._CLEANUP_PROOF).exists():
+                quarantine.rename(directory)
+                self._fsync_directory(directory.parent)
 
     @staticmethod
-    def _remove_quarantine_unlocked(quarantine: Path) -> None:
+    def _remove_legacy_quarantine_unlocked(quarantine: Path) -> None:
         entries = tuple(quarantine.iterdir())
         if any(not item.is_file() and not item.is_symlink() for item in entries):
             raise RawSpoolError("raw spool generation has an unexpected nested directory")
         for item in entries:
             if item.is_file() or item.is_symlink():
                 item.unlink()
+        quarantine.rmdir()
+
+    def _publish_cleanup_proof_unlocked(self, quarantine: Path) -> Mapping[str, Any]:
+        proof = quarantine / self._CLEANUP_PROOF
+        if proof.exists():
+            return self._cleanup_proof_metadata_unlocked(quarantine)
+        metadata_files = [
+            path for path in quarantine.iterdir()
+            if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
+        ]
+        if len(metadata_files) != 1:
+            raise RawSpoolError("raw spool cleanup proof is missing metadata")
+        metadata_path = metadata_files[0]
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RawSpoolError("raw spool cleanup metadata is unreadable") from error
+        if not isinstance(metadata, Mapping):
+            raise RawSpoolError("raw spool cleanup metadata is invalid")
+        self._validate_cleanup_metadata_unlocked(metadata)
+        # A hard link publishes the already fsynced metadata atomically without
+        # replacing an existing journal or creating a partially written copy.
+        try:
+            os.link(metadata_path, proof, follow_symlinks=False)
+        except FileExistsError:
+            return self._cleanup_proof_metadata_unlocked(quarantine)
+        except OSError as error:
+            raise RawSpoolError("raw spool cleanup proof cannot be published") from error
+        self._fsync_directory(quarantine)
+        return self._cleanup_proof_metadata_unlocked(quarantine)
+
+    def _remove_quarantine_unlocked(self, quarantine: Path) -> None:
+        metadata = self._publish_cleanup_proof_unlocked(quarantine)
+        endpoint = metadata.get("endpoint")
+        if not isinstance(endpoint, str):
+            raise RawSpoolError("raw spool cleanup proof is incomplete")
+        label = self._label(endpoint)
+        proof = quarantine / self._CLEANUP_PROOF
+        expected = {proof.name, f"{label}.raw.json", f"{label}.request.json", ".durable"}
+        entries = tuple(quarantine.iterdir())
+        if any(
+            not item.is_file() or item.is_symlink() or item.name not in expected
+            for item in entries
+        ):
+            raise RawSpoolError("raw spool generation has an unexpected cleanup entry")
+        # The journal itself is checked by the DB guard and is always last.
+        for item in entries:
+            if item != proof:
+                item.unlink()
+                self._fsync_directory(quarantine)
+        proof.unlink()
+        self._fsync_directory(quarantine)
         quarantine.rmdir()
 
     def latest_catalogue(self) -> RawSpoolArtifact | None:
@@ -607,10 +750,25 @@ class RawSpool:
 
     def _latest_catalogue_unlocked(self) -> RawSpoolArtifact | None:
         directory = self._root_path() / "catalogue"
-        if not directory.is_dir():
+        if not directory.is_dir() or directory.is_symlink():
             return None
         request = BaseRequest("/leagues", {})
-        candidates = sorted((path for path in directory.iterdir() if path.is_dir() and (path / ".queue-pending").is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+        candidates: list[Path] = []
+        for path in directory.iterdir():
+            marker = path / ".queue-pending"
+            if not path.is_dir() or path.is_symlink() or not marker.is_file() or marker.is_symlink():
+                continue
+            try:
+                self._validate_directory(path)
+                # _load_unlocked rejects links at both artifact files.  Check
+                # all entries here too, before it traverses a candidate found
+                # by catalogue recovery under the already-held root lock.
+                if any(entry.is_symlink() for entry in path.iterdir()):
+                    continue
+            except RawSpoolError:
+                continue
+            candidates.append(path)
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for candidate in candidates:
             try:
                 value = self._load_unlocked(candidate, request)
