@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -173,9 +174,12 @@ class ProviderProvenance:
         if spool is not None:
             spool.set_purge_verifier(self._spool_candidate_is_safe_from_database)
 
-    def _contains_configured_credential(self, capture: RawFetchCapture) -> bool:
+    def _effective_scope(self, capture: RawFetchCapture, item: LeasedWorkItem) -> dict[str, Any]:
+        return _safe_mapping(capture.scope if capture.scope is not None else item.scope)
+
+    def _contains_configured_credential(self, capture: RawFetchCapture, scope: Mapping[str, Any]) -> bool:
         metadata = json.dumps(
-            {"parameters": _safe_mapping(capture.params), "scope": _safe_mapping(capture.scope or {})},
+            {"parameters": _safe_mapping(capture.params), "scope": scope},
             sort_keys=True, separators=(",", ":"),
         ).encode()
         return self._response_contains_api_key(capture.response.raw_body + b"\n" + metadata)
@@ -185,15 +189,13 @@ class ProviderProvenance:
     ) -> tuple[PersistedRawFetch, ...]:
         if not captures:
             return ()
-        if self._spool is not None:
-            self._spool.set_purge_verifier(lambda path: self._spool_candidate_is_safe(path, item, authorization))
         if self._connection.info.transaction_status != TransactionStatus.IDLE:
             raise ProvenanceError("raw persistence requires an idle database connection")
         # Use the client-owned detector before making any filesystem or
         # database mutation. Its error deliberately contains no raw content.
         for capture in captures:
             try:
-                contains_credential = self._contains_configured_credential(capture)
+                contains_credential = self._contains_configured_credential(capture, self._effective_scope(capture, item))
             except Exception:
                 raise ProvenanceError("provider response credential check failed") from None
             if contains_credential:
@@ -210,7 +212,7 @@ class ProviderProvenance:
                 artifact = RawSpoolArtifact(
                     BaseRequest(capture.endpoint, dict(_safe_mapping(capture.params))), capture.response,
                     capture.request_started_at, capture.response_received_at,
-                    _safe_mapping(capture.scope or item.scope), item.id, item.attempts,
+                    self._effective_scope(capture, item), item.id, item.attempts,
                     capture.normalization_version, capture.purpose, capture.retention_class, physical_request_id,
                 )
                 self._spool.stage(directory, artifact)
@@ -227,7 +229,6 @@ class ProviderProvenance:
         """Commit verified pre-DB spool captures before a replay hook can choose HTTP."""
         if self._spool is None:
             return ()
-        self._spool.set_purge_verifier(lambda path: self._spool_candidate_is_safe(path, item, authorization))
         if self._connection.info.transaction_status != TransactionStatus.IDLE:
             raise ProvenanceError("spool recovery requires an idle database connection")
         staged: list[object] = []
@@ -258,41 +259,11 @@ class ProviderProvenance:
         # marked durable.  Every recovery capture follows the same insert and
         # full conflict comparison as an ordinary fresh persistence.
         with self._connection.transaction():
-            self._validate_captures(recoverable)
+            self._validate_captures(item, recoverable)
             recovered.extend(self._persist_database_rows(item, authorization, recoverable))
         for directory in set(staged):
             self._spool.mark_durable(directory)
         return tuple(recovered)
-
-    def _spool_candidate_is_safe(
-        self, directory: object, item: LeasedWorkItem, authorization: AuthorizedSyncWork,
-    ) -> bool:
-        """Read-only proof that a durable local copy is safe to evict."""
-        if self._spool is None or not isinstance(directory, Path):
-            return False
-        try:
-            metadata_files = [path for path in directory.iterdir() if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")]
-            if len(metadata_files) != 1:
-                return False
-            metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
-            endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
-            if not isinstance(endpoint, str) or not isinstance(params, Mapping):
-                return False
-            artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
-            if artifact is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
-                return False
-            capture = RawFetchCapture(artifact.request.endpoint, dict(artifact.request.params), artifact.response, artifact.request_started_at, artifact.response_received_at, artifact.normalization_version or "legacy", artifact.purpose or "scheduled_refresh", artifact.retention_class or "standard", artifact.scope)
-            results, paging_current, paging_total = _response_summary(capture.response)
-            scope = {"scope_key": item.scope_key, "job_type": item.job_type, "scope": _safe_mapping(capture.scope or item.scope), "physical_request_id": artifact.physical_request_id}
-            subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope["scope"])
-            expires_at = None if capture.retention_class == "contract_sample" else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
-            with self._connection.transaction():
-                status = self._connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item.id,)).fetchone()
-                if status is None or status[0] != "succeeded":
-                    return False
-                return self._matching_physical_request(item, authorization, capture, artifact.work_item_attempt, artifact.physical_request_id, results, paging_current, paging_total, scope, subject_fixture_id, subject_season_id, subject_team_id, expires_at) is not None
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError, PsycopgError):
-            return False
 
     def _spool_candidate_is_safe_from_database(self, directory: object) -> bool:
         """Verify an existing durable capture after a process restart."""
@@ -312,6 +283,20 @@ class ProviderProvenance:
             artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
             if artifact is None or artifact.work_item_id is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
                 return False
+            identity = self._spool._repeatable_identity_unlocked(directory)  # type: ignore[attr-defined]
+            if identity is None:
+                return False
+            work_item_id, attempt, request_number = identity
+            if artifact.work_item_id != work_item_id or artifact.work_item_attempt != attempt:
+                return False
+            if request_number is not None:
+                if artifact.physical_request_id != _physical_request_id(work_item_id, attempt, request_number):
+                    return False
+            elif not re.fullmatch(
+                rf"work-item-{work_item_id}:attempt-{attempt}:request-[0-9]+",
+                artifact.physical_request_id,
+            ):
+                return False
             scope = _safe_mapping(artifact.scope or {})
             subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope)
             results, paging_current, paging_total = _response_summary(artifact.response)
@@ -326,6 +311,7 @@ class ProviderProvenance:
                          FROM source.provider_fetches provider_fetch
                          JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
                          JOIN ops.sync_work_items item ON item.id=provider_fetch.sync_work_item_id
+                         JOIN ops.sync_runs run ON run.id=item.run_id AND run.provider_id=provider_fetch.provider_id
                         WHERE item.status='succeeded'
                           AND provider_fetch.sync_work_item_id=%s
                           AND provider_fetch.sync_work_item_attempt=%s
@@ -374,20 +360,22 @@ class ProviderProvenance:
         authorization: AuthorizedSyncWork,
         captures: Sequence[tuple[RawFetchCapture, int, str]],
     ) -> tuple[PersistedRawFetch, ...]:
-        self._validate_captures(captures)
+        self._validate_captures(item, captures)
         # This transaction intentionally ends before the Q03 lease guard and
         # domain writer.  A later normalization rollback cannot erase evidence.
         with self._connection.transaction():
             return self._persist_database_rows(item, authorization, captures)
 
-    def _validate_captures(self, captures: Sequence[tuple[RawFetchCapture, int, str]]) -> None:
+    def _validate_captures(
+        self, item: LeasedWorkItem, captures: Sequence[tuple[RawFetchCapture, int, str]],
+    ) -> None:
         for capture, source_attempt, physical_request_id in captures:
             if not isinstance(source_attempt, int) or isinstance(source_attempt, bool) or source_attempt < 1:
                 raise ProvenanceError("source work-item attempt must be a positive integer")
             if not isinstance(physical_request_id, str) or not physical_request_id.strip():
                 raise ProvenanceError("physical request identity is required")
             try:
-                contains_credential = self._contains_configured_credential(capture)
+                contains_credential = self._contains_configured_credential(capture, self._effective_scope(capture, item))
             except Exception:
                 raise ProvenanceError("provider response credential check failed") from None
             if contains_credential:
@@ -402,7 +390,7 @@ class ProviderProvenance:
         persisted: list[PersistedRawFetch] = []
         for capture, source_attempt, physical_request_id in captures:
             results, paging_current, paging_total = _response_summary(capture.response)
-            capture_scope = _safe_mapping(capture.scope or item.scope)
+            capture_scope = self._effective_scope(capture, item)
             subject_fixture_id, subject_season_id, subject_team_id = _subjects(capture_scope)
             scope = {
                 "scope_key": item.scope_key,

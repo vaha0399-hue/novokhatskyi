@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 
 from app.api_football.budget import APIFootballBudgetError, budget_retry_delay_seconds
 from app.api_football.errors import APIFootballHTTPError
+from app.importer.raw_spool import RawSpoolCapacityError
 from app.sync.policies import AuthorizedSyncWork, SyncPolicyDenied, SyncPolicyGate, SyncWorkRequest
 from app.sync.repository import LeasedWorkItem, PostgresSyncRepository
 from app.sync.provenance import ProviderProvenance, RawFetchCapture
@@ -367,6 +368,12 @@ class RepeatableSyncWorker:
             if not deferred:
                 raise LeaseLost("repeatable work-item lease was lost before failure handling") from exc
             return True
+        except RawSpoolCapacityError:
+            # Local evidence storage is distinct from a provider contract
+            # failure.  Leave the fenced attempt untouched for safe retry.
+            stop.set()
+            thread.join()
+            raise
         except Exception as exc:
             stop.set()
             thread.join()

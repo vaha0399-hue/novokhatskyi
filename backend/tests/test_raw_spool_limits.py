@@ -122,7 +122,7 @@ def _crash_after_first_atomic_write(root: str, work_item_id: int) -> None:
 
 
 def _crash_after_quarantine_rename(root: str, directory: str) -> None:
-    spool = RawSpool(Path(root))
+    spool = RawSpool(Path(root), purge_verifier=lambda _directory: True)
     target = Path(directory)
     original_rename = Path.rename
 
@@ -259,7 +259,7 @@ def test_restart_recognizes_partial_atomic_write_without_damaging_existing_artif
     assert recovered.response.raw_body == interrupted.response.raw_body
 
 
-def test_restart_preserves_and_ignores_cleanup_quarantine_after_rename_crash(tmp_path: Path) -> None:
+def test_restart_rechecks_and_finishes_cleanup_quarantine_after_rename_crash(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
     root = tmp_path / "spool"
     spool = RawSpool(root)
@@ -279,4 +279,6 @@ def test_restart_preserves_and_ignores_cleanup_quarantine_after_rename_crash(tmp
 
     restarted = RawSpool(root)
     assert restarted.work_item_artifacts(work_item_id=401) == ()
-    assert quarantines[0].is_dir()
+    restarted.set_purge_verifier(lambda _directory: True)
+    restarted.enforce_limit()
+    assert not quarantines[0].exists()

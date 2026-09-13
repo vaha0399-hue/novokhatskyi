@@ -452,7 +452,7 @@ class Worker:
             generation = item.checkpoint.get("capture_generation")
             if isinstance(generation, int) and generation > 0 and competition.season_start_year is not None:
                 directory = self._spool.capture_directory(run_id=run_id, league_external_id=competition.league_external_id, season_start_year=competition.season_start_year, generation=generation)
-                if directory.is_dir(): self._spool.purge_generation(directory)
+                if directory.is_dir(): self._spool.purge_legacy_generation(directory)
             statistics = await self._backfill_statistics(item)
             self._repository.complete(item, {"outcome": "already_complete", "statistics": statistics}); return self._report(item, "already_complete")
         assert competition.season_start_year is not None
@@ -485,7 +485,7 @@ class Worker:
             return self._report(item, "deferred_unsupported_format", type(error).__name__)
         # Canonical DB now owns the same raw provenance; the VPS inbox is no
         # longer needed and is removed before this item becomes terminal.
-        self._spool.purge_generation(directory)
+        self._spool.purge_legacy_generation(directory)
         statistics = await self._backfill_statistics(item)
         outcome = "imported" if publication_state == "complete" else (
             "imported_no_standings" if publication_state == "no_standings" else "imported_partial"

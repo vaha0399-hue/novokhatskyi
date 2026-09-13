@@ -240,6 +240,96 @@ def test_q03_runner_propagates_spool_capacity_without_contract_transition(tmp_pa
         assert state[1] == {}
 
 
+def test_q03_runner_propagates_recovery_capacity_without_contract_transition(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-recovery-capacity-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        spool = RawSpool(tmp_path / "spool")
+        capture = _capture()
+        directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
+        spool.stage(directory, RawSpoolArtifact(
+            BaseRequest(capture.endpoint, dict(capture.params)), capture.response,
+            capture.request_started_at, capture.response_received_at, dict(item.scope), item.id,
+            item.attempts, capture.normalization_version, capture.purpose, capture.retention_class,
+            f"work-item-{item.id}:attempt-{item.attempts}:request-000001",
+        ))
+        spool._max_bytes = 1  # type: ignore[attr-defined]
+        worker = RepeatableSyncWorker(
+            connection, gate, f"q06-recovery-capacity-{suffix}",
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool),
+        )
+        worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
+
+        with pytest.raises(RawSpoolCapacityError):
+            worker.run_once(
+                lambda *_args: (_ for _ in ()).throw(AssertionError("recovery capacity must stop before HTTP")),
+                lambda *_args: (_ for _ in ()).throw(AssertionError("recovery capacity must stop before domain writes")),
+            )
+
+        assert connection.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (item.id,),
+        ).fetchone() == ("running", {})
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        assert not (directory / ".durable").exists()
+
+
+def test_q06_capacity_eviction_uses_each_candidate_own_succeeded_work_item(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, first_work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        first = PostgresSyncRepository(connection, gate).claim_next(f"q06-evict-first-{suffix}")
+        assert first is not None and first.id == first_work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        spool = RawSpool(tmp_path / "spool")
+        recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        recorder.persist(first, authorization, (_capture(),))
+        first_directory = spool.work_item_request_directory(work_item_id=first.id, attempt=first.attempts, request_number=1)
+        connection.execute(
+            "UPDATE ops.sync_work_items SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=%s",
+            (first.id,),
+        )
+        second_provider_id, second_season_id, _run_id, second_work_item_id, second_gate = _enqueue_q06_runner_work(connection, f"second-{suffix}")
+        second = PostgresSyncRepository(connection, second_gate).claim_next(f"q06-evict-second-{suffix}")
+        assert second is not None and second.id == second_work_item_id
+        spool._max_bytes = sum(  # type: ignore[attr-defined]
+            path.stat().st_size for path in spool.root.rglob("*")
+            if path.is_file() and path.name != ".spool.lock"
+        ) + 1
+
+        recorder.persist(second, second_gate.before_enqueue(SyncWorkRequest(second_provider_id, second_season_id, "fixtures")), (_capture(),))
+
+        second_directory = spool.work_item_request_directory(work_item_id=second.id, attempt=second.attempts, request_number=1)
+        assert not first_directory.exists()
+        assert second_directory.exists()
+
+
+def test_q06_fallback_item_scope_is_checked_for_configured_credential(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    secret = "q06-fallback-scope-secret"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        item, authorization = _item(connection, uuid.uuid4().hex)
+        scoped_item = dataclasses.replace(item, scope={"league": secret})
+        spool = RawSpool(tmp_path / "spool")
+        with pytest.raises(ProvenanceError, match="configured credential") as error:
+            ProviderProvenance(
+                connection, response_contains_api_key=lambda body: secret.encode() in body, spool=spool,
+            ).persist(scoped_item, authorization, (_capture(scope=None),))
+
+        assert secret not in str(error.value)
+        assert not spool.root.exists()
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 0
+
+
 def test_q06_succeeded_exact_db_copy_allows_local_purge_without_db_changes(tmp_path: Path) -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex

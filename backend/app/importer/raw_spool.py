@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import fcntl
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -68,16 +69,35 @@ class RawSpool:
     def set_purge_verifier(self, verifier: Callable[[Path], bool] | None) -> None:
         self._purge_verifier = verifier
 
+    @staticmethod
+    def _absolute_path(path: Path) -> Path:
+        """Normalize lexically without resolving (and following) symlinks."""
+        return Path(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+    @staticmethod
+    def _reject_symlink_components(path: Path) -> None:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                if current.is_symlink():
+                    raise RawSpoolError("raw spool path contains a symlink")
+            except OSError as error:
+                raise RawSpoolError("raw spool path cannot be inspected") from error
+            if not current.exists():
+                break
+
+    def _root_path(self) -> Path:
+        root = self._absolute_path(self._root)
+        self._reject_symlink_components(root)
+        return root
+
     def _validate_directory(self, directory: Path) -> None:
-        root = self._root.absolute()
-        candidate = directory.absolute()
+        root = self._root_path()
+        candidate = self._absolute_path(directory)
         if candidate == root or root not in candidate.parents:
             raise RawSpoolError("refusing to access path outside raw spool")
-        current = candidate
-        while current != root:
-            if current.is_symlink():
-                raise RawSpoolError("raw spool path contains a symlink")
-            current = current.parent
+        self._reject_symlink_components(candidate)
 
     class _Lock:
         def __init__(self, spool: "RawSpool") -> None:
@@ -85,10 +105,26 @@ class RawSpool:
             self.handle: Any = None
 
         def __enter__(self) -> "RawSpool._Lock":
-            self.spool._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lock_path = self.spool._root / ".spool.lock"
-            self.handle = open(lock_path, "a+b")
-            os.chmod(lock_path, 0o600)
+            root = self.spool._root_path()
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.spool._reject_symlink_components(root)
+            try:
+                root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError as error:
+                raise RawSpoolError("raw spool root cannot be opened safely") from error
+            try:
+                lock_descriptor = os.open(
+                    ".spool.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as error:
+                raise RawSpoolError("raw spool lock cannot be opened safely") from error
+            finally:
+                os.close(root_descriptor)
+            self.handle = os.fdopen(lock_descriptor, "a+b")
+            os.chmod(root / ".spool.lock", 0o600, follow_symlinks=False)
             fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
             return self
 
@@ -390,12 +426,71 @@ class RawSpool:
             return 0
         return sum(path.stat().st_size for path in self._root.rglob("*") if path.name != ".spool.lock" and path.is_file() and not path.is_symlink())
 
+    def _directory_size_unlocked(self, directory: Path) -> int:
+        return sum(
+            path.stat().st_size
+            for path in directory.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+
+    def _repeatable_identity_unlocked(self, directory: Path) -> tuple[int, int, int | None] | None:
+        """Return the identity encoded by a known Q06 directory, if any."""
+        try:
+            parts = self._absolute_path(directory).relative_to(self._root_path()).parts
+        except ValueError:
+            return None
+        if (
+            len(parts) != 4
+            or parts[0] != "repeatable"
+            or not (work_match := re.fullmatch(r"work-item-([1-9][0-9]*)", parts[1]))
+            or not (attempt_match := re.fullmatch(r"attempt-([1-9][0-9]*)", parts[2]))
+        ):
+            return None
+        request_match = re.fullmatch(r"request-([0-9]{6})", parts[3])
+        if request_match and int(request_match.group(1)) > 0:
+            return int(work_match.group(1)), int(attempt_match.group(1)), int(request_match.group(1))
+        if re.fullmatch(r"\.purging-[0-9a-f]+", parts[3]):
+            return int(work_match.group(1)), int(attempt_match.group(1)), None
+        return None
+
+    def _verified_q06_candidate_unlocked(self, directory: Path) -> bool:
+        identity = self._repeatable_identity_unlocked(directory)
+        marker = directory / ".durable"
+        if (
+            identity is None
+            or not directory.is_dir()
+            or directory.is_symlink()
+            or not marker.is_file()
+            or marker.is_symlink()
+            or self._purge_verifier is None
+        ):
+            return False
+        try:
+            return self._purge_verifier(directory)
+        except Exception:
+            return False
+
+    def _recover_quarantines_unlocked(self) -> None:
+        if not self._root.exists():
+            return
+        quarantines = sorted(
+            (
+                marker.parent for marker in self._root.rglob(".durable")
+                if marker.parent.name.startswith(".purging-")
+                and self._repeatable_identity_unlocked(marker.parent) is not None
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+        for directory in quarantines:
+            self._purge_verified_q06_unlocked(directory)
+
     def enforce_limit(self) -> None:
         with self._lock():
             self._enforce_limit_unlocked()
 
     def _enforce_limit_unlocked(self, *, required: int = 0) -> None:
         """Evict only DB-backed captures; never an uncommitted replay input."""
+        self._recover_quarantines_unlocked()
         if self._max_bytes is None or not self._root.exists():
             return
         total = self._size_unlocked()
@@ -404,19 +499,31 @@ class RawSpool:
         candidates = sorted(
             (
                 marker.parent for marker in self._root.rglob(".durable")
-                if marker.is_file() and not marker.is_symlink() and not marker.parent.name.startswith(".purging-")
+                if marker.is_file() and not marker.is_symlink() and self._repeatable_identity_unlocked(marker.parent) is not None
             ),
             key=lambda path: path.stat().st_mtime,
         )
+        selected: list[Path] = []
+        releasable = 0
         for directory in candidates:
-            if total + required <= self._max_bytes:
-                return
-            if self._purge_verifier is None or not self._purge_verifier(directory):
+            if not self._verified_q06_candidate_unlocked(directory):
                 continue
-            self._purge_generation_unlocked(directory)
-            total = self._size_unlocked()
-        if total + required > self._max_bytes:
+            selected.append(directory)
+            releasable += self._directory_size_unlocked(directory)
+            if total + required - releasable <= self._max_bytes:
+                break
+        # Do not remove one proven copy if the whole verified set cannot make
+        # room.  This keeps a capacity failure non-destructive.
+        if total + required - releasable > self._max_bytes:
             raise RawSpoolCapacityError("raw spool capacity is exhausted")
+        # Recheck every selected candidate before the first rename.  DB state
+        # can change while a verifier is reading it, whereas this root lock
+        # serializes all cooperating filesystem users.
+        if not all(self._verified_q06_candidate_unlocked(directory) for directory in selected):
+            raise RawSpoolCapacityError("raw spool capacity is exhausted")
+        for directory in selected:
+            if not self._purge_verified_q06_unlocked(directory):
+                raise RawSpoolCapacityError("raw spool capacity is exhausted")
 
     def discard_partial(self, directory: Path, request: BaseRequest) -> bool:
         """Recover only an interrupted single-endpoint write before refetching it."""
@@ -439,50 +546,74 @@ class RawSpool:
         return True
 
     def purge_generation(self, directory: Path) -> None:
-        """Delete only a known completed capture directory, never the spool root."""
+        """Delete a Q06 request only after its DB-backed proof succeeds."""
         self._validate_directory(directory)
         with self._lock():
-            self._purge_generation_unlocked(directory)
+            if not self._purge_verified_q06_unlocked(directory):
+                raise RawSpoolError("raw spool Q06 capture is not proven safe to purge")
 
-    def _purge_generation_unlocked(self, directory: Path) -> None:
+    def purge_legacy_generation(self, directory: Path) -> None:
+        """Explicit bootstrap-only cleanup for a completed legacy generation."""
+        self._validate_directory(directory)
+        with self._lock():
+            self._purge_legacy_generation_unlocked(directory)
+
+    def _purge_legacy_generation_unlocked(self, directory: Path) -> None:
         if not directory.is_dir() or directory.is_symlink():
             raise RawSpoolError("refusing to purge outside raw spool")
-        relative = directory.absolute().relative_to(self._root.absolute())
+        relative = self._absolute_path(directory).relative_to(self._root_path())
         parts = relative.parts
         known_generation = (
-            len(parts) == 3 and parts[0].startswith("run-") and
-            parts[1].startswith("league-") and parts[2].startswith("generation-")
+            len(parts) == 3 and re.fullmatch(r"run-[1-9][0-9]*", parts[0]) and
+            re.fullmatch(r"league-[1-9][0-9]*-season-[1-9][0-9]*", parts[1]) and
+            re.fullmatch(r"generation-[1-9][0-9]*", parts[2])
         )
-        known_request = (
-            len(parts) == 4 and parts[0] == "repeatable" and parts[1].startswith("work-item-") and
-            parts[2].startswith("attempt-") and parts[3].startswith("request-")
-        )
-        known_attempt = (
-            len(parts) == 3 and parts[0] == "repeatable" and parts[1].startswith("work-item-") and
-            parts[2].startswith("attempt-")
-        )
-        known_catalogue = len(parts) == 2 and parts[0] == "catalogue"
-        if not (known_generation or known_request or known_attempt or known_catalogue):
-            raise RawSpoolError("raw spool directory is not a known capture")
+        if not known_generation:
+            raise RawSpoolError("raw spool directory is not a legacy generation")
         quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
         directory.rename(quarantine)
-        for item in quarantine.iterdir():
+        self._remove_quarantine_unlocked(quarantine)
+
+    def _purge_verified_q06_unlocked(self, directory: Path) -> bool:
+        if not self._verified_q06_candidate_unlocked(directory):
+            return False
+        if directory.name.startswith(".purging-"):
+            self._remove_quarantine_unlocked(directory)
+            return True
+        quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
+        directory.rename(quarantine)
+        # A rename is recoverable but not a proof: verify the same bytes and
+        # metadata again under their quarantine name before deletion.
+        if not self._verified_q06_candidate_unlocked(quarantine):
+            quarantine.rename(directory)
+            return False
+        self._remove_quarantine_unlocked(quarantine)
+        return True
+
+    @staticmethod
+    def _remove_quarantine_unlocked(quarantine: Path) -> None:
+        entries = tuple(quarantine.iterdir())
+        if any(not item.is_file() and not item.is_symlink() for item in entries):
+            raise RawSpoolError("raw spool generation has an unexpected nested directory")
+        for item in entries:
             if item.is_file() or item.is_symlink():
                 item.unlink()
-            else:
-                raise RawSpoolError("raw spool generation has an unexpected nested directory")
         quarantine.rmdir()
 
     def latest_catalogue(self) -> RawSpoolArtifact | None:
         """Recover a staged catalogue after a crash before queue creation."""
-        directory = self._root / "catalogue"
+        with self._lock():
+            return self._latest_catalogue_unlocked()
+
+    def _latest_catalogue_unlocked(self) -> RawSpoolArtifact | None:
+        directory = self._root_path() / "catalogue"
         if not directory.is_dir():
             return None
         request = BaseRequest("/leagues", {})
         candidates = sorted((path for path in directory.iterdir() if path.is_dir() and (path / ".queue-pending").is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
         for candidate in candidates:
             try:
-                value = self.load(candidate, request)
+                value = self._load_unlocked(candidate, request)
             except RawSpoolError:
                 continue
             if value is not None:
@@ -490,13 +621,25 @@ class RawSpool:
         return None
 
     def mark_catalogue_pending(self, directory: Path) -> None:
-        self._write_atomic(directory / ".queue-pending", b"pending\n")
+        self._validate_directory(directory)
+        with self._lock():
+            relative = self._absolute_path(directory).relative_to(self._root_path()).parts
+            if len(relative) != 2 or relative[0] != "catalogue" or not directory.is_dir() or directory.is_symlink():
+                raise RawSpoolError("raw spool directory is not a catalogue artifact")
+            marker = directory / ".queue-pending"
+            if marker.exists():
+                if not marker.is_file() or marker.is_symlink():
+                    raise RawSpoolError("unsafe raw spool catalogue marker")
+                return
+            self._ensure_capacity(len(b"pending\n"))
+            self._write_atomic(marker, b"pending\n")
 
     def consume_pending_catalogues(self) -> None:
-        directory = self._root / "catalogue"
-        if not directory.is_dir():
-            return
-        for candidate in directory.iterdir():
-            marker = candidate / ".queue-pending"
-            if candidate.is_dir() and marker.is_file() and not marker.is_symlink():
-                marker.unlink()
+        with self._lock():
+            directory = self._root_path() / "catalogue"
+            if not directory.is_dir() or directory.is_symlink():
+                return
+            for candidate in directory.iterdir():
+                marker = candidate / ".queue-pending"
+                if candidate.is_dir() and not candidate.is_symlink() and marker.is_file() and not marker.is_symlink():
+                    marker.unlink()

@@ -48,12 +48,19 @@ def test_q06_raw_capture_rejects_credential_bearing_metadata() -> None:
 def test_q06_spool_refuses_over_limit_without_db_proof(tmp_path: Path) -> None:
     spool = RawSpool(tmp_path / "spool", max_bytes=10_000)
     now = datetime.now(UTC)
-    artifact = RawSpoolArtifact(BaseRequest("/fixtures", {"league": 39}), _response(), now, now)
-    durable = spool.work_item_directory(work_item_id=1, attempt=1)
-    active = spool.work_item_directory(work_item_id=2, attempt=1)
+    artifact = RawSpoolArtifact(
+        BaseRequest("/fixtures", {"league": 39}), _response(), now, now,
+        {"league": 39}, 1, 1, "fixtures-v1", "scheduled_refresh", "standard",
+        "work-item-1:attempt-1:request-000001",
+    )
+    durable = spool.work_item_request_directory(work_item_id=1, attempt=1, request_number=1)
+    active = spool.work_item_request_directory(work_item_id=2, attempt=1, request_number=1)
     spool.stage(durable, artifact)
     spool.mark_durable(durable)
-    spool.stage(active, artifact)
+    spool.stage(active, RawSpoolArtifact(
+        artifact.request, artifact.response, now, now, {"league": 39}, 2, 1,
+        "fixtures-v1", "scheduled_refresh", "standard", "work-item-2:attempt-1:request-000001",
+    ))
 
     # A durable marker is only a candidate.  Without a read-only DB verifier,
     # both captures remain available and the bounded store refuses growth.
@@ -68,19 +75,26 @@ def test_q06_spool_refuses_over_limit_without_db_proof(tmp_path: Path) -> None:
 def test_q06_spool_purges_only_verified_durable_capture(tmp_path: Path) -> None:
     spool = RawSpool(tmp_path / "spool", max_bytes=10_000)
     now = datetime.now(UTC)
-    artifact = RawSpoolArtifact(BaseRequest("/fixtures", {"league": 39}), _response(), now, now)
-    durable = spool.work_item_directory(work_item_id=1, attempt=1)
-    active = spool.work_item_directory(work_item_id=2, attempt=1)
+    artifact = RawSpoolArtifact(
+        BaseRequest("/fixtures", {"league": 39}), _response(), now, now,
+        {"league": 39}, 1, 1, "fixtures-v1", "scheduled_refresh", "standard",
+        "work-item-1:attempt-1:request-000001",
+    )
+    durable = spool.work_item_request_directory(work_item_id=1, attempt=1, request_number=1)
+    active = spool.work_item_request_directory(work_item_id=2, attempt=1, request_number=1)
     spool.stage(durable, artifact)
     spool.mark_durable(durable)
-    spool.stage(active, artifact)
+    spool.stage(active, RawSpoolArtifact(
+        artifact.request, artifact.response, now, now, {"league": 39}, 2, 1,
+        "fixtures-v1", "scheduled_refresh", "standard", "work-item-2:attempt-1:request-000001",
+    ))
     spool._max_bytes = sum(path.stat().st_size for path in active.iterdir())  # type: ignore[attr-defined]
 
     with pytest.raises(RawSpoolCapacityError):
         spool.enforce_limit()
     assert durable.exists()
 
-    spool.set_purge_verifier(lambda path: path.name == "attempt-1" and path.parent.name == "work-item-1")
+    spool.set_purge_verifier(lambda path: path.parent.parent.name == "work-item-1")
     spool.enforce_limit()
     assert not durable.exists()
     assert active.exists()
@@ -107,6 +121,61 @@ def test_q06_spool_rejects_symlinked_purge_path(tmp_path: Path) -> None:
 
     with pytest.raises(RawSpoolError):
         spool.purge_generation(link / "league-1-season-2026" / "generation-1")
+
+
+def test_q06_public_purge_never_deletes_unproven_repeatable_capture(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool", purge_verifier=lambda _directory: True)
+    now = datetime.now(UTC)
+    directory = spool.work_item_request_directory(work_item_id=1, attempt=1, request_number=1)
+    spool.stage(directory, RawSpoolArtifact(
+        BaseRequest("/fixtures", {"league": 39}), _response(), now, now,
+        {"league": 39}, 1, 1, "fixtures-v1", "scheduled_refresh", "standard",
+        "work-item-1:attempt-1:request-000001",
+    ))
+
+    with pytest.raises(RawSpoolError, match="not proven"):
+        spool.purge_generation(directory)
+
+    assert directory.exists()
+
+
+def test_q06_spool_rejects_lexically_escaped_or_symlinked_root_and_lock(tmp_path: Path) -> None:
+    root = tmp_path / "spool"
+    outside = tmp_path / "outside"
+    escaped = root / ".." / "outside" / "repeatable" / "work-item-1" / "attempt-1" / "request-000001"
+    with pytest.raises(RawSpoolError):
+        RawSpool(root).stage(escaped, RawSpoolArtifact(BaseRequest("/fixtures", {}), _response(), datetime.now(UTC), datetime.now(UTC)))
+
+    target = tmp_path / "target"
+    target.mkdir()
+    root_link = tmp_path / "spool-link"
+    root_link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(RawSpoolError):
+        RawSpool(root_link).stage(
+            root_link / "repeatable" / "work-item-1" / "attempt-1" / "request-000001",
+            RawSpoolArtifact(BaseRequest("/fixtures", {}), _response(), datetime.now(UTC), datetime.now(UTC)),
+        )
+
+    root.mkdir()
+    (root / ".spool.lock").symlink_to(outside)
+    with pytest.raises(RawSpoolError):
+        RawSpool(root).stage(
+            root / "repeatable" / "work-item-1" / "attempt-1" / "request-000001",
+            RawSpoolArtifact(BaseRequest("/fixtures", {}), _response(), datetime.now(UTC), datetime.now(UTC)),
+        )
+
+
+def test_q06_catalogue_marker_reserves_root_capacity(tmp_path: Path) -> None:
+    spool = RawSpool(tmp_path / "spool", max_bytes=10_000)
+    now = datetime.now(UTC)
+    directory = spool.root / "catalogue" / "digest"
+    spool.stage(directory, RawSpoolArtifact(BaseRequest("/leagues", {}), _response(), now, now))
+    spool._max_bytes = sum(path.stat().st_size for path in spool.root.rglob("*") if path.is_file())  # type: ignore[attr-defined]
+
+    with pytest.raises(RawSpoolCapacityError):
+        spool.mark_catalogue_pending(directory)
+
+    assert not (directory / ".queue-pending").exists()
 
 
 @dataclass
