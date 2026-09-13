@@ -13,9 +13,11 @@ from pathlib import Path
 
 import psycopg
 import pytest
+import httpx
 from psycopg.types.json import Jsonb
 
 from app.api_football import APIFootballClient, APIFootballResponse
+from app.api_football.budget import PostgresAPIFootballBudget
 from app.importer.raw_spool import RawSpool, RawSpoolArtifact, RawSpoolCapacityError, RawSpoolError
 from app.importer.season_bootstrap import BaseRequest
 from app.sync.dispatch import Q03DispatchRegistry
@@ -158,6 +160,40 @@ def _concurrent_db_cleanup(url: str, root: str, barrier: Any, results: Any) -> N
         results.put("capacity")
     except BaseException as error:
         results.put(type(error).__name__)
+
+
+def _reset_q04_budget(
+    connection: psycopg.Connection, *, daily: int = 10, minute: int = 10, operations: int = 10,
+) -> None:
+    connection.execute(
+        """UPDATE ops.api_football_budget_config
+              SET daily_limit=%s,minute_limit=%s,operations_limit=%s,
+                  history_limit=0,legacy_manual_limit=0,protected_reserve=0
+            WHERE singleton""",
+        (daily, minute, operations),
+    )
+    connection.execute("DELETE FROM ops.api_football_budget_state")
+
+
+class _MeteredFixturesDispatch:
+    def __init__(self, client: APIFootballClient) -> None:
+        self.client = client
+        self.applied = 0
+
+    def fetch(self, item: LeasedWorkItem, _authorization: AuthorizedSyncWork) -> WorkResult:
+        started_at = datetime.now(UTC)
+        response = asyncio.run(self.client.get_once("/fixtures", params={"league": 39}))
+        received_at = datetime.now(UTC)
+        return WorkResult(
+            {"provider_results": response.data.get("results")},
+            raw_fetches=(RawFetchCapture(
+                "/fixtures", {"league": 39}, response, started_at, received_at,
+                "fixtures-v1", scope=dict(item.scope),
+            ),),
+        )
+
+    def apply_result(self, _writer, _item: LeasedWorkItem, _result: WorkResult) -> None:
+        self.applied += 1
 
 
 def test_credential_bearing_raw_never_reaches_spool_or_database(tmp_path: Path) -> None:
@@ -887,6 +923,7 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection, operations=0)
         _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
         owner = f"q06-spool-{suffix}"
         spool = RawSpool(tmp_path / "spool")
@@ -921,9 +958,22 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
         ).fetchone()[0] == 0
         _requeue_for_replay(connection, work_item_id, owner)
 
+        http_calls = 0
+
+        def forbidden_http(_request: httpx.Request) -> httpx.Response:
+            nonlocal http_calls
+            http_calls += 1
+            return httpx.Response(200, json={"errors": {}, "response": []})
+
+        replay_client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(forbidden_http),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+
         class SpoolReplayDispatch:
-            def __init__(self) -> None:
-                self.http_calls = 0
+            def __init__(self, client: APIFootballClient) -> None:
+                self.client = client
+                self.fetch_calls = 0
 
             def replay(self, item, _authorization, recorder):
                 with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
@@ -941,24 +991,32 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
                 return WorkResult({}, source_fetch_ids=(saved.fetch_id,), replay_normalization_version="fixtures-v2")
 
             def fetch(self, *_args):
-                self.http_calls += 1
+                self.fetch_calls += 1
+                asyncio.run(self.client.get_once("/fixtures", params={"league": 39}))
                 raise AssertionError("spool replay must not call the provider")
 
             def apply_result(self, _writer, _item, _result):
                 pass
 
-        dispatch = SpoolReplayDispatch()
-        with psycopg.connect(TEST_DB_URL) as recovery_connection:
-            second_recorder = ProviderProvenance(
-                recovery_connection, response_contains_api_key=lambda _body: False, spool=spool,
-            )
-            second_worker = RepeatableSyncWorker(
-                recovery_connection, gate, owner,
-                heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
-                provenance=second_recorder,
-            )
-            assert second_worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
-        assert dispatch.http_calls == 0
+        dispatch = SpoolReplayDispatch(replay_client)
+        try:
+            with psycopg.connect(TEST_DB_URL) as recovery_connection:
+                second_recorder = ProviderProvenance(
+                    recovery_connection, response_contains_api_key=lambda _body: False, spool=spool,
+                )
+                second_worker = RepeatableSyncWorker(
+                    recovery_connection, gate, owner,
+                    heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                    provenance=second_recorder,
+                )
+                assert second_worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
+        finally:
+            asyncio.run(replay_client.aclose())
+        assert dispatch.fetch_calls == 0
+        assert http_calls == 0
+        assert connection.execute(
+            "SELECT count(*) FROM ops.api_football_budget_state",
+        ).fetchone() == (0,)
         row = connection.execute(
             """SELECT provider_fetch.sync_work_item_attempt,provider_fetch.normalization_version,
                       provider_fetch.purpose,payload.retention_class,provider_fetch.request_started_at,
@@ -1664,3 +1722,391 @@ def test_q06_hash_change_after_replay_load_blocks_fenced_domain_write() -> None:
         assert connection.execute(
             "SELECT count(*) FROM source.provider_fetch_replays WHERE source_fetch_id=%s", (fetch_id,),
         ).fetchone()[0] == 0
+
+
+def test_q06_registered_fetch_commits_one_budget_debit_raw_and_completion() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    calls: list[str] = []
+
+    def http_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(
+            200,
+            content=b'{"errors":{},"results":0,"paging":{"current":1,"total":1},"response":[]}',
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection)
+        _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(http_handler),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        dispatch = _MeteredFixturesDispatch(client)
+        worker = RepeatableSyncWorker(
+            connection, gate, f"q06-budget-success-{suffix}",
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=ProviderProvenance(
+                connection, response_contains_api_key=client.response_contains_api_key,
+            ),
+        )
+        try:
+            assert worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
+        finally:
+            asyncio.run(client.aclose())
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        assert calls == ["https://v3.football.api-sports.io/fixtures?league=39"]
+        assert observer.execute(
+            "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton"
+        ).fetchone() == (1, 1, 1)
+        assert observer.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (work_item_id,),
+        ).fetchone() == ("succeeded", {"provider_results": 0})
+        fetch_id = observer.execute(
+            "SELECT id FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+        ).fetchone()[0]
+        assert observer.execute(
+            "SELECT inline_body IS NOT NULL,purged_at FROM source.provider_raw_payloads WHERE fetch_id=%s",
+            (fetch_id,),
+        ).fetchone() == (True, None)
+        assert dispatch.applied == 1
+
+
+@pytest.mark.parametrize("mode", ("denied", "unavailable"))
+def test_q06_registered_budget_failure_defers_same_item_before_http(mode: str) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    calls = 0
+
+    def http_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"errors": {}, "results": 0, "response": []})
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection, operations=0)
+        config = connection.execute(
+            """SELECT daily_limit,minute_limit,operations_limit,history_limit,
+                      legacy_manual_limit,protected_reserve
+                 FROM ops.api_football_budget_config WHERE singleton"""
+        ).fetchone()
+        assert config is not None
+        if mode == "unavailable":
+            connection.execute("DELETE FROM ops.api_football_budget_config WHERE singleton")
+        _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        stable_key = connection.execute(
+            "SELECT stable_key FROM ops.sync_work_items WHERE id=%s", (work_item_id,),
+        ).fetchone()[0]
+        client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(http_handler),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        dispatch = _MeteredFixturesDispatch(client)
+        worker = RepeatableSyncWorker(
+            connection, gate, f"q06-budget-{mode}-{suffix}",
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=ProviderProvenance(connection, response_contains_api_key=client.response_contains_api_key),
+        )
+        try:
+            assert worker.run_registered_once(Q03DispatchRegistry({"fixtures": dispatch})) is True
+        finally:
+            asyncio.run(client.aclose())
+            if mode == "unavailable":
+                connection.execute(
+                    """INSERT INTO ops.api_football_budget_config(
+                           singleton,daily_limit,minute_limit,operations_limit,history_limit,
+                           legacy_manual_limit,protected_reserve
+                       ) VALUES(true,%s,%s,%s,%s,%s,%s)""",
+                    config,
+                )
+
+        row = connection.execute(
+            """SELECT status,stable_key,checkpoint,attempts,attempts_in_budget,
+                      finished_at,last_error
+                 FROM ops.sync_work_items WHERE id=%s""",
+            (work_item_id,),
+        ).fetchone()
+        assert row[:6] == (
+            "pending", stable_key, {}, 1, 0, None,
+        )
+        assert row[6] == "budget_pending"
+        assert calls == 0
+        assert dispatch.applied == 0
+        assert connection.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("retry_after", (None, "120"), ids=("base-cooldown", "numeric-retry-after"))
+def test_q06_registered_429_sets_shared_cooldown_and_blocks_next_http(retry_after: str | None) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    calls: list[int] = []
+
+    def first_http(_request: httpx.Request) -> httpx.Response:
+        calls.append(429)
+        headers = {"retry-after": retry_after} if retry_after is not None else {}
+        return httpx.Response(429, headers=headers, json={"errors": {}, "response": []})
+
+    def forbidden_http(_request: httpx.Request) -> httpx.Response:
+        calls.append(200)
+        return httpx.Response(200, json={"errors": {}, "response": []})
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection)
+        _provider_id, _season_id, _run_id, first_item_id, first_gate = _enqueue_q06_runner_work(connection, suffix + "a")
+        first_client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(first_http),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        try:
+            first_worker = RepeatableSyncWorker(
+                connection, first_gate, f"q06-429-first-{suffix}",
+                heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                provenance=ProviderProvenance(connection, response_contains_api_key=first_client.response_contains_api_key),
+            )
+            assert first_worker.run_registered_once(
+                Q03DispatchRegistry({"fixtures": _MeteredFixturesDispatch(first_client)}),
+            ) is True
+        finally:
+            asyncio.run(first_client.aclose())
+
+        _provider_id, _season_id, _run_id, second_item_id, second_gate = _enqueue_q06_runner_work(connection, suffix + "b")
+        second_client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(forbidden_http),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        try:
+            second_worker = RepeatableSyncWorker(
+                connection, second_gate, f"q06-429-second-{suffix}",
+                heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                provenance=ProviderProvenance(connection, response_contains_api_key=second_client.response_contains_api_key),
+            )
+            assert second_worker.run_registered_once(
+                Q03DispatchRegistry({"fixtures": _MeteredFixturesDispatch(second_client)}),
+            ) is True
+        finally:
+            asyncio.run(second_client.aclose())
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        state = observer.execute(
+            "SELECT daily_used,operations_used,cooldown_until FROM ops.api_football_budget_state WHERE singleton"
+        ).fetchone()
+        assert state[:2] == (1, 1)
+        assert state[2] is not None
+        if retry_after is not None:
+            assert state[2] >= datetime.now(UTC) + timedelta(seconds=100)
+        assert calls == [429]
+        assert observer.execute(
+            "SELECT status,last_error FROM ops.sync_work_items WHERE id=ANY(%s) ORDER BY id",
+            ([first_item_id, second_item_id],),
+        ).fetchall() == [("pending", "budget_pending"), ("pending", "budget_pending")]
+
+
+@pytest.mark.parametrize("failure", ("timeout", "observe"))
+def test_q06_physical_request_debit_survives_timeout_or_observe_failure(failure: str) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    calls = 0
+    trigger = f"q06_observe_fail_{suffix}"
+    function = f"ops.q06_observe_fail_{suffix}"
+
+    def http_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure == "timeout":
+            raise httpx.ReadTimeout("simulated timeout", request=request)
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as breaker:
+            breaker.execute(
+                f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                "BEGIN RAISE EXCEPTION 'simulated observe failure'; END $$",
+            )
+            breaker.execute(
+                f"CREATE TRIGGER {trigger} BEFORE UPDATE ON ops.api_football_budget_state "
+                f"FOR EACH ROW EXECUTE FUNCTION {function}()",
+            )
+        return httpx.Response(
+            200,
+            headers={"x-ratelimit-limit": "10", "x-ratelimit-remaining": "9"},
+            json={"errors": {}, "results": 0, "response": []},
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection)
+        _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(http_handler),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        worker = RepeatableSyncWorker(
+            connection, gate, f"q06-{failure}-{suffix}",
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=ProviderProvenance(connection, response_contains_api_key=client.response_contains_api_key),
+        )
+        try:
+            assert worker.run_registered_once(
+                Q03DispatchRegistry({"fixtures": _MeteredFixturesDispatch(client)}),
+            ) is True
+        finally:
+            asyncio.run(client.aclose())
+            if failure == "observe":
+                connection.execute(f"DROP TRIGGER IF EXISTS {trigger} ON ops.api_football_budget_state")
+                connection.execute(f"DROP FUNCTION IF EXISTS {function}()")
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        assert calls == 1
+        assert observer.execute(
+            "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton"
+        ).fetchone() == (1, 1, 1)
+        status, attempts_in_budget, last_error, finished_at = observer.execute(
+            "SELECT status,attempts_in_budget,last_error,finished_at FROM ops.sync_work_items WHERE id=%s",
+            (work_item_id,),
+        ).fetchone()
+        assert (status, finished_at) == ("pending", None)
+        assert (attempts_in_budget, last_error) == (
+            (1, "provider_http_0") if failure == "timeout" else (0, "budget_pending")
+        )
+        assert observer.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+        ).fetchone() == (0,)
+
+
+def test_q06_registered_db_replay_bypasses_exhausted_budget_and_http() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    calls = 0
+
+    def http_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            content=b'{"errors":{},"results":0,"paging":{"current":1,"total":1},"response":[]}',
+        )
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        _reset_q04_budget(connection, operations=1)
+        _provider_id, _season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        owner = f"q06-budget-replay-{suffix}"
+        client = APIFootballClient(
+            "q06-e2e-key", transport=httpx.MockTransport(http_handler),
+            budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+        )
+        recorder = ProviderProvenance(connection, response_contains_api_key=client.response_contains_api_key)
+        worker = RepeatableSyncWorker(
+            connection, gate, owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+            provenance=recorder,
+        )
+        class FailingInitialDispatch(_MeteredFixturesDispatch):
+            def apply_result(self, _writer, _item, _result):
+                raise RuntimeError("domain rollback")
+
+        initial = FailingInitialDispatch(client)
+        with pytest.raises(RuntimeError, match="domain rollback"):
+            worker.run_registered_once(Q03DispatchRegistry({"fixtures": initial}))
+        assert calls == 1
+        fetch_id = connection.execute(
+            "SELECT id FROM source.provider_fetches WHERE sync_work_item_id=%s", (work_item_id,),
+        ).fetchone()[0]
+        _requeue_for_replay(connection, work_item_id, owner)
+
+        class ReplayDispatch(_MeteredFixturesDispatch):
+            def replay(self, item, _authorization, provenance):
+                saved = provenance.latest_replay(item, endpoint="/fixtures", params={"league": 39})
+                assert saved is not None and saved.fetch_id == fetch_id
+                return WorkResult(
+                    {"replayed": True}, source_fetch_ids=(saved.fetch_id,),
+                    replay_normalization_version="fixtures-v2",
+                )
+
+        replay = ReplayDispatch(client)
+        try:
+            assert worker.run_registered_once(Q03DispatchRegistry({"fixtures": replay})) is True
+        finally:
+            asyncio.run(client.aclose())
+
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        assert calls == 1
+        assert observer.execute(
+            "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton"
+        ).fetchone() == (1, 1, 1)
+        assert observer.execute(
+            "SELECT status,checkpoint FROM ops.sync_work_items WHERE id=%s", (work_item_id,),
+        ).fetchone() == ("succeeded", {"replayed": True})
+        assert observer.execute(
+            "SELECT count(*) FROM source.provider_fetch_replays WHERE source_fetch_id=%s", (fetch_id,),
+        ).fetchone() == (1,)
+
+
+def test_q06_two_registered_workers_compete_for_one_real_budget_slot() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        _reset_q04_budget(setup, daily=1, minute=1, operations=1)
+        first = _enqueue_q06_runner_work(setup, suffix + "a")
+        second = _enqueue_q06_runner_work(setup, suffix + "b")
+        item_ids = [first[3], second[3]]
+
+    start = threading.Barrier(2)
+    calls: list[int] = []
+    outcomes: list[bool] = []
+    failures: list[BaseException] = []
+    calls_lock = threading.Lock()
+
+    def run(owner: str) -> None:
+        def http_handler(_request: httpx.Request) -> httpx.Response:
+            with calls_lock:
+                calls.append(200)
+            return httpx.Response(
+                200,
+                content=b'{"errors":{},"results":0,"paging":{"current":1,"total":1},"response":[]}',
+            )
+
+        try:
+            with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+                gate = SyncPolicyGate(
+                    PostgresCompetitionSyncPolicyReader(connection), now=lambda: datetime.now(UTC),
+                )
+                client = APIFootballClient(
+                    "q06-e2e-key", transport=httpx.MockTransport(http_handler),
+                    budget=PostgresAPIFootballBudget(TEST_DB_URL), budget_consumer="operations",
+                )
+                worker = RepeatableSyncWorker(
+                    connection, gate, owner,
+                    heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                    provenance=ProviderProvenance(
+                        connection, response_contains_api_key=client.response_contains_api_key,
+                    ),
+                )
+                try:
+                    start.wait(timeout=5)
+                    outcomes.append(worker.run_registered_once(
+                        Q03DispatchRegistry({"fixtures": _MeteredFixturesDispatch(client)}),
+                    ))
+                finally:
+                    asyncio.run(client.aclose())
+        except BaseException as error:
+            failures.append(error)
+
+    left = threading.Thread(target=run, args=(f"q06-last-slot-left-{suffix}",))
+    right = threading.Thread(target=run, args=(f"q06-last-slot-right-{suffix}",))
+    left.start(); right.start(); left.join(timeout=10); right.join(timeout=10)
+
+    assert not left.is_alive() and not right.is_alive()
+    assert failures == []
+    assert outcomes == [True, True]
+    assert calls == [200]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        assert observer.execute(
+            "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton"
+        ).fetchone() == (1, 1, 1)
+        assert observer.execute(
+            "SELECT status,count(*) FROM ops.sync_work_items WHERE id=ANY(%s) GROUP BY status ORDER BY status",
+            (item_ids,),
+        ).fetchall() == [("pending", 1), ("succeeded", 1)]
+        assert observer.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=ANY(%s)", (item_ids,),
+        ).fetchone() == (1,)
