@@ -1,4 +1,10 @@
-"""Crash-safe local landing zone for pre-canonical provider responses."""
+"""Crash-safe local landing zone for pre-canonical provider responses.
+
+All filesystem operations use the root lock; DB verification is performed while
+that short lock is held, and HTTP is never part of the critical section.  A
+verified purge first renames its directory to ``.purging-*`` so an interrupted
+cleanup remains visible and is never mistaken for replay input.
+"""
 
 from __future__ import annotations
 
@@ -324,6 +330,10 @@ class RawSpool:
                 raise RawSpoolError("unsafe raw spool work attempt directory")
             attempt = int(attempt_value)
             for request_directory in sorted(attempt_directory.iterdir(), key=lambda path: path.name):
+                if request_directory.name.startswith(".purging-"):
+                    # A prior process may have crashed after quarantine rename;
+                    # keep it for inspection and never treat it as replay input.
+                    continue
                 if (
                     not request_directory.is_dir()
                     or request_directory.is_symlink()

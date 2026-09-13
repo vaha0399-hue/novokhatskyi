@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from psycopg import Connection
+from psycopg import Connection, Error as PsycopgError
 from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
@@ -272,7 +272,9 @@ class ProviderProvenance:
             endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
             if not isinstance(endpoint, str) or not isinstance(params, Mapping):
                 return False
-            artifact = self._spool.load(directory, BaseRequest(endpoint, dict(params)))
+            # enforce_limit already holds the spool-root lock; use the
+            # lock-free reader to avoid re-entering flock on another fd.
+            artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
             if artifact is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
                 return False
             capture = RawFetchCapture(
@@ -303,7 +305,7 @@ class ProviderProvenance:
                     results, paging_current, paging_total, scope, subject_fixture_id,
                     subject_season_id, subject_team_id, expires_at,
                 ) is not None
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError):
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError, PsycopgError):
             return False
 
     def _persist_database(
