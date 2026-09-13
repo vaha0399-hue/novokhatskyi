@@ -14,7 +14,7 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from app.api_football import APIFootballClient, APIFootballResponse
-from app.importer.raw_spool import RawSpool
+from app.importer.raw_spool import RawSpool, RawSpoolArtifact
 from app.importer.season_bootstrap import BaseRequest
 from app.sync.dispatch import Q03DispatchRegistry
 from app.sync.policies import (
@@ -396,6 +396,94 @@ def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: P
                 capture.response.raw_body,
             ),
         ]
+
+
+def test_concurrent_spool_recovery_and_persist_share_one_physical_raw_fetch(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+        item = PostgresSyncRepository(setup, gate).claim_next(f"q06-physical-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        capture = _capture()
+        spool = RawSpool(tmp_path / "spool")
+        request_directory = spool.work_item_request_directory(
+            work_item_id=item.id, attempt=item.attempts, request_number=1,
+        )
+        physical_request_id = f"work-item-{item.id}:attempt-{item.attempts}:request-000001"
+        spool.stage(
+            request_directory,
+            RawSpoolArtifact(
+                BaseRequest(capture.endpoint, dict(capture.params)),
+                capture.response,
+                capture.request_started_at,
+                capture.response_received_at,
+                dict(item.scope),
+                item.id,
+                item.attempts,
+                capture.normalization_version,
+                capture.purpose,
+                capture.retention_class,
+                physical_request_id,
+            ),
+        )
+        delay_function = f"ops.q06_physical_delay_{suffix}"
+        delay_trigger = f"q06_physical_delay_{suffix}"
+        setup.execute(
+            f"""CREATE FUNCTION {delay_function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END $$""",
+        )
+        setup.execute(
+            f"CREATE TRIGGER {delay_trigger} BEFORE INSERT ON source.provider_fetches "
+            f"FOR EACH ROW EXECUTE FUNCTION {delay_function}()",
+        )
+        barrier = threading.Barrier(2)
+        recovered_ids: list[int] = []
+        failures: list[BaseException] = []
+
+        def recover() -> None:
+            try:
+                with psycopg.connect(TEST_DB_URL) as connection:
+                    recorder = ProviderProvenance(
+                        connection, response_contains_api_key=lambda _body: False, spool=spool,
+                    )
+                    barrier.wait(timeout=2)
+                    recovered = recorder.recover_spooled_raw(item, authorization)
+                    assert len(recovered) == 1
+                    recovered_ids.append(recovered[0].fetch_id)
+            except BaseException as error:
+                failures.append(error)
+
+        left = threading.Thread(target=recover)
+        right = threading.Thread(target=recover)
+        left.start(); right.start(); left.join(); right.join()
+        setup.execute(f"DROP TRIGGER {delay_trigger} ON source.provider_fetches")
+        setup.execute(f"DROP FUNCTION {delay_function}()")
+
+        assert failures == []
+        assert len(recovered_ids) == 2 and recovered_ids[0] == recovered_ids[1]
+        fetch_id = recovered_ids[0]
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (fetch_id,),
+        ).fetchone()[0] == 1
+
+        with psycopg.connect(TEST_DB_URL) as connection:
+            recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+            assert recorder.recover_spooled_raw(item, authorization) == ()
+        with psycopg.connect(TEST_DB_URL) as connection:
+            recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False)
+            persisted = recorder.persist(item, authorization, (capture,))
+            assert tuple(value.fetch_id for value in persisted) == (fetch_id,)
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+        ).fetchone()[0] == 1
+        assert setup.execute(
+            "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (fetch_id,),
+        ).fetchone()[0] == 1
 
 
 def test_real_q03_runner_replays_raw_with_source_links_and_atomic_completion() -> None:

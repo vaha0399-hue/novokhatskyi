@@ -323,6 +323,11 @@ class ProviderProvenance:
                 "scope": capture_scope,
                 "physical_request_id": physical_request_id,
             }
+            expires_at = (
+                None
+                if capture.retention_class == "contract_sample"
+                else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
+            )
             row = self._connection.execute(
                     """INSERT INTO source.provider_fetches(
                            provider_id,endpoint,request_params,request_params_sha256,purpose,
@@ -331,6 +336,8 @@ class ProviderProvenance:
                            request_scope,normalization_version,sync_work_item_id,sync_work_item_attempt,
                            subject_fixture_id,subject_season_id,subject_team_id
                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'success',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT ((request_scope ->> 'physical_request_id'))
+                       WHERE request_scope ? 'physical_request_id' DO NOTHING
                        RETURNING id""",
                     (
                         authorization.request.provider_id, capture.endpoint, Jsonb(_safe_mapping(capture.params)),
@@ -342,7 +349,25 @@ class ProviderProvenance:
                     ),
             ).fetchone()
             if row is None:
-                raise ProvenanceError("provider fetch insert did not return an id")
+                existing = self._matching_physical_request(
+                    item,
+                    authorization,
+                    capture,
+                    source_attempt,
+                    physical_request_id,
+                    results,
+                    paging_current,
+                    paging_total,
+                    scope,
+                    subject_fixture_id,
+                    subject_season_id,
+                    subject_team_id,
+                    expires_at,
+                )
+                if existing is None:
+                    raise ProvenanceError("existing physical request does not match captured raw provenance")
+                persisted.append(PersistedRawFetch(existing, capture))
+                continue
             fetch_id = int(row[0])
             self._connection.execute(
                     """INSERT INTO source.provider_raw_payloads(
@@ -350,11 +375,89 @@ class ProviderProvenance:
                        ) VALUES(%s,%s,'application/json',%s,%s,%s)""",
                     (
                         fetch_id, capture.response.raw_body, len(capture.response.raw_body), capture.retention_class,
-                        None if capture.retention_class == "contract_sample" else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS),
+                        expires_at,
                     ),
             )
             persisted.append(PersistedRawFetch(fetch_id, capture))
         return tuple(persisted)
+
+    def _matching_physical_request(
+        self,
+        item: LeasedWorkItem,
+        authorization: AuthorizedSyncWork,
+        capture: RawFetchCapture,
+        source_attempt: int,
+        physical_request_id: str,
+        results: int | None,
+        paging_current: int | None,
+        paging_total: int | None,
+        scope: Mapping[str, Any],
+        subject_fixture_id: int | None,
+        subject_season_id: int | None,
+        subject_team_id: int | None,
+        expires_at: datetime | None,
+    ) -> int | None:
+        row = self._connection.execute(
+            """SELECT provider_fetch.id
+                 FROM source.provider_fetches provider_fetch
+                 JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                WHERE provider_fetch.request_scope->>'physical_request_id'=%s
+                  AND provider_fetch.provider_id=%s
+                  AND provider_fetch.endpoint=%s
+                  AND provider_fetch.request_params=%s
+                  AND provider_fetch.request_params_sha256=%s
+                  AND provider_fetch.purpose=%s
+                  AND provider_fetch.request_started_at=%s
+                  AND provider_fetch.response_received_at=%s
+                  AND provider_fetch.http_status=%s
+                  AND provider_fetch.outcome='success'
+                  AND provider_fetch.provider_results IS NOT DISTINCT FROM %s
+                  AND provider_fetch.paging_current IS NOT DISTINCT FROM %s
+                  AND provider_fetch.paging_total IS NOT DISTINCT FROM %s
+                  AND provider_fetch.content_sha256=%s
+                  AND provider_fetch.request_scope=%s
+                  AND provider_fetch.normalization_version=%s
+                  AND provider_fetch.sync_work_item_id=%s
+                  AND provider_fetch.sync_work_item_attempt=%s
+                  AND provider_fetch.subject_fixture_id IS NOT DISTINCT FROM %s
+                  AND provider_fetch.subject_season_id IS NOT DISTINCT FROM %s
+                  AND provider_fetch.subject_team_id IS NOT DISTINCT FROM %s
+                  AND payload.inline_body=%s
+                  AND payload.content_type='application/json'
+                  AND payload.content_encoding IS NULL
+                  AND payload.object_key IS NULL
+                  AND payload.byte_count=%s
+                  AND payload.retention_class=%s
+                  AND payload.expires_at IS NOT DISTINCT FROM %s
+                  AND payload.purged_at IS NULL""",
+            (
+                physical_request_id,
+                authorization.request.provider_id,
+                capture.endpoint,
+                Jsonb(_safe_mapping(capture.params)),
+                _params_digest(capture.params),
+                capture.purpose,
+                capture.request_started_at,
+                capture.response_received_at,
+                capture.response.status_code,
+                results,
+                paging_current,
+                paging_total,
+                hashlib.sha256(capture.response.raw_body).digest(),
+                Jsonb(dict(scope)),
+                capture.normalization_version,
+                item.id,
+                source_attempt,
+                subject_fixture_id,
+                subject_season_id,
+                subject_team_id,
+                capture.response.raw_body,
+                len(capture.response.raw_body),
+                capture.retention_class,
+                expires_at,
+            ),
+        ).fetchone()
+        return int(row[0]) if row is not None else None
 
     def latest_replay(self, item: LeasedWorkItem, *, endpoint: str, params: Mapping[str, Any]) -> PersistedRawFetch | None:
         """Return verified durable bytes from an earlier attempt without HTTP."""
