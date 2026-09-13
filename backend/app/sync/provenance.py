@@ -170,6 +170,15 @@ class ProviderProvenance:
         self._connection = connection
         self._response_contains_api_key = response_contains_api_key
         self._spool = spool
+        if spool is not None:
+            spool.set_purge_verifier(self._spool_candidate_is_safe_from_database)
+
+    def _contains_configured_credential(self, capture: RawFetchCapture) -> bool:
+        metadata = json.dumps(
+            {"parameters": _safe_mapping(capture.params), "scope": _safe_mapping(capture.scope or {})},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        return self._response_contains_api_key(capture.response.raw_body + b"\n" + metadata)
 
     def persist(
         self, item: LeasedWorkItem, authorization: AuthorizedSyncWork, captures: Sequence[RawFetchCapture],
@@ -184,9 +193,9 @@ class ProviderProvenance:
         # database mutation. Its error deliberately contains no raw content.
         for capture in captures:
             try:
-                contains_credential = self._response_contains_api_key(capture.response.raw_body)
-            except Exception as error:
-                raise ProvenanceError("provider response credential check failed") from error
+                contains_credential = self._contains_configured_credential(capture)
+            except Exception:
+                raise ProvenanceError("provider response credential check failed") from None
             if contains_credential:
                 raise ProvenanceError("provider response contains configured credential")
         staged: list[object] = []
@@ -262,6 +271,34 @@ class ProviderProvenance:
         if self._spool is None or not isinstance(directory, Path):
             return False
         try:
+            metadata_files = [path for path in directory.iterdir() if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")]
+            if len(metadata_files) != 1:
+                return False
+            metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+            endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
+            if not isinstance(endpoint, str) or not isinstance(params, Mapping):
+                return False
+            artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
+            if artifact is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
+                return False
+            capture = RawFetchCapture(artifact.request.endpoint, dict(artifact.request.params), artifact.response, artifact.request_started_at, artifact.response_received_at, artifact.normalization_version or "legacy", artifact.purpose or "scheduled_refresh", artifact.retention_class or "standard", artifact.scope)
+            results, paging_current, paging_total = _response_summary(capture.response)
+            scope = {"scope_key": item.scope_key, "job_type": item.job_type, "scope": _safe_mapping(capture.scope or item.scope), "physical_request_id": artifact.physical_request_id}
+            subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope["scope"])
+            expires_at = None if capture.retention_class == "contract_sample" else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
+            with self._connection.transaction():
+                status = self._connection.execute("SELECT status FROM ops.sync_work_items WHERE id=%s", (item.id,)).fetchone()
+                if status is None or status[0] != "succeeded":
+                    return False
+                return self._matching_physical_request(item, authorization, capture, artifact.work_item_attempt, artifact.physical_request_id, results, paging_current, paging_total, scope, subject_fixture_id, subject_season_id, subject_team_id, expires_at) is not None
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError, PsycopgError):
+            return False
+
+    def _spool_candidate_is_safe_from_database(self, directory: object) -> bool:
+        """Verify an existing durable capture after a process restart."""
+        if self._spool is None or not isinstance(directory, Path):
+            return False
+        try:
             metadata_files = [
                 path for path in directory.iterdir()
                 if path.is_file() and not path.is_symlink() and path.name.endswith(".request.json")
@@ -272,42 +309,65 @@ class ProviderProvenance:
             endpoint, params = metadata.get("endpoint"), metadata.get("parameters")
             if not isinstance(endpoint, str) or not isinstance(params, Mapping):
                 return False
-            # enforce_limit already holds the spool-root lock; use the
-            # lock-free reader to avoid re-entering flock on another fd.
             artifact = self._spool._load_unlocked(directory, BaseRequest(endpoint, dict(params)))  # type: ignore[attr-defined]
-            if artifact is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
+            if artifact is None or artifact.work_item_id is None or artifact.work_item_attempt is None or artifact.physical_request_id is None:
                 return False
-            capture = RawFetchCapture(
-                artifact.request.endpoint, dict(artifact.request.params), artifact.response,
-                artifact.request_started_at, artifact.response_received_at,
-                artifact.normalization_version or "legacy", artifact.purpose or "scheduled_refresh",
-                artifact.retention_class or "standard", artifact.scope,
-            )
-            results, paging_current, paging_total = _response_summary(capture.response)
-            scope = {
-                "scope_key": item.scope_key, "job_type": item.job_type,
-                "scope": _safe_mapping(capture.scope or item.scope),
+            scope = _safe_mapping(artifact.scope or {})
+            subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope)
+            results, paging_current, paging_total = _response_summary(artifact.response)
+            expires_at = None if artifact.retention_class == "contract_sample" else artifact.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
+            request_scope = {
+                "scope": scope,
                 "physical_request_id": artifact.physical_request_id,
             }
-            subject_fixture_id, subject_season_id, subject_team_id = _subjects(scope["scope"])
-            expires_at = (
-                None if capture.retention_class == "contract_sample"
-                else capture.response_received_at + timedelta(days=RAW_RETENTION_DAYS)
-            )
             with self._connection.transaction():
-                status = self._connection.execute(
-                    "SELECT status FROM ops.sync_work_items WHERE id=%s", (item.id,),
+                row = self._connection.execute(
+                    """SELECT provider_fetch.id
+                         FROM source.provider_fetches provider_fetch
+                         JOIN source.provider_raw_payloads payload ON payload.fetch_id=provider_fetch.id
+                         JOIN ops.sync_work_items item ON item.id=provider_fetch.sync_work_item_id
+                        WHERE item.status='succeeded'
+                          AND provider_fetch.sync_work_item_id=%s
+                          AND provider_fetch.sync_work_item_attempt=%s
+                          AND provider_fetch.request_scope->>'physical_request_id'=%s
+                          AND provider_fetch.endpoint=%s
+                          AND provider_fetch.request_params=%s
+                          AND provider_fetch.request_params_sha256=%s
+                          AND provider_fetch.purpose=%s
+                          AND provider_fetch.request_started_at=%s
+                          AND provider_fetch.response_received_at=%s
+                          AND provider_fetch.http_status=%s
+                          AND provider_fetch.outcome='success'
+                          AND provider_fetch.provider_results IS NOT DISTINCT FROM %s
+                          AND provider_fetch.paging_current IS NOT DISTINCT FROM %s
+                          AND provider_fetch.paging_total IS NOT DISTINCT FROM %s
+                          AND provider_fetch.content_sha256=%s
+                          AND provider_fetch.request_scope->'scope'=%s
+                          AND provider_fetch.normalization_version=%s
+                          AND provider_fetch.subject_fixture_id IS NOT DISTINCT FROM %s
+                          AND provider_fetch.subject_season_id IS NOT DISTINCT FROM %s
+                          AND provider_fetch.subject_team_id IS NOT DISTINCT FROM %s
+                          AND payload.inline_body=%s
+                          AND payload.content_type='application/json'
+                          AND payload.content_encoding IS NULL
+                          AND payload.object_key IS NULL
+                          AND payload.byte_count=%s
+                          AND payload.retention_class=%s
+                          AND payload.expires_at IS NOT DISTINCT FROM %s
+                          AND payload.purged_at IS NULL""",
+                    (
+                        artifact.work_item_id, artifact.work_item_attempt, artifact.physical_request_id,
+                        artifact.request.endpoint, Jsonb(dict(artifact.request.params)), _params_digest(artifact.request.params),
+                        artifact.purpose, artifact.request_started_at, artifact.response_received_at,
+                        artifact.response.status_code, results, paging_current, paging_total,
+                        hashlib.sha256(artifact.response.raw_body).digest(), Jsonb(scope),
+                        artifact.normalization_version, subject_fixture_id, subject_season_id, subject_team_id,
+                        artifact.response.raw_body, len(artifact.response.raw_body), artifact.retention_class, expires_at,
+                    ),
                 ).fetchone()
-                if status is None or status[0] != "succeeded":
-                    return False
-                return self._matching_physical_request(
-                    item, authorization, capture, artifact.work_item_attempt, artifact.physical_request_id,
-                    results, paging_current, paging_total, scope, subject_fixture_id,
-                    subject_season_id, subject_team_id, expires_at,
-                ) is not None
+                return row is not None
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, ProvenanceError, PsycopgError):
             return False
-
     def _persist_database(
         self,
         item: LeasedWorkItem,
@@ -327,9 +387,9 @@ class ProviderProvenance:
             if not isinstance(physical_request_id, str) or not physical_request_id.strip():
                 raise ProvenanceError("physical request identity is required")
             try:
-                contains_credential = self._response_contains_api_key(capture.response.raw_body)
-            except Exception as error:
-                raise ProvenanceError("provider response credential check failed") from error
+                contains_credential = self._contains_configured_credential(capture)
+            except Exception:
+                raise ProvenanceError("provider response credential check failed") from None
             if contains_credential:
                 raise ProvenanceError("provider response contains configured credential")
 

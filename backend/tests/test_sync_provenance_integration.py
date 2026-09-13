@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import multiprocessing
 import json
 import os
 import threading
@@ -145,6 +146,20 @@ def _q06_subjects(
     return fixture_id, home_id
 
 
+def _concurrent_db_cleanup(url: str, root: str, barrier: Any, results: Any) -> None:
+    try:
+        with psycopg.connect(url, autocommit=True) as connection:
+            spool = RawSpool(Path(root), max_bytes=1)
+            ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+            barrier.wait(timeout=5)
+            spool.enforce_limit()
+            results.put("completed")
+    except RawSpoolCapacityError:
+        results.put("capacity")
+    except BaseException as error:
+        results.put(type(error).__name__)
+
+
 def test_credential_bearing_raw_never_reaches_spool_or_database(tmp_path: Path) -> None:
     assert TEST_DB_URL is not None
     with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
@@ -164,6 +179,41 @@ def test_credential_bearing_raw_never_reaches_spool_or_database(tmp_path: Path) 
         assert connection.execute(
             "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("location", ("parameters", "scope"), ids=("parameter-value", "nested-scope"))
+def test_q06_credential_metadata_is_rejected_without_output(tmp_path: Path, location: str, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    assert TEST_DB_URL is not None
+    secret = "q06-metadata-secret"
+    values = {"parameters": {"note": secret}, "scope": {"nested": {"token": secret}}}
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        item, authorization = _item(connection, uuid.uuid4().hex)
+        spool = RawSpool(tmp_path / "spool")
+        with pytest.raises(ProvenanceError) as error:
+            ProviderProvenance(connection, response_contains_api_key=lambda body: secret.encode() in body, spool=spool).persist(
+                item, authorization, (_capture(params=values[location] if location == "parameters" else None, scope=values[location] if location == "scope" else None),),
+            )
+        assert secret not in str(error.value)
+        assert secret not in caplog.text
+        assert secret not in capsys.readouterr().err
+        assert not spool.root.exists()
+
+
+def test_q06_detector_exception_does_not_expose_exception_chain(tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    assert TEST_DB_URL is not None
+    secret = "q06-detector-secret"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        item, authorization = _item(connection, uuid.uuid4().hex)
+        spool = RawSpool(tmp_path / "spool")
+        def detector(_body: bytes) -> bool:
+            raise RuntimeError(secret)
+        with pytest.raises(ProvenanceError) as error:
+            ProviderProvenance(connection, response_contains_api_key=detector, spool=spool).persist(item, authorization, (_capture(),))
+        assert error.value.__cause__ is None
+        assert secret not in repr(error.value)
+        assert secret not in caplog.text
+        assert secret not in capsys.readouterr().err
+        assert not spool.root.exists()
 
 
 def test_q03_runner_propagates_spool_capacity_without_contract_transition(tmp_path: Path) -> None:
@@ -219,6 +269,83 @@ def test_q06_succeeded_exact_db_copy_allows_local_purge_without_db_changes(tmp_p
         assert connection.execute(
             "SELECT inline_body FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
         ).fetchone()[0] == capture.response.raw_body
+
+
+def test_q06_new_process_verifies_existing_durable_candidate_after_restart(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    spool = RawSpool(tmp_path / "spool")
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as first:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(first, suffix)
+        item = PostgresSyncRepository(first, gate).claim_next(f"q06-restart-purge-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        capture = _capture()
+        persisted = ProviderProvenance(first, response_contains_api_key=lambda _body: False, spool=spool).persist(item, authorization, (capture,))
+        directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
+        first.execute("UPDATE ops.sync_work_items SET status='succeeded', lease_owner=NULL, lease_expires_at=NULL, finished_at=clock_timestamp() WHERE id=%s", (item.id,))
+        before = first.execute("SELECT count(*) FROM source.provider_fetches WHERE id=%s", (persisted[0].fetch_id,)).fetchone()[0]
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as second:
+        restarted = RawSpool(spool.root)
+        ProviderProvenance(second, response_contains_api_key=lambda _body: False, spool=restarted)
+        restarted._max_bytes = 1  # type: ignore[attr-defined]
+        restarted.enforce_limit()
+        assert not directory.exists()
+        assert second.execute("SELECT count(*) FROM source.provider_fetches WHERE id=%s", (persisted[0].fetch_id,)).fetchone()[0] == before
+
+
+@pytest.mark.parametrize("state", ("pending", "running", "quarantine"), ids=("pending", "running", "quarantine"))
+def test_q06_nonterminal_queue_states_keep_durable_spool(tmp_path: Path, state: str) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    spool = RawSpool(tmp_path / "spool")
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-state-{state}-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        recorder.persist(item, authorization, (_capture(),))
+        directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
+        if state == "pending":
+            connection.execute("UPDATE ops.sync_work_items SET status='pending', lease_owner=NULL, lease_expires_at=NULL, available_at=clock_timestamp()+interval '1 hour' WHERE id=%s", (item.id,))
+        elif state == "quarantine":
+            connection.execute("UPDATE ops.sync_work_items SET status='quarantined', lease_owner=NULL, lease_expires_at=NULL, quarantined_at=clock_timestamp(), quarantine_reason='q06 test' WHERE id=%s", (item.id,))
+        ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        spool._max_bytes = 1  # type: ignore[attr-defined]
+        with pytest.raises(RawSpoolCapacityError):
+            spool.enforce_limit()
+        assert directory.exists()
+
+
+def test_q06_concurrent_db_verified_cleanup_is_serial_and_idempotent(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    spool = RawSpool(tmp_path / "spool")
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
+        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-concurrent-cleanup-{suffix}")
+        assert item is not None and item.id == work_item_id
+        authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+        capture = _capture()
+        persisted = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool).persist(item, authorization, (capture,))
+        directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
+        connection.execute("UPDATE ops.sync_work_items SET status='succeeded', lease_owner=NULL, lease_expires_at=NULL, finished_at=clock_timestamp() WHERE id=%s", (item.id,))
+        before = connection.execute("SELECT count(*),max(id) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,)).fetchone()
+    context = multiprocessing.get_context("spawn")
+    barrier, results = context.Barrier(2), context.Queue()
+    processes = [context.Process(target=_concurrent_db_cleanup, args=(TEST_DB_URL, str(spool.root), barrier, results)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+    assert sorted(results.get(timeout=2) for _ in processes) in (["completed", "completed"], ["capacity", "completed"])
+    assert not directory.exists()
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as observer:
+        assert observer.execute("SELECT count(*),max(id) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,)).fetchone() == before
+        assert observer.execute("SELECT count(*),max(fetch_id) FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,)).fetchone() == (1, persisted[0].fetch_id)
 
 
 @pytest.mark.parametrize("mode", ("metadata", "purged"), ids=("metadata-mismatch", "payload-purged"))
