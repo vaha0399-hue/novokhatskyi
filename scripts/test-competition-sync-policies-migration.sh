@@ -35,9 +35,16 @@ psql_db() {
 apply_prior_migrations() {
   local database="$1"
   local migration
+  local migration_name
+  local policy_migration_name
+  policy_migration_name="$(basename "$POLICY_MIGRATION")"
   while IFS= read -r migration; do
+    migration_name="$(basename "$migration")"
+    if [[ ! "$migration_name" < "$policy_migration_name" ]]; then
+      break
+    fi
     psql_db "$database" -f "$migration" >/dev/null
-  done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' ! -name '20260908010000_competition_sync_policies.sql' | sort)
+  done < <(find "$ROOT_DIR/supabase/migrations" -maxdepth 1 -type f -name '*.sql' | sort)
 }
 
 apply_policy_and_assertions() {
