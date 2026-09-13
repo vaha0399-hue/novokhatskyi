@@ -14,6 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 import httpx
+from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
 from app.api_football import APIFootballClient, APIFootballResponse
@@ -160,6 +161,30 @@ def _concurrent_db_cleanup(url: str, root: str, barrier: Any, results: Any) -> N
         results.put("capacity")
     except BaseException as error:
         results.put(type(error).__name__)
+
+
+def _prepare_q06_cleanup_candidate(
+    setup: psycopg.Connection,
+    cleanup_connection: psycopg.Connection,
+    tmp_path: Path,
+    suffix: str,
+) -> tuple[RawSpool, LeasedWorkItem, Path]:
+    provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+    item = PostgresSyncRepository(setup, gate).claim_next(f"q06-cleanup-state-{suffix}")
+    assert item is not None and item.id == work_item_id
+    authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+    spool = RawSpool(tmp_path / "spool")
+    ProviderProvenance(
+        cleanup_connection,
+        response_contains_api_key=lambda _body: False,
+        spool=spool,
+    ).persist(item, authorization, (_capture(),))
+    directory = spool.work_item_request_directory(
+        work_item_id=item.id,
+        attempt=item.attempts,
+        request_number=1,
+    )
+    return spool, item, directory
 
 
 def _reset_q04_budget(
@@ -369,32 +394,217 @@ def test_q06_fallback_item_scope_is_checked_for_configured_credential(tmp_path: 
 def test_q06_succeeded_exact_db_copy_allows_local_purge_without_db_changes(tmp_path: Path) -> None:
     assert TEST_DB_URL is not None
     suffix = uuid.uuid4().hex
-    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
-        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(connection, suffix)
-        item = PostgresSyncRepository(connection, gate).claim_next(f"q06-purge-{suffix}")
+    with (
+        psycopg.connect(TEST_DB_URL, autocommit=True) as setup,
+        psycopg.connect(TEST_DB_URL) as cleanup_connection,
+    ):
+        provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+        item = PostgresSyncRepository(setup, gate).claim_next(f"q06-purge-{suffix}")
         assert item is not None and item.id == work_item_id
         authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
         spool = RawSpool(tmp_path / "spool")
-        recorder = ProviderProvenance(connection, response_contains_api_key=lambda _body: False, spool=spool)
+        recorder = ProviderProvenance(
+            cleanup_connection,
+            response_contains_api_key=lambda _body: False,
+            spool=spool,
+        )
         capture = _capture()
         persisted = recorder.persist(item, authorization, (capture,))
         directory = spool.work_item_request_directory(work_item_id=item.id, attempt=item.attempts, request_number=1)
-        before = connection.execute(
+        before = setup.execute(
             "SELECT count(*),max(id) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
         ).fetchone()
-        connection.execute(
+        cleanup_connection.execute(
             "UPDATE ops.sync_work_items SET status='succeeded', lease_owner=NULL, lease_expires_at=NULL, finished_at=clock_timestamp() WHERE id=%s",
             (item.id,),
         )
+        assert cleanup_connection.info.transaction_status == TransactionStatus.INTRANS
+        cleanup_connection.commit()
+        assert cleanup_connection.info.transaction_status == TransactionStatus.IDLE
         spool._max_bytes = max(1, sum(path.stat().st_size for path in spool.root.rglob("*") if path.is_file()) - 1)  # type: ignore[attr-defined]
         spool.enforce_limit()
+        spool.enforce_limit()
         assert not directory.exists()
-        assert connection.execute(
+        assert setup.execute(
             "SELECT count(*),max(id) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
         ).fetchone() == before
-        assert connection.execute(
+        assert setup.execute(
             "SELECT inline_body FROM source.provider_raw_payloads WHERE fetch_id=%s", (persisted[0].fetch_id,),
         ).fetchone()[0] == capture.response.raw_body
+
+
+def test_q06_cleanup_refuses_uncommitted_succeeded_without_touching_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with (
+        psycopg.connect(TEST_DB_URL, autocommit=True) as setup,
+        psycopg.connect(TEST_DB_URL) as cleanup_connection,
+        psycopg.connect(TEST_DB_URL, autocommit=True) as observer,
+    ):
+        spool, item, directory = _prepare_q06_cleanup_candidate(
+            setup,
+            cleanup_connection,
+            tmp_path,
+            suffix,
+        )
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        unlinked: list[Path] = []
+        original_unlink = Path.unlink
+
+        def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            unlinked.append(path)
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", record_unlink)
+        cleanup_connection.execute(
+            """UPDATE ops.sync_work_items
+                  SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
+                      finished_at=clock_timestamp()
+                WHERE id=%s""",
+            (item.id,),
+        )
+        assert cleanup_connection.info.transaction_status == TransactionStatus.INTRANS
+        assert cleanup_connection.execute(
+            "SELECT status FROM ops.sync_work_items WHERE id=%s",
+            (item.id,),
+        ).fetchone() == ("succeeded",)
+        assert observer.execute(
+            "SELECT status FROM ops.sync_work_items WHERE id=%s",
+            (item.id,),
+        ).fetchone() == ("running",)
+
+        with pytest.raises(RawSpoolError, match="not proven safe"):
+            spool.purge_generation(directory)
+
+        assert unlinked == []
+        assert directory.is_dir()
+        assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+        assert cleanup_connection.info.transaction_status == TransactionStatus.INTRANS
+        assert cleanup_connection.execute(
+            "SELECT status FROM ops.sync_work_items WHERE id=%s",
+            (item.id,),
+        ).fetchone() == ("succeeded",)
+        assert observer.execute(
+            "SELECT status FROM ops.sync_work_items WHERE id=%s",
+            (item.id,),
+        ).fetchone() == ("running",)
+
+        cleanup_connection.rollback()
+        assert cleanup_connection.info.transaction_status == TransactionStatus.IDLE
+        assert observer.execute(
+            "SELECT status FROM ops.sync_work_items WHERE id=%s",
+            (item.id,),
+        ).fetchone() == ("running",)
+
+
+def test_q06_quarantine_recovery_refuses_an_open_external_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    with (
+        psycopg.connect(TEST_DB_URL, autocommit=True) as setup,
+        psycopg.connect(TEST_DB_URL) as cleanup_connection,
+    ):
+        spool, item, directory = _prepare_q06_cleanup_candidate(
+            setup,
+            cleanup_connection,
+            tmp_path,
+            suffix,
+        )
+        setup.execute(
+            """UPDATE ops.sync_work_items
+                  SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
+                      finished_at=clock_timestamp()
+                WHERE id=%s""",
+            (item.id,),
+        )
+        quarantine = directory.with_name(f".purging-{uuid.uuid4().hex}")
+        directory.rename(quarantine)
+        metadata = quarantine / "fixtures.request.json"
+        os.link(metadata, quarantine / ".cleanup-proof.json", follow_symlinks=False)
+        before = {path.name: path.read_bytes() for path in quarantine.iterdir()}
+        unlinked: list[Path] = []
+        original_unlink = Path.unlink
+
+        def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            unlinked.append(path)
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", record_unlink)
+        cleanup_connection.execute("SELECT 1")
+        assert cleanup_connection.info.transaction_status == TransactionStatus.INTRANS
+        spool._max_bytes = 1  # type: ignore[attr-defined]
+
+        with pytest.raises(RawSpoolCapacityError):
+            spool.enforce_limit()
+
+        assert unlinked == []
+        assert quarantine.is_dir()
+        assert {path.name: path.read_bytes() for path in quarantine.iterdir()} == before
+        assert cleanup_connection.info.transaction_status == TransactionStatus.INTRANS
+        cleanup_connection.rollback()
+
+
+@pytest.mark.parametrize("state", ("inerror", "closed"))
+def test_q06_cleanup_refuses_an_unusable_database_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    cleanup_connection = psycopg.connect(TEST_DB_URL)
+    try:
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+            spool, item, directory = _prepare_q06_cleanup_candidate(
+                setup,
+                cleanup_connection,
+                tmp_path,
+                suffix,
+            )
+            setup.execute(
+                """UPDATE ops.sync_work_items
+                      SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
+                          finished_at=clock_timestamp()
+                    WHERE id=%s""",
+                (item.id,),
+            )
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        unlinked: list[Path] = []
+        original_unlink = Path.unlink
+
+        def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            unlinked.append(path)
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", record_unlink)
+        if state == "inerror":
+            with pytest.raises(psycopg.errors.DivisionByZero):
+                cleanup_connection.execute("SELECT 1 / 0")
+            assert cleanup_connection.info.transaction_status == TransactionStatus.INERROR
+        else:
+            cleanup_connection.close()
+            assert cleanup_connection.closed
+
+        with pytest.raises(RawSpoolError, match="not proven safe"):
+            spool.purge_generation(directory)
+
+        assert unlinked == []
+        assert directory.is_dir()
+        assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+        if state == "inerror":
+            assert cleanup_connection.info.transaction_status == TransactionStatus.INERROR
+            cleanup_connection.rollback()
+            assert cleanup_connection.info.transaction_status == TransactionStatus.IDLE
+        else:
+            assert cleanup_connection.closed
+    finally:
+        cleanup_connection.close()
 
 
 def test_q06_new_process_verifies_existing_durable_candidate_after_restart(tmp_path: Path) -> None:

@@ -278,6 +278,17 @@ class ProviderProvenance:
         if self._spool is None or not isinstance(directory, Path):
             yield False
             return
+        # Cleanup may only inspect committed state.  A nested transaction or
+        # savepoint can see its caller's uncommitted ``succeeded`` update and
+        # must never be used as proof that the local replay copy is disposable.
+        try:
+            connection_status = self._connection.info.transaction_status
+        except PsycopgError:
+            yield False
+            return
+        if self._connection.closed or connection_status != TransactionStatus.IDLE:
+            yield False
+            return
         try:
             proof = directory / self._spool._CLEANUP_PROOF  # type: ignore[attr-defined]
             proof_exists = proof.exists()
