@@ -18,6 +18,7 @@ from app.sync.scheduler_repository import PostgresSchedulerRepository, Scheduler
 from app.sync.repository import RecalculationWork
 from app.sync.policies import AuthorizedSyncWork
 from app.sync.worker import AtomicWorkTransaction, WorkResult
+from app.sync.diagnostics import emit_lifecycle
 
 
 Q05Handler = Q03Dispatch
@@ -66,19 +67,32 @@ class Q05SchedulerProcess:
                 with self._connection.transaction():
                     if decision.next_state is None:
                         if isinstance(decision.work, RecalculationWork):
-                            results.append(self._repository.enqueue_recalculation(run_id=run_id, work=decision.work, available_at=decision.deadline or now))
+                            result = self._repository.enqueue_recalculation(run_id=run_id, work=decision.work, available_at=decision.deadline or now)
+                        elif "fixture_id" in decision.work.scope:
+                            result = self._repository.enqueue_event(
+                                run_id=run_id, work=decision.work, available_at=decision.deadline or now,
+                            )
+                        else:
                             continue
-                        if "fixture_id" not in decision.work.scope:
-                            continue
-                        results.append(self._repository.enqueue_event(
-                            run_id=run_id, work=decision.work, available_at=decision.deadline or now,
-                        ))
                     else:
-                        results.append(self._repository.enqueue_and_advance(
+                        result = self._repository.enqueue_and_advance(
                             run_id=run_id, work=decision.work,
                             expected_state=state_by_key.get(decision.next_state.key()),
                             next_state=decision.next_state, available_at=decision.deadline or now,
-                        ))
+                        )
             except SyncPolicyDenied as error:
                 denials.append(error.reason.value)
+                emit_lifecycle("scheduler_enqueue_denied", scope=decision.scope,
+                               reason=f"policy_{error.reason.value}", run_id=run_id,
+                               job_type=decision.work.work_type)
+                continue
+            results.append(result)
+            emit_lifecycle(
+                "scheduler_enqueue_committed" if result.enqueued else "scheduler_enqueue_deduplicated",
+                job_id=result.work_item_id,
+                scope=decision.scope,
+                run_id=run_id,
+                job_type=decision.work.work_type,
+                checkpoint_advanced=result.checkpoint_advanced,
+            )
         return SchedulerRunResult(preview, tuple(results), tuple(denials))

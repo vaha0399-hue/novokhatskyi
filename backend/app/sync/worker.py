@@ -6,14 +6,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from random import uniform
 from threading import Event, Thread
+from time import perf_counter
 from typing import Any, Protocol
 
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.api_football.budget import APIFootballBudgetError, budget_retry_delay_seconds
+from app.api_football.budget import APIFootballBudgetDenied, APIFootballBudgetError, budget_retry_delay_seconds
 from app.api_football.errors import APIFootballHTTPError
 from app.importer.raw_spool import RawSpoolCapacityError
+from app.sync.diagnostics import budget_reason, emit_lifecycle, provider_http_reason
 from app.sync.policies import AuthorizedSyncWork, SyncPolicyDenied, SyncPolicyGate, SyncWorkRequest
 from app.sync.repository import LeasedWorkItem, PostgresSyncRepository
 from app.sync.provenance import ProviderProvenance, RawFetchCapture
@@ -307,7 +309,11 @@ class RepeatableSyncWorker:
                 authorization = self._authorization(item)
             except (SyncPolicyDenied, ValueError) as exc:
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+                emit_lifecycle("job_quarantined", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               reason="policy_denied")
                 return True
+        started = perf_counter()
+        emit_lifecycle("job_claimed", job_id=item.id, attempts=item.attempts, scope=item.scope)
         # Fetchers may wait on HTTP; no transaction is active here.
         failed = Event()
         stop = Event()
@@ -323,6 +329,7 @@ class RepeatableSyncWorker:
         thread = Thread(target=beat, daemon=True)
         thread.start()
         try:
+            emit_lifecycle("job_execution_started", job_id=item.id, attempts=item.attempts, scope=item.scope)
             recover_spooled_raw = getattr(self._provenance, "recover_spooled_raw", None)
             if callable(recover_spooled_raw):
                 # A crash can leave verified bytes in the spool before their
@@ -351,6 +358,8 @@ class RepeatableSyncWorker:
             stop.set()
             thread.join()
             if failed.is_set():
+                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="heartbeat_lost")
                 raise LeaseLost("repeatable work-item heartbeat failed") from exc
             if isinstance(exc, APIFootballBudgetError):
                 deferred = self.repository.defer_for_budget(
@@ -369,23 +378,39 @@ class RepeatableSyncWorker:
                 with self._connection.transaction():
                     deferred = self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
             if not deferred:
+                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
                 raise LeaseLost("repeatable work-item lease was lost before failure handling") from exc
+            reason = (
+                budget_reason(exc.reason) if isinstance(exc, APIFootballBudgetDenied)
+                else "budget_unavailable" if isinstance(exc, APIFootballBudgetError)
+                else provider_http_reason(exc.status_code)
+            )
+            event = "job_deferred" if isinstance(exc, APIFootballBudgetError) or exc.status_code == 429 else "job_retry_scheduled"
+            emit_lifecycle(event, job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000, reason=reason)
             return True
         except RawSpoolCapacityError:
             # Local evidence storage is distinct from a provider contract
             # failure.  Leave the fenced attempt untouched for safe retry.
             stop.set()
             thread.join()
+            emit_lifecycle("job_execution_failed", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000, reason="raw_spool_capacity")
             raise
         except Exception as exc:
             stop.set()
             thread.join()
             with self._connection.transaction():
                 self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            emit_lifecycle("job_quarantined", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000, reason="handler_failure")
             return True
         stop.set()
         thread.join()
         if failed.is_set():
+            emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000, reason="heartbeat_lost")
             raise LeaseLost("repeatable work-item heartbeat failed")
         if result.raw_fetches:
             if self._provenance is None:
@@ -398,6 +423,8 @@ class RepeatableSyncWorker:
                 (item.id, self._owner, item.lease_token),
             ).fetchone()
             if guarded is None or guarded[0] is not True:
+                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
                 raise LeaseLost("repeatable work-item lease was lost before applying its result")
             writer = AtomicWorkTransaction(self._connection)
             if result.source_fetch_ids:
@@ -408,6 +435,8 @@ class RepeatableSyncWorker:
                 self._provenance.verify_source_fetches(
                     writer, item, result.source_fetch_ids, replayed_fetch_ids=result.replayed_fetch_ids,
                 )
+            emit_lifecycle("job_apply_started", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000)
             apply_result(writer, item, result)
             for enqueue_dependent in result.dependent_work:
                 enqueue_dependent(writer)
@@ -422,7 +451,11 @@ class RepeatableSyncWorker:
                 (item.id, self._owner, item.lease_token, Jsonb(dict(result.checkpoint))),
             ).fetchone()
             if completed is None or completed[0] is not True:
+                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
                 raise LeaseLost("repeatable work-item lease was lost before completion")
+        emit_lifecycle("job_completed", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                       duration_ms=(perf_counter() - started) * 1000)
         return True
 
     def run_registered_once(self, registry: Any, *, max_attempts: int = 5) -> bool:

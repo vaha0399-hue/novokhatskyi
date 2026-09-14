@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -506,6 +507,60 @@ def test_fixture_schedule_observation_blocks_concurrent_fetch_time_rewrite() -> 
 def _q05_policy(connection: psycopg.Connection, *, provider_id: int, season_id: int, work_types: tuple[str, ...]) -> None:
     connection.execute("UPDATE ops.competition_sync_policies SET enabled=true,allowed_work_types=%s,coverage=%s,refresh_intervals=%s WHERE provider_id=%s AND season_id=%s",
                        (list(work_types), Jsonb({name: {"state": "covered", "observed_on": "2026-09-09"} for name in work_types}), Jsonb({name: {"value": 1 if name != "schedule_near" else 3, "unit": "hour"} for name in work_types}), provider_id, season_id))
+
+
+def test_q07_diagnostic_sql_runs_read_only_and_reports_partial_metric_pairs() -> None:
+    """The runbook SQL must execute against the full current disposable schema."""
+    assert TEST_DB_URL is not None
+    suffix, now = uuid.uuid4().hex, datetime.now(UTC)
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id, season_id, _instance, _version, _run_id = _q05_scheduler_setup(connection, suffix)
+        fixture_id = _q05_fixture(
+            connection, provider_id=provider_id, season_id=season_id, suffix=suffix,
+            kickoff_at=now - timedelta(hours=8), lifecycle_state="completed",
+        )
+        team_id = int(connection.execute(
+            "SELECT home_team_id FROM football.fixtures WHERE id=%s", (fixture_id,),
+        ).fetchone()[0])
+        connection.execute(
+            """INSERT INTO football.fixture_team_statistics(
+                   fixture_id,team_id,corner_kicks,yellow_cards,mapping_version,
+                   observed_at,available_at,availability_basis
+               ) VALUES(%s,%s,0,NULL,'q07-test',%s,%s,'reconstructed_conservative')""",
+            (fixture_id, team_id, now - timedelta(hours=4), now - timedelta(hours=4)),
+        )
+        fetch_id = int(connection.execute(
+            "SELECT last_source_fetch_id FROM football.fixtures WHERE id=%s", (fixture_id,),
+        ).fetchone()[0])
+        connection.execute(
+            """INSERT INTO football.fixture_statistics_coverage(
+                   fixture_id,coverage_state,team_count,last_source_fetch_id,observed_at,next_retry_at,attempts
+               ) VALUES(%s,'partial',1,%s,%s,%s,1)""",
+            (fixture_id, fetch_id, now - timedelta(hours=4), now + timedelta(hours=1)),
+        )
+
+    report = (Path(__file__).parents[1] / "app" / "sync" / "diagnostics.sql").read_text(encoding="utf-8")
+    with psycopg.connect(TEST_DB_URL) as connection:
+        connection.execute("SET TRANSACTION READ ONLY")
+        cursor = connection.execute(report)
+        result_sets: list[list[tuple[object, ...]]] = []
+        while True:
+            result_sets.append(cursor.fetchall() if cursor.description is not None else [])
+            if not cursor.nextset():
+                break
+
+    assert len(result_sets) == 5
+    metric_columns = ("provider_id", "season_id", "metric", "fixtures", "expected_team_pairs",
+                      "observed_metric_team_pairs", "null_metric_team_pairs", "fixtures_without_statistics",
+                      "fixtures_with_one_team_statistics", "complete_team_pair_missing_selected_metric",
+                      "coverage_empty", "coverage_partial", "coverage_unknown_or_absent")
+    metrics = [dict(zip(metric_columns, row, strict=True)) for row in result_sets[3]]
+    corners = next(row for row in metrics if row["provider_id"] == provider_id and row["metric"] == "corner_kicks")
+    yellows = next(row for row in metrics if row["provider_id"] == provider_id and row["metric"] == "yellow_cards")
+    assert corners["fixtures_with_one_team_statistics"] == 1
+    assert corners["observed_metric_team_pairs"] == 1  # zero is observed, not missing
+    assert yellows["null_metric_team_pairs"] == 1
+    assert yellows["coverage_partial"] == 1
 
 
 def _q05_snapshot(now: datetime):
