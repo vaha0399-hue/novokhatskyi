@@ -477,19 +477,20 @@ def test_q06_capture_subject_must_belong_to_authorized_provider_season(
         )
         foreign_id = foreign_fixture_id if field == "fixture_id" else foreign_team_id
         spool = RawSpool(tmp_path / "spool")
+        capture = _capture(scope={field: foreign_id, "season_id": season_id})
 
         with pytest.raises(ProvenanceError, match="outside the authorized work scope"):
             ProviderProvenance(
                 connection,
                 response_contains_api_key=lambda _body: False,
                 spool=spool,
-            ).persist(
-                item,
-                authorization,
-                (_capture(scope={field: foreign_id, "season_id": season_id}),),
-            )
+            ).persist(item, authorization, (capture,))
 
-        assert not spool.root.exists()
+        directory = spool.work_item_request_directory(
+            work_item_id=item.id, attempt=item.attempts, request_number=1,
+        )
+        assert spool.load(directory, BaseRequest(capture.endpoint, dict(capture.params))) is not None
+        assert not (directory / ".durable").exists()
         assert connection.execute(
             "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s",
             (item.id,),
@@ -1351,12 +1352,165 @@ def test_q06_subject_request_binding_rejects_same_scope_mismatches_before_mutati
                     response_contains_api_key=lambda _body: False,
                     spool=spool,
                 ).persist(item, authorization, (capture,))
-            assert not spool.root.exists()
+            directory = spool.work_item_request_directory(
+                work_item_id=item.id, attempt=item.attempts, request_number=1,
+            )
+            loaded = spool.load(directory, BaseRequest(capture.endpoint, dict(capture.params)))
+            assert loaded is not None
+            assert loaded.response.raw_body == capture.response.raw_body
+            assert not (directory / ".durable").exists()
 
         assert connection.execute(
             "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s",
             (item.id,),
         ).fetchone()[0] == 0
+
+
+def test_successful_http_raw_survives_database_loss_before_relational_checks(tmp_path: Path) -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    http_calls = 0
+
+    def successful_http(_request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        return httpx.Response(200, json={
+            "get": "fixtures", "parameters": {"league": "39"}, "errors": {}, "results": 0,
+            "paging": {"current": 1, "total": 1}, "response": [],
+        })
+
+    capture_connection = psycopg.connect(TEST_DB_URL)
+    client: APIFootballClient | None = None
+    try:
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as setup:
+            _reset_q04_budget(setup)
+            client = APIFootballClient(
+                "q06-preflight-secret",
+                transport=httpx.MockTransport(successful_http),
+                budget=PostgresAPIFootballBudget(TEST_DB_URL),
+                budget_consumer="operations",
+            )
+            provider_id, season_id, _run_id, work_item_id, gate = _enqueue_q06_runner_work(setup, suffix)
+            owner = f"q06-preflight-loss-{suffix}"
+            item = PostgresSyncRepository(setup, gate).claim_next(owner)
+            assert item is not None and item.id == work_item_id
+            authorization = gate.before_enqueue(SyncWorkRequest(provider_id, season_id, "fixtures"))
+            started_at = datetime.now(UTC)
+            response = asyncio.run(client.get_once("/fixtures", params={"league": 39}))
+            received_at = datetime.now(UTC)
+            capture = RawFetchCapture(
+                "/fixtures", {"league": 39}, response, started_at, received_at,
+                "fixtures-v1", purpose="research", retention_class="contract_sample", scope=dict(item.scope),
+            )
+            spool = RawSpool(tmp_path / "spool")
+            recorder = ProviderProvenance(
+                capture_connection,
+                response_contains_api_key=client.response_contains_api_key,
+                spool=spool,
+            )
+
+            assert setup.execute(
+                "SELECT pg_terminate_backend(%s)", (capture_connection.info.backend_pid,),
+            ).fetchone()[0] is True
+            with pytest.raises(psycopg.Error):
+                recorder.persist(item, authorization, (capture,))
+
+            directory = spool.work_item_request_directory(
+                work_item_id=item.id, attempt=item.attempts, request_number=1,
+            )
+            loaded = spool.load(directory, BaseRequest(capture.endpoint, dict(capture.params)))
+            assert loaded is not None
+            assert loaded.response.raw_body == capture.response.raw_body
+            assert loaded.request_started_at == capture.request_started_at
+            assert loaded.response_received_at == capture.response_received_at
+            assert loaded.scope == capture.scope
+            assert loaded.work_item_id == item.id
+            assert loaded.work_item_attempt == item.attempts
+            assert loaded.normalization_version == capture.normalization_version
+            assert loaded.purpose == capture.purpose
+            assert loaded.retention_class == capture.retention_class
+            assert loaded.physical_request_id == (
+                f"work-item-{item.id}:attempt-{item.attempts}:request-000001"
+            )
+            assert not (directory / ".durable").exists()
+            assert setup.execute(
+                "SELECT count(*) FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+            ).fetchone()[0] == 0
+            assert setup.execute(
+                """SELECT count(*) FROM source.provider_raw_payloads payload
+                     JOIN source.provider_fetches provider_fetch ON provider_fetch.id=payload.fetch_id
+                    WHERE provider_fetch.sync_work_item_id=%s""",
+                (item.id,),
+            ).fetchone()[0] == 0
+
+            budget_after_http = setup.execute(
+                "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton",
+            ).fetchone()
+            assert budget_after_http == (1, 1, 1)
+            _requeue_for_replay(setup, work_item_id, owner)
+
+            class RecoveredDispatch:
+                def __init__(self) -> None:
+                    self.fetch_calls = 0
+                    self.apply_calls = 0
+
+                def replay(self, replay_item, _authorization, provenance):
+                    assert (directory / ".durable").is_file()
+                    saved = provenance.latest_replay(
+                        replay_item, endpoint=capture.endpoint, params=capture.params,
+                    )
+                    assert saved is not None
+                    assert saved.capture.response.raw_body == capture.response.raw_body
+                    return WorkResult(
+                        {}, source_fetch_ids=(saved.fetch_id,), replay_normalization_version="fixtures-v2",
+                    )
+
+                def fetch(self, *_args):
+                    self.fetch_calls += 1
+                    raise AssertionError("recovered raw must prevent a second HTTP request")
+
+                def apply_result(self, _writer, _item, _result):
+                    self.apply_calls += 1
+
+            dispatch = RecoveredDispatch()
+            with psycopg.connect(TEST_DB_URL) as recovery_connection:
+                recovery_recorder = ProviderProvenance(
+                    recovery_connection,
+                    response_contains_api_key=client.response_contains_api_key,
+                    spool=spool,
+                )
+                recovery_worker = RepeatableSyncWorker(
+                    recovery_connection,
+                    gate,
+                    owner,
+                    heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL, autocommit=True),
+                    provenance=recovery_recorder,
+                )
+                assert recovery_worker.run_registered_once(
+                    Q03DispatchRegistry({"fixtures": dispatch}),
+                ) is True
+
+            assert dispatch.fetch_calls == 0
+            assert dispatch.apply_calls == 1
+            assert http_calls == 1
+            assert setup.execute(
+                "SELECT daily_used,minute_used,operations_used FROM ops.api_football_budget_state WHERE singleton",
+            ).fetchone() == budget_after_http
+            assert setup.execute(
+                "SELECT status FROM ops.sync_work_items WHERE id=%s", (item.id,),
+            ).fetchone() == ("succeeded",)
+            fetch_id = setup.execute(
+                "SELECT id FROM source.provider_fetches WHERE sync_work_item_id=%s", (item.id,),
+            ).fetchone()[0]
+            assert setup.execute(
+                "SELECT count(*) FROM source.provider_raw_payloads WHERE fetch_id=%s", (fetch_id,),
+            ).fetchone() == (1,)
+    finally:
+        capture_connection.close()
+        if client is not None:
+            asyncio.run(client.aclose())
+
+    assert http_calls == 1
 
 
 def test_registered_replay_recovers_precommit_spool_raw_without_http(tmp_path: Path) -> None:

@@ -273,19 +273,14 @@ class ProviderProvenance:
     ) -> tuple[PersistedRawFetch, ...]:
         if not captures:
             return ()
-        if self._connection.info.transaction_status != TransactionStatus.IDLE:
-            raise ProvenanceError("raw persistence requires an idle database connection")
         database_captures: list[tuple[RawFetchCapture, int, str]] = []
         for request_number, capture in enumerate(captures, start=1):
             physical_request_id = _physical_request_id(item.id, item.attempts, request_number)
             database_captures.append((capture, item.attempts, physical_request_id))
-        # Validate every capture before making any filesystem or database
-        # mutation. The client-owned detector error deliberately contains no
-        # raw content. A committed preflight keeps the connection IDLE while
-        # staging, because spool eviction must inspect committed DB state.
+        # Validate every capture locally before making any filesystem or
+        # database mutation. The client-owned detector error deliberately
+        # contains no raw content.
         self._validate_captures(item, authorization, database_captures)
-        with self._connection.transaction():
-            self._validate_authorized_subjects(item, authorization, database_captures)
         staged: list[object] = []
         for request_number, (capture, _, physical_request_id) in enumerate(database_captures, start=1):
             if self._spool is not None:
@@ -300,8 +295,12 @@ class ProviderProvenance:
                 )
                 self._spool.stage(directory, artifact)
                 staged.append(directory)
-        # Recheck under locks in the raw insert transaction so a relationship
-        # changed after preflight cannot become durable provenance.
+        # A successful provider response must survive a PostgreSQL outage, but
+        # staged bytes are not trusted provenance: relational checks still run
+        # under locks in the raw insert transaction before any source row is
+        # committed or the spool artifact is marked durable.
+        if self._connection.info.transaction_status != TransactionStatus.IDLE:
+            raise ProvenanceError("raw persistence requires an idle database connection")
         with self._connection.transaction():
             self._validate_authorized_subjects(item, authorization, database_captures)
             persisted = self._persist_database_rows(item, authorization, database_captures)
