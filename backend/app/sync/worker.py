@@ -380,18 +380,15 @@ class RepeatableSyncWorker:
                 # attempt must pass Q04 reserve again, including Retry-After.
                 deferred = self.repository.defer_for_budget(item, self._owner, delay="60 seconds")
             elif exc.status_code == 0 or 500 <= exc.status_code < 600:
-                if item.attempts >= max_attempts:
-                    with self._connection.transaction():
-                        deferred = self.repository.requeue(
-                            item, self._owner, item.checkpoint, f"provider_http_{exc.status_code}_retry_exhausted",
-                            contract_error=True,
-                        )
+                delay = min(60, 2 ** min(item.attempts, 6)) + uniform(0, 1)
+                retry_transition = self.repository.settle_provider_retry(
+                    item, self._owner, delay=f"{delay} seconds", error=f"provider_http_{exc.status_code}",
+                    max_attempts=max_attempts,
+                )
+                deferred = retry_transition is not None
+                if retry_transition == "quarantined":
                     event, reason = "job_quarantined", "provider_retry_exhausted"
                 else:
-                    delay = min(60, 2 ** min(item.attempts, 6)) + uniform(0, 1)
-                    deferred = self.repository.defer_for_retry(
-                        item, self._owner, delay=f"{delay} seconds", error=f"provider_http_{exc.status_code}",
-                    )
                     event, reason = "job_retry_scheduled", provider_http_reason(exc.status_code)
             else:
                 with self._connection.transaction():

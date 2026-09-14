@@ -37,6 +37,19 @@ The `app.sync.lifecycle` logger emits one JSON object per line. Search by the
 numeric `job_id`; do not paste the log line into a public issue because scope
 can identify a competition/fixture.
 
+An application hosting `RepeatableSyncWorker` must configure this logger once
+at process startup, before it runs work. This is a library call, not a new CLI:
+
+```python
+from app.sync.diagnostics import configure_lifecycle_logging
+
+configure_lifecycle_logging()
+```
+
+The call is idempotent and the supported `scheduler_main` entrypoint already
+makes it. A separate Q03 worker host must make the same call; without it,
+normal Python logging configuration may not emit the JSON lifecycle stream.
+
 Expected successful sequence:
 
 1. `scheduler_enqueue_committed` (Q05)

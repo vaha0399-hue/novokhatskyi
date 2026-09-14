@@ -18,7 +18,7 @@ from typing import Any
 LOGGER = logging.getLogger("app.sync.lifecycle")
 
 _WORK_TYPES = frozenset({
-    "analytics_recalculation", "calendar_refresh", "correction_check",
+    "analytics_recalculation", "calendar_refresh", "correction_check", "coverage_refresh",
     "fixtures", "fixtures_refresh", "live_refresh", "overdue_status_check", "prematch_check", "quality_sweep",
     "result_finalization", "schedule_far", "schedule_near", "season_discovery",
     "standings_refresh", "statistics_retry",

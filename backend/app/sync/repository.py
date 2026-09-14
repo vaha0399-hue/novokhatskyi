@@ -188,6 +188,35 @@ class PostgresSyncRepository:
         """Transient failures retain their counted attempt and saved progress."""
         return self._defer(item, owner, delay=delay, error=error, restore_attempt=False)
 
+    def settle_provider_retry(
+        self, item: LeasedWorkItem, owner: str, *, delay: str, error: str, max_attempts: int,
+    ) -> str | None:
+        """Fenced provider retry using the durable retry cycle and checkpoint.
+
+        ``attempts`` is audit history, while ``attempts_in_budget`` is reset by
+        the reviewed manual-retry transition.  Lock and read both the current
+        retry cycle and checkpoint before choosing the terminal queue state so
+        a fetcher checkpoint is never overwritten by the claim snapshot.
+        """
+        if max_attempts < 1:
+            raise ValueError("max attempts must be positive")
+        with self._connection.transaction():
+            if not self._mutates("guard_repeatable_sync_work_item_lease", (item.id, owner, item.lease_token)):
+                return None
+            row = self._connection.execute(
+                "SELECT checkpoint,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item.id,),
+            ).fetchone()
+            if row is None or not isinstance(row[0], Mapping) or not isinstance(row[1], int):
+                raise RuntimeError("provider retry lost its locked work item")
+            checkpoint, attempts_in_budget = row
+            if attempts_in_budget >= max_attempts:
+                if not self.requeue(item, owner, checkpoint, f"{error}_retry_exhausted", contract_error=True):
+                    return None
+                return "quarantined"
+            if not self.requeue(item, owner, checkpoint, error, delay=delay):
+                return None
+            return "retry_scheduled"
+
     def _defer(self, item: LeasedWorkItem, owner: str, *, delay: str, error: str, restore_attempt: bool) -> bool:
         with self._connection.transaction():
             # The existing guard locks first, then rechecks expiry/token. Keep

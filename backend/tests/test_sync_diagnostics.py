@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from app.sync.diagnostics import budget_reason, emit_lifecycle, provider_http_reason, safe_scope
+from app.sync.diagnostics import LOGGER, budget_reason, configure_lifecycle_logging, emit_lifecycle, provider_http_reason, safe_scope
 
 
 def test_lifecycle_events_keep_only_safe_scope_and_never_log_secret_like_values(caplog) -> None:
@@ -39,6 +39,7 @@ def test_scope_and_reason_codes_are_stable_and_non_secret_bearing() -> None:
     assert budget_reason("token=test-secret") == "budget_denied"
     assert provider_http_reason(503) == "provider_http_503"
     assert provider_http_reason("secret") == "provider_http_error"
+    assert safe_scope({"_sync_policy": {"work_type": "coverage_refresh"}}) == {"work_type": "coverage_refresh"}
 
 
 def test_work_and_extra_fields_are_allowlisted_before_json_logging(caplog) -> None:
@@ -61,3 +62,27 @@ def test_work_and_extra_fields_are_allowlisted_before_json_logging(caplog) -> No
         "run_id": 7,
         "scope": {"work_type": "calendar_refresh"},
     }
+
+
+def test_configure_lifecycle_logging_emits_one_stderr_json_line_and_is_idempotent(capsys) -> None:
+    original_handlers = list(LOGGER.handlers)
+    original_level, original_propagate, original_disabled = LOGGER.level, LOGGER.propagate, LOGGER.disabled
+    try:
+        LOGGER.handlers.clear()
+        LOGGER.disabled = False
+        configure_lifecycle_logging()
+        configure_lifecycle_logging()
+        emit_lifecycle("job_claimed", job_id=7, attempts=1, scope={"work_type": "coverage_refresh"})
+        assert [json.loads(line) for line in capsys.readouterr().err.splitlines()] == [{
+            "attempts": 1,
+            "event": "job_claimed",
+            "job_id": 7,
+            "scope": {"work_type": "coverage_refresh"},
+        }]
+        assert sum(bool(getattr(handler, "_q07_lifecycle", False)) for handler in LOGGER.handlers) == 1
+    finally:
+        LOGGER.handlers.clear()
+        LOGGER.handlers.extend(original_handlers)
+        LOGGER.setLevel(original_level)
+        LOGGER.propagate = original_propagate
+        LOGGER.disabled = original_disabled

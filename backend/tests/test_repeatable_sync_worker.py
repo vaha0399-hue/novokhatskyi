@@ -223,7 +223,7 @@ def test_runner_classifies_provider_http_failures_without_apply(status_code: int
     worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
     calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     worker.repository.defer_for_budget = lambda *args, **kwargs: calls.append(("budget", args, kwargs)) or True  # type: ignore[method-assign]
-    worker.repository.defer_for_retry = lambda *args, **kwargs: calls.append(("retry", args, kwargs)) or True  # type: ignore[attr-defined,method-assign]
+    worker.repository.settle_provider_retry = lambda *args, **kwargs: calls.append(("retry", args, kwargs)) or "retry_scheduled"  # type: ignore[method-assign]
     worker.repository.requeue = lambda *args, **kwargs: calls.append(("contract", args, kwargs)) or True  # type: ignore[method-assign]
 
     with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
@@ -239,6 +239,7 @@ def test_runner_classifies_provider_http_failures_without_apply(status_code: int
     elif transition == "retry":
         assert calls[0][1] == (item, "owner")
         assert calls[0][2]["error"] == f"provider_http_{status_code}"
+        assert calls[0][2]["max_attempts"] == 5
         assert 2 <= float(str(calls[0][2]["delay"]).removesuffix(" seconds")) <= 3
     else:
         assert calls[0] == ("contract", (item, "owner", {}, f"API-Football returned HTTP {status_code}."), {"contract_error": True})
@@ -246,14 +247,13 @@ def test_runner_classifies_provider_http_failures_without_apply(status_code: int
         assert _events(caplog)[-1]["reason"] == "provider_http_400"
 
 
-def test_runner_quarantines_exhausted_5xx_instead_of_claiming_a_future_retry(caplog: pytest.LogCaptureFixture) -> None:
+def test_runner_reports_quarantined_5xx_when_fenced_repository_exhausts_retry_budget(caplog: pytest.LogCaptureFixture) -> None:
     connection = _RunnerConnection()
     worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
     item = _item(attempts=5)
     worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    worker.repository.requeue = lambda *args, **kwargs: calls.append((args, kwargs)) or True  # type: ignore[method-assign]
-    worker.repository.defer_for_retry = lambda *_args, **_kwargs: pytest.fail("exhausted retry must not be deferred")  # type: ignore[attr-defined,method-assign]
+    worker.repository.settle_provider_retry = lambda *args, **kwargs: calls.append((args, kwargs)) or "quarantined"  # type: ignore[method-assign]
 
     with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
         assert worker.run_once(
@@ -261,7 +261,9 @@ def test_runner_quarantines_exhausted_5xx_instead_of_claiming_a_future_retry(cap
             lambda *_: pytest.fail("apply"), max_attempts=5,
         ) is True
 
-    assert calls == [((item, "owner", {}, "provider_http_503_retry_exhausted"), {"contract_error": True})]
+    assert calls[0][0] == (item, "owner")
+    assert calls[0][1]["error"] == "provider_http_503"
+    assert calls[0][1]["max_attempts"] == 5
     assert _events(caplog)[-1]["event"] == "job_quarantined"
     assert _events(caplog)[-1]["reason"] == "provider_retry_exhausted"
 

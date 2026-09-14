@@ -2493,7 +2493,7 @@ def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success()
         repository = worker.repository
 
         # One legitimate failed execution remains counted against max_attempts.
-        first = repository.claim_next(owner, max_attempts=2)
+        first = repository.claim_next(owner, max_attempts=3)
         assert first is not None and first.id == item_id
         assert repository.requeue(first, owner, {"page": 2}, "ordinary_retry")
 
@@ -2515,7 +2515,7 @@ def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success()
                     assert connection.info.transaction_status.name == "IDLE"
                 raise error
 
-            assert worker.run_once(fetch, lambda *_args: pytest.fail("apply"), max_attempts=2) is True
+            assert worker.run_once(fetch, lambda *_args: pytest.fail("apply"), max_attempts=3) is True
             row = connection.execute(
                 "SELECT status,checkpoint,attempts,attempts_in_budget,last_error,available_at > clock_timestamp() "
                 "FROM ops.sync_work_items WHERE id=%s", (item_id,),
@@ -2523,7 +2523,7 @@ def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success()
             assert row == ("pending", persisted_checkpoint, wait_number + 2, 1, "budget_pending", True)
 
             # The deferred item is not claimable before its due time.
-            not_due = repository.claim_next(f"early-{suffix}", max_attempts=2)
+            not_due = repository.claim_next(f"early-{suffix}", max_attempts=3)
             assert not_due is None or not_due.id != item_id
             assert connection.execute(
                 "SELECT status,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
@@ -2532,8 +2532,27 @@ def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success()
                 "UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,),
             )
 
-    # A new worker connection resumes the same durable item even though its
-    # cumulative attempt count is already beyond the per-cycle maximum.
+    # A new 503 attempt remains pending: the five budget/429 waits increased
+    # audit history, but each restored the durable retry-cycle budget to one.
+    with psycopg.connect(TEST_DB_URL) as connection:
+        worker = RepeatableSyncWorker(
+            connection, Gate(), owner,
+            heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL),
+        )  # type: ignore[arg-type]
+        assert worker.run_once(
+            lambda *_args: (_ for _ in ()).throw(APIFootballHTTPError(503)),
+            lambda *_args: pytest.fail("apply"),
+            max_attempts=3,
+        ) is True
+        connection.commit()
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as verify_retry:
+        assert verify_retry.execute(
+            "SELECT status,checkpoint,attempts,attempts_in_budget,last_error FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("pending", persisted_checkpoint, 7, 2, "provider_http_503")
+        verify_retry.execute("UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,))
+
+    # A later execution uses the remaining retry-cycle budget even though the
+    # cumulative attempt count is already much higher.
     with psycopg.connect(TEST_DB_URL) as connection:
         worker = RepeatableSyncWorker(
             connection, Gate(), owner,
@@ -2543,14 +2562,53 @@ def test_q03_budget_deferrals_preserve_progress_and_retry_budget_until_success()
         assert worker.run_once(
             lambda item, _authorization: observed.append(item.checkpoint) or WorkResult({"done": True}),
             lambda *_args: None,
-            max_attempts=2,
+            max_attempts=3,
         ) is True
         connection.commit()
     assert observed == [persisted_checkpoint]
     with psycopg.connect(TEST_DB_URL, autocommit=True) as verify:
         assert verify.execute(
             "SELECT status,checkpoint,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
-        ).fetchone() == ("succeeded", {"done": True}, 7, 2)
+        ).fetchone() == ("succeeded", {"done": True}, 8, 3)
+
+
+def test_q03_manual_retry_resets_cycle_budget_after_many_budget_waits() -> None:
+    assert TEST_DB_URL is not None
+    suffix = uuid.uuid4().hex
+    owner = f"q03-manual-retry-{suffix}"
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+        provider_id = int(connection.execute(
+            "INSERT INTO source.providers(code,name) VALUES(%s,%s) RETURNING id",
+            (f"q03-manual-retry-{suffix}", "Q03 manual retry budget"),
+        ).fetchone()[0])
+        item_id, _ = _enqueue(
+            connection, _run(connection, provider_id, f"q03-manual-retry-{suffix}"),
+            f"q03-manual-retry:{suffix}", priority=10_450_000,
+            execution_key=f"q03-manual-retry:{suffix}",
+        )
+        repository = PostgresSyncRepository(
+            connection,
+            SyncPolicyGate(PostgresCompetitionSyncPolicyReader(connection), now=lambda: datetime.now(UTC)),
+        )
+        for _ in range(4):
+            item = repository.claim_next(owner, max_attempts=2)
+            assert item is not None and item.id == item_id
+            assert repository.defer_for_budget(item, owner, delay="0 seconds")
+        assert connection.execute(
+            "SELECT status,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("pending", 4, 0)
+        item = repository.claim_next(owner, max_attempts=2)
+        assert item is not None and item.attempts == 5
+        assert repository.requeue(item, owner, {"page": 5}, "manual review", contract_error=True)
+        assert repository.retry_quarantined(item_id)
+        assert connection.execute(
+            "SELECT status,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("pending", 5, 0)
+        reclaimed = repository.claim_next(owner, max_attempts=2)
+        assert reclaimed is not None and reclaimed.id == item_id and reclaimed.attempts == 6
+        assert connection.execute(
+            "SELECT status,attempts,attempts_in_budget FROM ops.sync_work_items WHERE id=%s", (item_id,),
+        ).fetchone() == ("running", 6, 1)
 
 
 def test_q03_budget_defer_stale_or_expired_lease_cannot_mutate_item() -> None:
@@ -2668,8 +2726,15 @@ def test_q03_transient_http_retries_consume_attempt_budget_and_quarantine_at_lim
             heartbeat_connection_factory=lambda: psycopg.connect(TEST_DB_URL),
         )  # type: ignore[arg-type]
         for attempt in (1, 2):
+            def fetch(claimed, _authorization):
+                if attempt == 2:
+                    # The terminal transition must reload this durable value,
+                    # rather than restoring the earlier claim snapshot.
+                    assert worker.repository.checkpoint(claimed, owner, {"page": 4})
+                raise APIFootballHTTPError(503)
+
             assert worker.run_once(
-                lambda *_args: (_ for _ in ()).throw(APIFootballHTTPError(503)),
+                fetch,
                 lambda *_args: pytest.fail("apply"),
                 max_attempts=2,
             ) is True
@@ -2685,14 +2750,14 @@ def test_q03_transient_http_retries_consume_attempt_budget_and_quarantine_at_lim
                 assert connection.execute(
                     "SELECT status,checkpoint,attempts,attempts_in_budget,quarantine_reason "
                     "FROM ops.sync_work_items WHERE id=%s", (item_id,),
-                ).fetchone() == ("quarantined", {"page": 3}, attempt, attempt, "provider_http_503_retry_exhausted")
+                ).fetchone() == ("quarantined", {"page": 4}, attempt, attempt, "provider_http_503_retry_exhausted")
 
         claimed = worker.repository.claim_next(f"exhaust-{suffix}", max_attempts=2)
         assert claimed is None or claimed.id != item_id
         assert connection.execute(
             "SELECT status,checkpoint,attempts,attempts_in_budget,quarantine_reason "
             "FROM ops.sync_work_items WHERE id=%s", (item_id,),
-        ).fetchone() == ("quarantined", {"page": 3}, 2, 2, "provider_http_503_retry_exhausted")
+        ).fetchone() == ("quarantined", {"page": 4}, 2, 2, "provider_http_503_retry_exhausted")
 
 
 def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_completion() -> None:
