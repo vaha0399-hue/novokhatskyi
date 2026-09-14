@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import psycopg
 
 from app.sync.policies import PostgresCompetitionSyncPolicyReader, SyncPolicyGate
+from app.sync.diagnostics import configure_lifecycle_logging
 from app.sync.scheduler import SyncScheduler
 from app.sync.scheduler_process import Q05SchedulerProcess
 from app.sync.scheduler_repository import PostgresSchedulerRepository, PostgresSchedulerSnapshotReader
@@ -20,6 +21,7 @@ def _json_default(value: object) -> object:
 
 
 def main() -> None:
+    configure_lifecycle_logging()
     parser = argparse.ArgumentParser(description="Opt-in deterministic Q05 scheduler")
     parser.add_argument("--database-url", required=True, help="explicit PostgreSQL URL; never read from API client configuration")
     parser.add_argument("--run-id", type=int, help="required only with --enqueue")

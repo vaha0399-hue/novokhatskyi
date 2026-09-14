@@ -301,17 +301,27 @@ class RepeatableSyncWorker:
         transaction_status = getattr(getattr(self._connection, "info", None), "transaction_status", None)
         if transaction_status is not None and getattr(transaction_status, "name", str(transaction_status)) != "IDLE":
             raise RuntimeError("repeatable worker requires an IDLE main connection before claim")
+        policy_denied = False
+        policy_lease_lost = False
         with self._connection.transaction():
+            item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
+            if item is None:
+                return False
             try:
-                item = self.repository.claim_next(self._owner, max_attempts=max_attempts)
-                if item is None:
-                    return False
                 authorization = self._authorization(item)
             except (SyncPolicyDenied, ValueError) as exc:
-                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
-                emit_lifecycle("job_quarantined", job_id=item.id, attempts=item.attempts, scope=item.scope,
-                               reason="policy_denied")
-                return True
+                if not self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True):
+                    policy_lease_lost = True
+                else:
+                    policy_denied = True
+        if policy_lease_lost:
+            emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           reason="lease_lost")
+            raise LeaseLost("repeatable work-item lease was lost before policy failure handling")
+        if policy_denied:
+            emit_lifecycle("job_quarantined", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           reason="policy_denied")
+            return True
         started = perf_counter()
         emit_lifecycle("job_claimed", job_id=item.id, attempts=item.attempts, scope=item.scope)
         # Fetchers may wait on HTTP; no transaction is active here.
@@ -370,23 +380,32 @@ class RepeatableSyncWorker:
                 # attempt must pass Q04 reserve again, including Retry-After.
                 deferred = self.repository.defer_for_budget(item, self._owner, delay="60 seconds")
             elif exc.status_code == 0 or 500 <= exc.status_code < 600:
-                delay = min(60, 2 ** min(item.attempts, 6)) + uniform(0, 1)
-                deferred = self.repository.defer_for_retry(
-                    item, self._owner, delay=f"{delay} seconds", error=f"provider_http_{exc.status_code}",
-                )
+                if item.attempts >= max_attempts:
+                    with self._connection.transaction():
+                        deferred = self.repository.requeue(
+                            item, self._owner, item.checkpoint, f"provider_http_{exc.status_code}_retry_exhausted",
+                            contract_error=True,
+                        )
+                    event, reason = "job_quarantined", "provider_retry_exhausted"
+                else:
+                    delay = min(60, 2 ** min(item.attempts, 6)) + uniform(0, 1)
+                    deferred = self.repository.defer_for_retry(
+                        item, self._owner, delay=f"{delay} seconds", error=f"provider_http_{exc.status_code}",
+                    )
+                    event, reason = "job_retry_scheduled", provider_http_reason(exc.status_code)
             else:
                 with self._connection.transaction():
                     deferred = self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+                event, reason = "job_quarantined", provider_http_reason(exc.status_code)
             if not deferred:
                 emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
                                duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
                 raise LeaseLost("repeatable work-item lease was lost before failure handling") from exc
-            reason = (
-                budget_reason(exc.reason) if isinstance(exc, APIFootballBudgetDenied)
-                else "budget_unavailable" if isinstance(exc, APIFootballBudgetError)
-                else provider_http_reason(exc.status_code)
-            )
-            event = "job_deferred" if isinstance(exc, APIFootballBudgetError) or exc.status_code == 429 else "job_retry_scheduled"
+            if isinstance(exc, APIFootballBudgetError):
+                event = "job_deferred"
+                reason = budget_reason(exc.reason) if isinstance(exc, APIFootballBudgetDenied) else "budget_unavailable"
+            elif exc.status_code == 429:
+                event, reason = "job_deferred", provider_http_reason(exc.status_code)
             emit_lifecycle(event, job_id=item.id, attempts=item.attempts, scope=item.scope,
                            duration_ms=(perf_counter() - started) * 1000, reason=reason)
             return True
@@ -402,7 +421,11 @@ class RepeatableSyncWorker:
             stop.set()
             thread.join()
             with self._connection.transaction():
-                self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+                quarantined = self.repository.requeue(item, self._owner, {}, str(exc), contract_error=True)
+            if not quarantined:
+                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
+                raise LeaseLost("repeatable work-item lease was lost before handler failure handling") from exc
             emit_lifecycle("job_quarantined", job_id=item.id, attempts=item.attempts, scope=item.scope,
                            duration_ms=(perf_counter() - started) * 1000, reason="handler_failure")
             return True
@@ -414,46 +437,64 @@ class RepeatableSyncWorker:
             raise LeaseLost("repeatable work-item heartbeat failed")
         if result.raw_fetches:
             if self._provenance is None:
+                emit_lifecycle("job_execution_failed", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="provenance_failure")
                 raise RuntimeError("raw fetches require a Q06 provenance recorder")
-            persisted = self._provenance.persist(item, authorization, result.raw_fetches)
+            try:
+                persisted = self._provenance.persist(item, authorization, result.raw_fetches)
+            except Exception:
+                emit_lifecycle("job_execution_failed", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000, reason="provenance_failure")
+                raise
             result = replace(result, source_fetch_ids=tuple(value.fetch_id for value in persisted))
-        with self._connection.transaction():
-            guarded = self._connection.execute(
-                "SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)",
-                (item.id, self._owner, item.lease_token),
-            ).fetchone()
-            if guarded is None or guarded[0] is not True:
-                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
-                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
-                raise LeaseLost("repeatable work-item lease was lost before applying its result")
-            writer = AtomicWorkTransaction(self._connection)
-            if result.source_fetch_ids:
-                if self._provenance is None:
-                    raise RuntimeError("source fetch ids require a Q06 provenance recorder")
-                # Replayed bytes are hashed again here, after the lease fence
-                # and before the first domain mutation.
-                self._provenance.verify_source_fetches(
-                    writer, item, result.source_fetch_ids, replayed_fetch_ids=result.replayed_fetch_ids,
-                )
-            emit_lifecycle("job_apply_started", job_id=item.id, attempts=item.attempts, scope=item.scope,
-                           duration_ms=(perf_counter() - started) * 1000)
-            apply_result(writer, item, result)
-            for enqueue_dependent in result.dependent_work:
-                enqueue_dependent(writer)
-            if result.replayed_fetch_ids:
-                assert self._provenance is not None
-                assert isinstance(result.replay_normalization_version, str)
-                self._provenance.record_reprocessing(
-                    writer, item, result.replayed_fetch_ids, result.replay_normalization_version,
-                )
-            completed = self._connection.execute(
-                "SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)",
-                (item.id, self._owner, item.lease_token, Jsonb(dict(result.checkpoint))),
-            ).fetchone()
-            if completed is None or completed[0] is not True:
-                emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
-                               duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
-                raise LeaseLost("repeatable work-item lease was lost before completion")
+        terminal_reason = "apply_or_commit_failure"
+        try:
+            with self._connection.transaction():
+                guarded = self._connection.execute(
+                    "SELECT ops.guard_repeatable_sync_work_item_lease(%s,%s,%s)",
+                    (item.id, self._owner, item.lease_token),
+                ).fetchone()
+                if guarded is None or guarded[0] is not True:
+                    emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                                   duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
+                    raise LeaseLost("repeatable work-item lease was lost before applying its result")
+                writer = AtomicWorkTransaction(self._connection)
+                if result.source_fetch_ids:
+                    if self._provenance is None:
+                        terminal_reason = "provenance_failure"
+                        raise RuntimeError("source fetch ids require a Q06 provenance recorder")
+                    # Replayed bytes are hashed again here, after the lease fence
+                    # and before the first domain mutation.
+                    terminal_reason = "provenance_failure"
+                    self._provenance.verify_source_fetches(
+                        writer, item, result.source_fetch_ids, replayed_fetch_ids=result.replayed_fetch_ids,
+                    )
+                    terminal_reason = "apply_or_commit_failure"
+                emit_lifecycle("job_apply_started", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                               duration_ms=(perf_counter() - started) * 1000)
+                apply_result(writer, item, result)
+                for enqueue_dependent in result.dependent_work:
+                    enqueue_dependent(writer)
+                if result.replayed_fetch_ids:
+                    assert self._provenance is not None
+                    assert isinstance(result.replay_normalization_version, str)
+                    self._provenance.record_reprocessing(
+                        writer, item, result.replayed_fetch_ids, result.replay_normalization_version,
+                    )
+                completed = self._connection.execute(
+                    "SELECT ops.complete_repeatable_sync_work_item(%s,%s,%s,%s)",
+                    (item.id, self._owner, item.lease_token, Jsonb(dict(result.checkpoint))),
+                ).fetchone()
+                if completed is None or completed[0] is not True:
+                    emit_lifecycle("job_lease_lost", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                                   duration_ms=(perf_counter() - started) * 1000, reason="lease_lost")
+                    raise LeaseLost("repeatable work-item lease was lost before completion")
+        except LeaseLost:
+            raise
+        except Exception:
+            emit_lifecycle("job_execution_failed", job_id=item.id, attempts=item.attempts, scope=item.scope,
+                           duration_ms=(perf_counter() - started) * 1000, reason=terminal_reason)
+            raise
         emit_lifecycle("job_completed", job_id=item.id, attempts=item.attempts, scope=item.scope,
                        duration_ms=(perf_counter() - started) * 1000)
         return True

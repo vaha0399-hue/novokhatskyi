@@ -39,3 +39,25 @@ def test_scope_and_reason_codes_are_stable_and_non_secret_bearing() -> None:
     assert budget_reason("token=test-secret") == "budget_denied"
     assert provider_http_reason(503) == "provider_http_503"
     assert provider_http_reason("secret") == "provider_http_error"
+
+
+def test_work_and_extra_fields_are_allowlisted_before_json_logging(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
+        emit_lifecycle(
+            "job_claimed", scope={"work_type": "api_key=test-secret"},
+            job_type="api_key=test-secret", run_id=-1, checkpoint_advanced="true",
+        )
+        emit_lifecycle(
+            "job_claimed", scope={"work_type": "calendar_refresh"},
+            job_type="calendar_refresh", run_id=7, checkpoint_advanced=True,
+        )
+
+    unsafe, safe = (json.loads(message) for message in caplog.messages[-2:])
+    assert unsafe == {"event": "job_claimed", "scope": {}}
+    assert safe == {
+        "checkpoint_advanced": True,
+        "event": "job_claimed",
+        "job_type": "calendar_refresh",
+        "run_id": 7,
+        "scope": {"work_type": "calendar_refresh"},
+    }

@@ -538,6 +538,41 @@ def test_q07_diagnostic_sql_runs_read_only_and_reports_partial_metric_pairs() ->
                ) VALUES(%s,'partial',1,%s,%s,%s,1)""",
             (fixture_id, fetch_id, now - timedelta(hours=4), now + timedelta(hours=1)),
         )
+        _q05_fixture(
+            connection, provider_id=provider_id, season_id=season_id, suffix=f"future-{suffix}",
+            kickoff_at=now + timedelta(days=2), lifecycle_state="scheduled",
+        )
+        _q05_fixture(
+            connection, provider_id=provider_id, season_id=season_id, suffix=f"overdue-{suffix}",
+            kickoff_at=now - timedelta(hours=1), lifecycle_state="scheduled",
+        )
+        connection.execute(
+            """INSERT INTO ops.sync_work_items(
+                   run_id,scope_key,scope,job_type,stable_key,entity_key,execution_key
+               ) VALUES(%s,%s,%s,'calendar_refresh',%s,%s,%s)""",
+            (
+                _run_id, f"q07-invalid-{suffix}",
+                Jsonb({"_sync_policy": {"provider_id": "not-a-number", "season_id": 999999999999999999999999}}),
+                f"q07-invalid-{suffix}", f"q07-invalid-entity-{suffix}", f"q07-invalid-execution-{suffix}",
+            ),
+        )
+        # These observations must be newer than the helper's source fetches,
+        # proving provider freshness takes the latest record for *each*
+        # endpoint rather than all-history success or another endpoint.
+        for endpoint, outcome, provider_results, normalized_at, observed_at, subject_season_id in (
+            ("/fixtures", "success", 1, now + timedelta(minutes=1), now + timedelta(minutes=1), None),
+            ("/fixtures", "provider_error", None, None, now + timedelta(minutes=2), None),
+            ("/fixtures/statistics", "success", 0, now + timedelta(minutes=3), now + timedelta(minutes=3), None),
+            ("/standings", "success", 1, None, now + timedelta(minutes=4), season_id),
+        ):
+            connection.execute(
+                """INSERT INTO source.provider_fetches(
+                       provider_id,endpoint,purpose,request_started_at,response_received_at,
+                       http_status,outcome,provider_results,subject_fixture_id,subject_season_id,normalized_at
+                   ) VALUES(%s,%s,'scheduled_refresh',%s,%s,200,%s,%s,%s,%s,%s)""",
+                (provider_id, endpoint, observed_at, observed_at, outcome, provider_results,
+                 fixture_id if subject_season_id is None else None, subject_season_id, normalized_at),
+            )
 
     report = (Path(__file__).parents[1] / "app" / "sync" / "diagnostics.sql").read_text(encoding="utf-8")
     with psycopg.connect(TEST_DB_URL) as connection:
@@ -549,18 +584,40 @@ def test_q07_diagnostic_sql_runs_read_only_and_reports_partial_metric_pairs() ->
             if not cursor.nextset():
                 break
 
-    assert len(result_sets) == 5
+    assert len(result_sets) == 6
+    queue_columns = ("state", "work_items", "oldest_queue_age_seconds")
+    queue_states = [dict(zip(queue_columns, row, strict=True)) for row in result_sets[0]]
+    assert next(row for row in queue_states if row["state"] == "invalid_scope")["work_items"] >= 1
+    lifecycle_columns = ("provider_id", "season_id", "lifecycle_state", "overdue_fixtures", "oldest_kickoff_at", "greatest_overdue_seconds")
+    lifecycle = [dict(zip(lifecycle_columns, row, strict=True)) for row in result_sets[1]]
+    assert next(row for row in lifecycle if row["provider_id"] == provider_id and row["lifecycle_state"] == "scheduled")["overdue_fixtures"] == 1
     metric_columns = ("provider_id", "season_id", "metric", "fixtures", "expected_team_pairs",
                       "observed_metric_team_pairs", "null_metric_team_pairs", "fixtures_without_statistics",
                       "fixtures_with_one_team_statistics", "complete_team_pair_missing_selected_metric",
                       "coverage_empty", "coverage_partial", "coverage_unknown_or_absent")
-    metrics = [dict(zip(metric_columns, row, strict=True)) for row in result_sets[3]]
+    metrics = [dict(zip(metric_columns, row, strict=True)) for row in result_sets[4]]
     corners = next(row for row in metrics if row["provider_id"] == provider_id and row["metric"] == "corner_kicks")
     yellows = next(row for row in metrics if row["provider_id"] == provider_id and row["metric"] == "yellow_cards")
     assert corners["fixtures_with_one_team_statistics"] == 1
     assert corners["observed_metric_team_pairs"] == 1  # zero is observed, not missing
     assert yellows["null_metric_team_pairs"] == 1
     assert yellows["coverage_partial"] == 1
+    assert corners["fixtures"] == 1  # the future scheduled fixture is not eligible statistics coverage
+
+    freshness_columns = (
+        "provider_id", "season_id", "endpoint", "last_response_received_at", "last_normalized_at",
+        "freshness_age_seconds", "lifetime_successes", "lifetime_failures", "latest_outcome",
+        "latest_provider_results", "factual_status",
+    )
+    freshness = [dict(zip(freshness_columns, row, strict=True)) for row in result_sets[3]]
+    fixture_report = next(row for row in freshness if row["provider_id"] == provider_id and row["endpoint"] == "/fixtures")
+    statistics_report = next(row for row in freshness if row["provider_id"] == provider_id and row["endpoint"] == "/fixtures/statistics")
+    standings_report = next(row for row in freshness if row["provider_id"] == provider_id and row["endpoint"] == "/standings")
+    assert fixture_report["factual_status"] == "provider_failure_observed"
+    assert fixture_report["latest_outcome"] == "provider_error"
+    assert fixture_report["lifetime_successes"] >= 1 and fixture_report["lifetime_failures"] >= 1
+    assert statistics_report["factual_status"] == "provider_empty_response_observed"
+    assert standings_report["factual_status"] == "response_not_normalized"
 
 
 def _q05_snapshot(now: datetime):
@@ -2616,20 +2673,26 @@ def test_q03_transient_http_retries_consume_attempt_budget_and_quarantine_at_lim
                 lambda *_args: pytest.fail("apply"),
                 max_attempts=2,
             ) is True
-            assert connection.execute(
-                "SELECT status,checkpoint,attempts,attempts_in_budget,last_error "
-                "FROM ops.sync_work_items WHERE id=%s", (item_id,),
-            ).fetchone() == ("pending", {"page": 3}, attempt, attempt, "provider_http_503")
-            connection.execute(
-                "UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,),
-            )
+            if attempt == 1:
+                assert connection.execute(
+                    "SELECT status,checkpoint,attempts,attempts_in_budget,last_error "
+                    "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+                ).fetchone() == ("pending", {"page": 3}, attempt, attempt, "provider_http_503")
+                connection.execute(
+                    "UPDATE ops.sync_work_items SET available_at=clock_timestamp() WHERE id=%s", (item_id,),
+                )
+            else:
+                assert connection.execute(
+                    "SELECT status,checkpoint,attempts,attempts_in_budget,quarantine_reason "
+                    "FROM ops.sync_work_items WHERE id=%s", (item_id,),
+                ).fetchone() == ("quarantined", {"page": 3}, attempt, attempt, "provider_http_503_retry_exhausted")
 
         claimed = worker.repository.claim_next(f"exhaust-{suffix}", max_attempts=2)
         assert claimed is None or claimed.id != item_id
         assert connection.execute(
             "SELECT status,checkpoint,attempts,attempts_in_budget,quarantine_reason "
             "FROM ops.sync_work_items WHERE id=%s", (item_id,),
-        ).fetchone() == ("quarantined", {"page": 3}, 2, 2, "provider_http_503")
+        ).fetchone() == ("quarantined", {"page": 3}, 2, 2, "provider_http_503_retry_exhausted")
 
 
 def test_q03_guarded_result_transaction_rolls_back_result_dependents_and_completion() -> None:

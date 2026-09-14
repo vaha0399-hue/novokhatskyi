@@ -74,6 +74,9 @@ def test_scheduler_cli_passes_materialized_season_and_analytics_inputs(monkeypat
     monkeypatch.setattr(scheduler_main, "SyncPolicyGate", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(scheduler_main, "PostgresSchedulerRepository", lambda *_args: object())
     monkeypatch.setattr(scheduler_main, "Q05SchedulerProcess", _Process)
+    # Lifecycle configuration is covered below; avoid installing a persistent
+    # process handler in this unit-level wiring test.
+    monkeypatch.setattr(scheduler_main, "configure_lifecycle_logging", lambda: None)
     monkeypatch.setattr("sys.argv", argv)
 
     scheduler_main.main()
@@ -82,3 +85,12 @@ def test_scheduler_cli_passes_materialized_season_and_analytics_inputs(monkeypat
     assert calls[0]["seasons"] == snapshot.seasons
     assert calls[0]["analytics_inputs"] == snapshot.analytics_inputs
     assert calls[0]["prematch_observations"] == snapshot.prematch_observations
+
+
+def test_scheduler_cli_configures_lifecycle_json_logging_before_startup(monkeypatch) -> None:
+    configured: list[bool] = []
+    monkeypatch.setattr(scheduler_main, "configure_lifecycle_logging", lambda: configured.append(True))
+    monkeypatch.setattr("sys.argv", ["scheduler", "--help"])
+    with pytest.raises(SystemExit, match="0"):
+        scheduler_main.main()
+    assert configured == [True]

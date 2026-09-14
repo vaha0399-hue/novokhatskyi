@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -51,6 +53,13 @@ class _RunnerConnection(_Connection):
         return _Row(None)
 
 
+class _CommitFailureConnection(_RunnerConnection):
+    def execute(self, query, params=None):
+        if "complete_repeatable" in query:
+            raise RuntimeError("completion write failed")
+        return super().execute(query, params)
+
+
 class _HeartbeatConnection(_Connection):
     def __init__(self, value=True): self.value = value
     def __enter__(self): return self
@@ -72,8 +81,12 @@ class _Gate:
         return authorization
 
 
-def _item(*, checkpoint=None):
-    return LeasedWorkItem(1, 1, "scope", {"_sync_policy": {"provider_id": 1, "season_id": 1, "work_type": "x", "instance_id": 1, "version": 1}}, checkpoint or {}, 1, "x", 0, "key", "entity", "exec", 9)
+def _item(*, checkpoint=None, attempts=1):
+    return LeasedWorkItem(1, 1, "scope", {"_sync_policy": {"provider_id": 1, "season_id": 1, "work_type": "calendar_refresh", "instance_id": 1, "version": 1}}, checkpoint or {}, attempts, "calendar_refresh", 0, "key", "entity", "exec", 9)
+
+
+def _events(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    return [json.loads(record.message) for record in caplog.records if record.name == "app.sync.lifecycle"]
 
 
 class _DenyBudget:
@@ -190,18 +203,20 @@ def test_runner_budget_defer_fails_closed_after_heartbeat_or_lease_loss() -> Non
         )
 
 
-def test_runner_ordinary_fetch_error_remains_contract_quarantined() -> None:
+def test_runner_ordinary_fetch_error_remains_contract_quarantined(caplog: pytest.LogCaptureFixture) -> None:
     connection = _RunnerConnection()
     worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
     worker.repository.claim_next = lambda *_args, **_kwargs: _item(checkpoint={"page": 4})  # type: ignore[method-assign]
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     worker.repository.requeue = lambda *args, **kwargs: calls.append((args, kwargs)) or True  # type: ignore[method-assign]
-    assert worker.run_once(lambda *_: (_ for _ in ()).throw(ValueError("bad payload")), lambda *_: pytest.fail("apply")) is True
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
+        assert worker.run_once(lambda *_: (_ for _ in ()).throw(ValueError("bad payload")), lambda *_: pytest.fail("apply")) is True
     assert calls == [((_item(checkpoint={"page": 4}), "owner", {}, "bad payload"), {"contract_error": True})]
+    assert _events(caplog)[-1]["event"] == "job_quarantined"
 
 
 @pytest.mark.parametrize(("status_code", "transition"), ((429, "budget"), (503, "retry"), (0, "retry"), (400, "contract")))
-def test_runner_classifies_provider_http_failures_without_apply(status_code: int, transition: str) -> None:
+def test_runner_classifies_provider_http_failures_without_apply(status_code: int, transition: str, caplog: pytest.LogCaptureFixture) -> None:
     connection = _RunnerConnection()
     worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
     item = _item(checkpoint={"page": 4})
@@ -211,10 +226,11 @@ def test_runner_classifies_provider_http_failures_without_apply(status_code: int
     worker.repository.defer_for_retry = lambda *args, **kwargs: calls.append(("retry", args, kwargs)) or True  # type: ignore[attr-defined,method-assign]
     worker.repository.requeue = lambda *args, **kwargs: calls.append(("contract", args, kwargs)) or True  # type: ignore[method-assign]
 
-    assert worker.run_once(
-        lambda *_: (_ for _ in ()).throw(APIFootballHTTPError(status_code)),
-        lambda *_: pytest.fail("apply"),
-    ) is True
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
+        assert worker.run_once(
+            lambda *_: (_ for _ in ()).throw(APIFootballHTTPError(status_code)),
+            lambda *_: pytest.fail("apply"),
+        ) is True
 
     assert len(calls) == 1 and calls[0][0] == transition
     if transition == "budget":
@@ -226,6 +242,28 @@ def test_runner_classifies_provider_http_failures_without_apply(status_code: int
         assert 2 <= float(str(calls[0][2]["delay"]).removesuffix(" seconds")) <= 3
     else:
         assert calls[0] == ("contract", (item, "owner", {}, f"API-Football returned HTTP {status_code}."), {"contract_error": True})
+        assert _events(caplog)[-1]["event"] == "job_quarantined"
+        assert _events(caplog)[-1]["reason"] == "provider_http_400"
+
+
+def test_runner_quarantines_exhausted_5xx_instead_of_claiming_a_future_retry(caplog: pytest.LogCaptureFixture) -> None:
+    connection = _RunnerConnection()
+    worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    item = _item(attempts=5)
+    worker.repository.claim_next = lambda *_args, **_kwargs: item  # type: ignore[method-assign]
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    worker.repository.requeue = lambda *args, **kwargs: calls.append((args, kwargs)) or True  # type: ignore[method-assign]
+    worker.repository.defer_for_retry = lambda *_args, **_kwargs: pytest.fail("exhausted retry must not be deferred")  # type: ignore[attr-defined,method-assign]
+
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"):
+        assert worker.run_once(
+            lambda *_: (_ for _ in ()).throw(APIFootballHTTPError(503)),
+            lambda *_: pytest.fail("apply"), max_attempts=5,
+        ) is True
+
+    assert calls == [((item, "owner", {}, "provider_http_503_retry_exhausted"), {"contract_error": True})]
+    assert _events(caplog)[-1]["event"] == "job_quarantined"
+    assert _events(caplog)[-1]["reason"] == "provider_retry_exhausted"
 
 
 def test_runner_fetch_is_outside_transaction_and_lost_guard_never_applies() -> None:
@@ -246,6 +284,77 @@ def test_runner_policy_denial_quarantines_without_fetch_or_apply() -> None:
     worker.repository.requeue = lambda *args, **kwargs: calls.append(args) or True  # type: ignore[method-assign]
     assert worker.run_once(lambda *_: pytest.fail("fetch"), lambda *_: pytest.fail("apply")) is True
     assert calls and calls[0][-1] == "competition sync policy denied: disabled"
+
+
+def test_runner_claim_value_error_never_uses_an_unbound_item() -> None:
+    worker = RepeatableSyncWorker(_RunnerConnection(), _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad claim"))  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="bad claim"):
+        worker.run_once(lambda *_: pytest.fail("fetch"), lambda *_: pytest.fail("apply"))
+
+
+def test_runner_policy_requeue_false_raises_lease_lost_without_quarantine_event(caplog: pytest.LogCaptureFixture) -> None:
+    worker = RepeatableSyncWorker(_RunnerConnection(), _Gate(denied=True), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.requeue = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"), pytest.raises(LeaseLost, match="policy failure"):
+        worker.run_once(lambda *_: pytest.fail("fetch"), lambda *_: pytest.fail("apply"))
+    assert [event["event"] for event in _events(caplog)] == ["job_lease_lost"]
+
+
+def test_runner_generic_requeue_false_raises_lease_lost_without_quarantine_event(caplog: pytest.LogCaptureFixture) -> None:
+    worker = RepeatableSyncWorker(_RunnerConnection(), _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.requeue = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"), pytest.raises(LeaseLost, match="handler failure"):
+        worker.run_once(lambda *_: (_ for _ in ()).throw(ValueError("unsafe secret")), lambda *_: pytest.fail("apply"))
+    assert _events(caplog)[-1]["event"] == "job_lease_lost"
+
+
+def test_runner_apply_failure_emits_terminal_failure_and_never_completed(caplog: pytest.LogCaptureFixture) -> None:
+    worker = RepeatableSyncWorker(_RunnerConnection(), _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory())  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"), pytest.raises(ValueError, match="apply failed"):
+        worker.run_once(lambda *_: WorkResult({}), lambda *_: (_ for _ in ()).throw(ValueError("apply failed")))
+    events = _events(caplog)
+    assert events[-1]["event"] == "job_execution_failed"
+    assert events[-1]["reason"] == "apply_or_commit_failure"
+    assert all(event["event"] != "job_completed" for event in events)
+
+
+def test_runner_provenance_failure_emits_terminal_failure_and_never_completed(caplog: pytest.LogCaptureFixture) -> None:
+    class BrokenProvenance:
+        def verify_source_fetches(self, *_args, **_kwargs) -> None:
+            raise RuntimeError("source verification failed")
+
+    class Replay:
+        def replay(self, *_args) -> WorkResult:
+            return WorkResult({}, source_fetch_ids=(17,), replay_normalization_version="test-v1")
+
+    worker = RepeatableSyncWorker(
+        _RunnerConnection(), _Gate(), "owner", provenance=BrokenProvenance(),
+        heartbeat_connection_factory=_heartbeat_factory(),
+    )  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"), pytest.raises(RuntimeError, match="source verification"):
+        worker.run_once(Replay(), lambda *_: pytest.fail("apply"))
+    events = _events(caplog)
+    assert events[-1]["event"] == "job_execution_failed"
+    assert events[-1]["reason"] == "provenance_failure"
+    assert all(event["event"] != "job_completed" for event in events)
+
+
+def test_runner_completion_failure_emits_terminal_failure_and_never_completed(caplog: pytest.LogCaptureFixture) -> None:
+    worker = RepeatableSyncWorker(
+        _CommitFailureConnection(), _Gate(), "owner", heartbeat_connection_factory=_heartbeat_factory(),
+    )  # type: ignore[arg-type]
+    worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="app.sync.lifecycle"), pytest.raises(RuntimeError, match="completion write failed"):
+        worker.run_once(lambda *_: WorkResult({}), lambda *_: None)
+    events = _events(caplog)
+    assert events[-1]["event"] == "job_execution_failed"
+    assert events[-1]["reason"] == "apply_or_commit_failure"
+    assert all(event["event"] != "job_completed" for event in events)
 
 
 def test_runner_heartbeat_failure_prevents_apply_after_fetch() -> None:

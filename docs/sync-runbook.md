@@ -56,15 +56,15 @@ For a queue record, correlate separately with:
 
 ```sql
 SELECT id, run_id, status, attempts, job_type, available_at, started_at,
-       finished_at, lease_expires_at, quarantine_reason
+       finished_at, lease_expires_at
 FROM ops.sync_work_items
 WHERE id = :job_id;
 ```
 
 Run the placeholder query only in a client that binds `:job_id`; never build
-SQL by interpolating a request parameter. The bundled report intentionally
-does **not** select `last_error` or `quarantine_reason`, because historical
-callers may have stored exception text there.
+SQL by interpolating a request parameter. The trace and bundled report
+intentionally do **not** select `last_error` or `quarantine_reason`, because
+historical callers may have stored exception text there.
 
 ## Interpret failures and delay
 
@@ -76,6 +76,7 @@ callers may have stored exception text there.
 | `provider_empty_response_observed` | A successful season-scoped response explicitly reported zero results. This is provider evidence, not a successful statistics-completeness claim. |
 | `unknown_no_season_scoped_fetch` | Q07 has no usable season-scoped provider observation. It cannot tell provider absence from an unwired handler, a skipped policy, or a delayed request. |
 | `pending_due` with an increasing `oldest_queue_age_seconds` | Active, due handler backlog. `pending_scheduled` is future work and is not backlog; `active_lease` is currently owned; `stale_lease` has expired. |
+| `overdue_football_lifecycle` | Known scheduled/in-progress fixtures more than 15 minutes after kickoff, grouped by football lifecycle. This is not `stale_lease` and Q07 does not repair it or make a provider request. |
 | `job_quarantined` | Contract/policy/handler failure. The safe event reason is a category; inspect privileged durable evidence under the incident procedure rather than exposing raw exception content. |
 
 `provider_http_429` follows the budget-defer path because Q04 records the
@@ -101,10 +102,14 @@ metric (`total_shots`, `shots_on_goal`, `corner_kicks`, `yellow_cards`, and
   seasons and do not multiply fixture counts through joins.
 
 Q07 does not infer freshness for D01–D09 data handlers that do not yet exist.
-Use the provider-freshness result as evidence only for stored provider fetches;
-use scheduler preview to see `handler_unavailable` or `input_unavailable`.
-`freshness_age_seconds` is the age of the newest stored response, not an SLA
-verdict and not evidence that an unwired handler should have fetched it.
+Provider freshness is one row per provider/season/**endpoint**: its latest
+outcome, result count, and normalization timestamp come from the same stored
+fetch record. Lifetime success/failure counters are separate context and never
+override that latest state. An endpoint therefore cannot make statistics look
+fresh merely because an unrelated endpoint succeeded. Use scheduler preview to
+see `handler_unavailable` or `input_unavailable`. `freshness_age_seconds` is
+the age of that endpoint's newest stored response, not an SLA verdict and not
+evidence that an unwired handler should have fetched it.
 
 ## Budget report
 

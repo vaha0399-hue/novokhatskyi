@@ -17,6 +17,13 @@ from typing import Any
 
 LOGGER = logging.getLogger("app.sync.lifecycle")
 
+_WORK_TYPES = frozenset({
+    "analytics_recalculation", "calendar_refresh", "correction_check",
+    "fixtures", "fixtures_refresh", "live_refresh", "overdue_status_check", "prematch_check", "quality_sweep",
+    "result_finalization", "schedule_far", "schedule_near", "season_discovery",
+    "standings_refresh", "statistics_retry",
+})
+
 _SCOPE_KEYS = frozenset(
     {
         "provider_id",
@@ -30,7 +37,10 @@ _SCOPE_KEYS = frozenset(
     }
 )
 _REASON = re.compile(r"^[a-z0-9_]{1,80}$")
-_EXTRA_FIELDS = frozenset({"run_id", "job_type", "checkpoint_advanced"})
+
+
+def _safe_work_type(value: object) -> str | None:
+    return value if isinstance(value, str) and value in _WORK_TYPES else None
 
 
 def safe_scope(scope: Mapping[str, Any]) -> dict[str, int | str]:
@@ -44,8 +54,8 @@ def safe_scope(scope: Mapping[str, Any]) -> dict[str, int | str]:
         value = scope.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             result[key] = value
-        elif key == "work_type" and isinstance(value, str) and value:
-            result[key] = value
+        elif key == "work_type" and (work_type := _safe_work_type(value)) is not None:
+            result[key] = work_type
     policy = scope.get("_sync_policy")
     if isinstance(policy, Mapping):
         for key in ("provider_id", "season_id", "work_type"):
@@ -53,8 +63,8 @@ def safe_scope(scope: Mapping[str, Any]) -> dict[str, int | str]:
                 value = policy.get(key)
                 if isinstance(value, int) and not isinstance(value, bool):
                     result[key] = value
-                elif key == "work_type" and isinstance(value, str) and value:
-                    result[key] = value
+                elif key == "work_type" and (work_type := _safe_work_type(value)) is not None:
+                    result[key] = work_type
     return result
 
 
@@ -81,10 +91,15 @@ def emit_lifecycle(
             payload["duration_ms"] = round(max(0.0, duration_ms), 3)
         if reason is not None:
             payload["reason"] = reason if _REASON.fullmatch(reason) else "unknown_failure"
-        payload.update({
-            key: value for key, value in extra.items()
-            if key in _EXTRA_FIELDS and value is not None
-        })
+        run_id = extra.get("run_id")
+        if isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0:
+            payload["run_id"] = run_id
+        job_type = _safe_work_type(extra.get("job_type"))
+        if job_type is not None:
+            payload["job_type"] = job_type
+        checkpoint_advanced = extra.get("checkpoint_advanced")
+        if isinstance(checkpoint_advanced, bool):
+            payload["checkpoint_advanced"] = checkpoint_advanced
         LOGGER.info("%s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
     except Exception:
         # Observability cannot affect the fenced transaction or failure path.
@@ -109,3 +124,20 @@ def budget_reason(reason: object) -> str:
 def provider_http_reason(status_code: object) -> str:
     """Expose only a valid HTTP status, never a provider response body."""
     return f"provider_http_{status_code}" if isinstance(status_code, int) and 0 <= status_code <= 599 else "provider_http_error"
+
+
+def configure_lifecycle_logging() -> None:
+    """Attach an INFO handler that writes the pre-serialized JSON unchanged."""
+    try:
+        if any(getattr(handler, "_q07_lifecycle", False) for handler in LOGGER.handlers):
+            return
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._q07_lifecycle = True  # type: ignore[attr-defined]
+        LOGGER.addHandler(handler)
+        LOGGER.setLevel(logging.INFO)
+        LOGGER.propagate = False
+    except Exception:
+        # Startup diagnostics must not prevent an otherwise valid scheduler.
+        return

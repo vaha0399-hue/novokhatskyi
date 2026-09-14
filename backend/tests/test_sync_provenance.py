@@ -234,6 +234,7 @@ def test_q06_runner_persists_raw_before_a_domain_transaction_rolls_back() -> Non
     provenance = _Provenance()
     worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=lambda: _Connection(), provenance=provenance)  # type: ignore[arg-type]
     worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.requeue = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
     now = datetime.now(UTC)
     capture = RawFetchCapture("/fixtures", {"league": 39}, _response(), now, now, "fixtures-v1")
 
@@ -266,6 +267,7 @@ def test_q06_runner_rejects_fresh_raw_mixed_with_existing_source_ids() -> None:
     provenance = _Provenance()
     worker = RepeatableSyncWorker(connection, _Gate(), "owner", heartbeat_connection_factory=lambda: _Connection(), provenance=provenance)  # type: ignore[arg-type]
     worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.requeue = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
     now = datetime.now(UTC)
     capture = RawFetchCapture("/fixtures", {"league": 39}, _response(), now, now, "fixtures-v1")
 
@@ -295,6 +297,7 @@ def test_q06_runner_rejects_existing_provenance_from_ordinary_fetch(result_field
         connection, _Gate(), "owner", heartbeat_connection_factory=lambda: _Connection(), provenance=provenance,
     )  # type: ignore[arg-type]
     worker.repository.claim_next = lambda *_args, **_kwargs: _item()  # type: ignore[method-assign]
+    worker.repository.requeue = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
 
     assert worker.run_once(
         lambda *_: WorkResult({}, **result_fields),
